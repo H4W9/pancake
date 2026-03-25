@@ -11,6 +11,7 @@
 #include "esp_event.h"
 #include "nvs_flash.h"
 #include "led_strip.h"
+#include "driver/gpio.h"
 // Note: Legacy RMT driver removed in ESP-IDF 6.x - using led_strip component instead
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +96,7 @@ static esp_err_t init_wifi(void) {
 }
 
 static esp_err_t init_led(void) {
+    gpio_reset_pin(NEOPIXEL_GPIO);
     led_strip_config_t strip_cfg = {
         .strip_gpio_num = NEOPIXEL_GPIO,
         .max_leds = LED_COUNT,
