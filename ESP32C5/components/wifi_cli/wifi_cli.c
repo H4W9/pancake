@@ -12,6 +12,7 @@
 #include "nvs_flash.h"
 #include "led_strip.h"
 #include "driver/gpio.h"
+#include "driver/rmt_types.h"
 // Note: Legacy RMT driver removed in ESP-IDF 6.x - using led_strip component instead
 #include <stdlib.h>
 #include <string.h>
@@ -106,7 +107,7 @@ static esp_err_t init_led(void) {
     };
     
     led_strip_rmt_config_t rmt_cfg = {
-        .clk_src = LED_STRIP_RMT_CLK_SRC_DEFAULT,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
         .resolution_hz = RMT_RES_HZ,
         .flags.with_dma = false,
     };
