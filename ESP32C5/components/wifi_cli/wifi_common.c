@@ -1,12 +1,44 @@
 // wifi_common.c - Common helper functions
 #include "wifi_common.h"
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 
 // Global variables (defined once, extern in header)
 led_strip_handle_t g_led_strip = NULL;
 volatile app_state_t g_app_state = APP_STATE_IDLE;
 volatile bool g_operation_stop_requested = false;
+
+void led_set_state(uint8_t r, uint8_t g, uint8_t b) {
+    if (!g_led_strip) return;
+    led_strip_set_pixel(g_led_strip, 0, r, g, b);
+    led_strip_refresh(g_led_strip);
+}
+
+// Matches cyberbrick boot sequence: R→G→B→white (120ms each), 3× white blink (80ms on/off)
+#define BOOT_BRIGHT 40
+void led_boot_sequence(void) {
+    if (!g_led_strip) return;
+    // Wipe R → G → B → white
+    uint8_t colors[4][3] = {
+        {BOOT_BRIGHT, 0,           0          },
+        {0,           BOOT_BRIGHT, 0          },
+        {0,           0,           BOOT_BRIGHT},
+        {BOOT_BRIGHT, BOOT_BRIGHT, BOOT_BRIGHT},
+    };
+    for (int i = 0; i < 4; i++) {
+        led_set_state(colors[i][0], colors[i][1], colors[i][2]);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    // Three quick white blinks
+    for (int i = 0; i < 3; i++) {
+        led_set_state(BOOT_BRIGHT, BOOT_BRIGHT, BOOT_BRIGHT);
+        vTaskDelay(pdMS_TO_TICKS(80));
+        led_set_state(0, 0, 0);
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+}
 
 const char* authmode_to_string(wifi_auth_mode_t mode) {
     switch (mode) {

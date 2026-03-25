@@ -113,6 +113,8 @@ static esp_err_t init_led(void) {
     
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &g_led_strip));
     ESP_LOGI(TAG, "LED strip initialized");
+    led_boot_sequence();           // R→G→B→white, 3× white blink
+    led_set_state(0, 0, 32);       // dim blue = idle/ready
     
     return ESP_OK;
 }

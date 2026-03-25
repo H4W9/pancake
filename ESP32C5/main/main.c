@@ -1315,6 +1315,7 @@ static void wifi_scan_done_cb(void *arg, esp_event_base_t event_base, int32_t ev
             deauth_rescan_done_flag = true;
         } else {
             scan_done_ui_flag = true;
+            led_set_state(0, 32, 0);   // green = scan done
         }
     }
     // Ensure button UI matches actual sniffer state (in case we auto-started)
@@ -2308,7 +2309,8 @@ static void sniffer_task(void *pvParameters) {
         vTaskDelete(NULL);
         return;
     }
-    
+    led_set_state(0, 64, 64);  // cyan = sniffer active
+
     // Keep task running until sniffer_task_active is set to false
     while (sniffer_task_active) {
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -2316,6 +2318,7 @@ static void sniffer_task(void *pvParameters) {
     
     // Stop wifi_sniffer
     wifi_sniffer_stop();
+    led_set_state(0, 0, 32);   // blue = idle
     
     ESP_LOGI(TAG, "Sniffer task ending");
     sniffer_task_handle = NULL;
@@ -4079,6 +4082,7 @@ void app_main(void)
             if (deauth_resume_flag) {
                 deauth_resume_flag = false;
                 wifi_attacks_start_deauth();
+                led_set_state(64, 0, 0);   // red = deauth
                 if (deauth_pause_btn) {
                     lv_obj_t *label = lv_obj_get_child(deauth_pause_btn, 0);
                     if (label) lv_label_set_text(label, "Pause");
@@ -4228,6 +4232,7 @@ void app_main(void)
                 // Re-save targets with updated channels and resume attack
                 wifi_scanner_save_target_bssids();
                 wifi_attacks_start_deauth();
+                led_set_state(64, 0, 0);   // red = deauth
                 
                 deauth_rescan_active = false;
                 ESP_LOGI(TAG, "Deauth rescan complete, attack resumed");
@@ -5022,6 +5027,7 @@ static void deauth_quit_event_cb(lv_event_t *e)
     deauth_rescan_timer_stop();
     // Stop all attacks (deauth, evil twin, etc.)
     wifi_attacks_stop_all();
+    led_set_state(0, 0, 32);   // blue = idle
     deauth_stop_flag = true;
     deauth_paused = false;
     // Navigate back to menu
@@ -5091,6 +5097,7 @@ static void blackout_yes_btn_cb(lv_event_t *e)
     
     // Start blackout attack
     wifi_attacks_start_blackout();
+    led_set_state(64, 0, 32);  // pink = blackout
 }
 
 static void blackout_stop_btn_cb(lv_event_t *e)
@@ -5098,6 +5105,7 @@ static void blackout_stop_btn_cb(lv_event_t *e)
     (void)e;
     // Stop blackout attack
     wifi_attacks_stop_all();
+    led_set_state(0, 0, 32);   // blue = idle
     blackout_disable_log_capture();
     blackout_networks_label = NULL;
     blackout_status_label = NULL;
@@ -5192,6 +5200,7 @@ static void snifferdog_yes_btn_cb(lv_event_t *e)
     
     ESP_LOGI(TAG, "Starting Snifferdog...");
     sniffer_dog_active = true;
+    led_set_state(0, 32, 64);  // blue-cyan = snifferdog
     
     // Set promiscuous filter
     esp_wifi_set_promiscuous_filter(&sniffer_filter);
@@ -5263,6 +5272,7 @@ static void snifferdog_stop_btn_cb(lv_event_t *e)
     portEXIT_CRITICAL(&snifferdog_stats_spin);
     snifferdog_ui_active = false;  // Clear snifferdog UI active flag
     scan_done_ui_flag = false;  // Clear any pending scan done flag
+    led_set_state(0, 0, 32);   // blue = idle
     // Navigate back to menu
     nav_to_menu_flag = true;
 }
@@ -5418,6 +5428,7 @@ static void sniffer_quit_cb(lv_event_t *e)
     
     // Stop promiscuous mode but DO NOT clear data
     wifi_sniffer_stop();
+    led_set_state(0, 0, 32);   // blue = idle
     
     // Cleanup UI state
     sniffer_disable_log_capture();
@@ -6458,6 +6469,7 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
         lv_obj_set_style_text_color(network_info, COLOR_MATERIAL_RED, 0);
         return;
     }
+    led_set_state(64, 32, 0);  // amber = SAE overflow
     
     sae_overflow_log_ta = NULL;  // No longer using textarea
     
@@ -6472,6 +6484,7 @@ static void sae_overflow_stop_btn_cb(lv_event_t *e)
     (void)e;
     // Stop SAE overflow attack
     wifi_attacks_stop_all();
+    led_set_state(0, 0, 32);   // blue = idle
     sae_overflow_disable_log_capture();
     sae_overflow_log_ta = NULL;
     sae_overflow_stop_btn = NULL;
@@ -8438,6 +8451,7 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
     wardrive_stop_btn = NULL;
     wardrive_ui_active = false;
     scan_done_ui_flag = false;
+    led_set_state(0, 0, 32);   // blue = idle
 
     if (wd_ui_timer) { lv_timer_del(wd_ui_timer); wd_ui_timer = NULL; }
     wd_ui_gps_label = NULL;
@@ -8861,6 +8875,7 @@ static void karma_start_btn_cb(lv_event_t *e)
         karma_ui_active = false;
         return;
     }
+    led_set_state(64, 64, 0);  // yellow = karma
 
     // Add initial "Karma Started" event
     lv_textarea_add_text(karma_log_ta, "Karma Started\n");
@@ -8877,6 +8892,7 @@ static void karma_stop_btn_cb(lv_event_t *e)
     
     // Stop the portal
     wifi_attacks_stop_portal();
+    led_set_state(0, 0, 32);   // blue = idle
     
     // Unregister event callback
     wifi_attacks_set_evil_twin_event_cb(NULL);
@@ -9224,6 +9240,7 @@ static void portal_start_btn_cb(lv_event_t *e)
         portal_ui_active = false;
         return;
     }
+    led_set_state(64, 0, 64);  // purple = portal
 
     // Add initial "Portal Started" event
     lv_textarea_add_text(portal_log_ta, "Portal Started\n");
@@ -9240,6 +9257,7 @@ static void portal_stop_btn_cb(lv_event_t *e)
     
     // Stop the portal
     wifi_attacks_stop_portal();
+    led_set_state(0, 0, 32);   // blue = idle
     
     // Unregister event callback
     wifi_attacks_set_evil_twin_event_cb(NULL);
@@ -9929,6 +9947,7 @@ static void show_wifi_scan_attack_screen(void)
     
     // Start scan
     wifi_scanner_start_scan();
+    led_set_state(0, 0, 64);   // bright blue = scanning
 }
 
 // ============================================================================
@@ -13836,6 +13855,7 @@ void attack_event_cb(lv_event_t *e)
 
         // Start scan
         wifi_scanner_start_scan();
+        led_set_state(0, 0, 64);   // bright blue = scanning
         return;
     }
 
@@ -16041,6 +16061,7 @@ static void show_deauth_monitor_screen(void)
     // Start WiFi scan to gather network SSIDs
     ESP_LOGI(TAG, "Starting WiFi scan for deauth monitor...");
     wifi_scanner_start_scan();
+    led_set_state(0, 0, 64);   // bright blue = scanning
 }
 
 // ============================================================================

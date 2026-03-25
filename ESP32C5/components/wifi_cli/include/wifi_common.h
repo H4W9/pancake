@@ -123,6 +123,12 @@ typedef struct {
 // Global LED strip handle (shared across components)
 extern led_strip_handle_t g_led_strip;
 
+// LED status helper - call from any component
+void led_set_state(uint8_t r, uint8_t g, uint8_t b);
+
+// Boot animation: R→G→B→white flash, 3× white blink
+void led_boot_sequence(void);
+
 // Global application state (shared across components)
 extern volatile app_state_t g_app_state;
 

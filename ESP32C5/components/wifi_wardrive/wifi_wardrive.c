@@ -1,5 +1,6 @@
 #include "wifi_wardrive.h"
 #include "wifi_scanner.h"
+#include "wifi_common.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -457,6 +458,7 @@ esp_err_t wifi_wardrive_start(void) {
     }
     
     ESP_LOGI(TAG, "Starting wardrive...");
+    led_set_state(0, 64, 32);  // teal = wardrive
     
     // Initialize GPS if not already done
     static bool gps_initialized = false;
@@ -503,6 +505,7 @@ esp_err_t wifi_wardrive_stop(void) {
     }
     
     ESP_LOGI(TAG, "Wardrive stopped");
+    led_set_state(0, 0, 32);   // blue = idle
     return ESP_OK;
 }
 
