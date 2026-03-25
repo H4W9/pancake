@@ -105,18 +105,22 @@ static esp_err_t init_led(void) {
         .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
         .flags.invert_out = false,
     };
-    
+
     led_strip_rmt_config_t rmt_cfg = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
         .resolution_hz = RMT_RES_HZ,
         .flags.with_dma = false,
     };
-    
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &g_led_strip));
-    ESP_LOGI(TAG, "LED strip initialized");
-    led_boot_sequence();           // R→G→B→white, 3× white blink
-    led_set_state(0, 0, 32);       // dim blue = idle/ready
-    
+
+    esp_err_t err = led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &g_led_strip);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "LED strip init FAILED (GPIO %d): %s", NEOPIXEL_GPIO, esp_err_to_name(err));
+        g_led_strip = NULL;
+        return err;
+    }
+    ESP_LOGI(TAG, "LED strip initialized on GPIO %d", NEOPIXEL_GPIO);
+    led_boot_sequence();
+    led_set_state(0, 0, 32);
     return ESP_OK;
 }
 
