@@ -29,7 +29,7 @@ extern "C" {
 #define MAX_HTML_FILENAME 64
 
 // GPIO pins
-#define NEOPIXEL_GPIO 28
+#define NEOPIXEL_GPIO 27
 #define LED_COUNT 1
 #define RMT_RES_HZ (10 * 1000 * 1000)
 
