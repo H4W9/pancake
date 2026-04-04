@@ -138,7 +138,7 @@ static int bt_device_count = 0;
 #define CTP_RST  8
 
 // Backlight control (set to -1 if LED is tied to 3V3 / no GPIO)
-#define LCD_BL_IO -1
+#define LCD_BL_IO 26   // -1
 #define LCD_BL_ACTIVE_LEVEL 1
 
 #define SCREEN_INACTIVITY_TIMEOUT_MS 30000
