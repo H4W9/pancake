@@ -3343,9 +3343,9 @@ void app_main(void)
     
     // MAX17048 fuel gauge — shares I2C bus with FT6336U touch
     if (init_max17048() == ESP_OK) {
-        battery_task_stack = (StackType_t *)heap_caps_malloc(2048 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+        battery_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
         if (battery_task_stack != NULL) {
-            battery_task_handle = xTaskCreateStatic(battery_monitor_task, "bat_mon", 2048, NULL,
+            battery_task_handle = xTaskCreateStatic(battery_monitor_task, "bat_mon", 4096, NULL,
                 tskIDLE_PRIORITY + 1, battery_task_stack, &battery_task_buffer);
             if (battery_task_handle == NULL) {
                 ESP_LOGE(TAG, "Failed to create battery monitor task");
@@ -14745,7 +14745,6 @@ static void battery_monitor_task(void *arg)
 
     for (;;) {
         uint8_t pct = read_max17048_percent();
-        float volts = read_max17048_voltage();
 
         if (pct == 255) {
             // MAX17048 not responding
@@ -14762,7 +14761,7 @@ static void battery_monitor_task(void *arg)
             snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_EMPTY " %d%%", pct);
         }
 
-        ESP_LOGI(TAG, "Battery: %d%% / %.3fV", pct, volts);
+        ESP_LOGI(TAG, "Battery: %d%%", pct);
 
         // Save to global buffer so new screens can show it immediately
         strncpy(last_voltage_str, voltage_str, sizeof(last_voltage_str) - 1);
