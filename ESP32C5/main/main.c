@@ -3133,7 +3133,6 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to create I2C mutex!");
         return;
     }
-    }
 
     // Screenshot worker (queue + background saver task)
     screenshot_queue = xQueueCreate(1, sizeof(screenshot_msg_t));
