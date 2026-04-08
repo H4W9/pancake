@@ -241,6 +241,7 @@ static lv_color_t *buf1 = NULL;
 static lv_color_t *buf2 = NULL;
 static SemaphoreHandle_t lvgl_mutex = NULL;
 SemaphoreHandle_t sd_spi_mutex = NULL;  // Mutex for SD/SPI access (shared with display) - used by attack_handshake.c
+static SemaphoreHandle_t i2c_mutex = NULL;  // Mutex for I2C_NUM_0 (FT6336U touch + MAX17048 battery)
 static volatile bool touch_pressed_flag = false;
 static volatile uint16_t touch_x_flag = 0;
 static volatile uint16_t touch_y_flag = 0;
@@ -3126,6 +3127,14 @@ void app_main(void)
         return;
     }
 
+    // Create I2C mutex (FT6336U touch and MAX17048 battery share I2C_NUM_0)
+    i2c_mutex = xSemaphoreCreateMutex();
+    if (i2c_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create I2C mutex!");
+        return;
+    }
+    }
+
     // Screenshot worker (queue + background saver task)
     screenshot_queue = xQueueCreate(1, sizeof(screenshot_msg_t));
     if (screenshot_queue == NULL) {
@@ -4613,9 +4622,12 @@ void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
     
     // Debug counter kept but no console prints (avoid VFS write during draw)
     call_count++;
-    if (ft6336_read_touch(touch, &point) && point.touched) {
-        touched = true;
-        last_input_ms = now_ms;
+    if (i2c_mutex && xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (ft6336_read_touch(touch, &point) && point.touched) {
+            touched = true;
+            last_input_ms = now_ms;
+        }
+        xSemaphoreGive(i2c_mutex);
     }
 
     if (screen_dimmed) {
@@ -14657,6 +14669,9 @@ static void gps_task(void *arg)
 static esp_err_t max17048_read_reg(uint8_t reg, uint16_t *value)
 {
     uint8_t buf[2];
+    if (!i2c_mutex || xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (MAX17048_ADDR << 1) | I2C_MASTER_WRITE, true);
@@ -14668,6 +14683,9 @@ static esp_err_t max17048_read_reg(uint8_t reg, uint16_t *value)
     i2c_master_stop(cmd);
     esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
+
+    xSemaphoreGive(i2c_mutex);
+
     if (ret == ESP_OK)
         *value = ((uint16_t)buf[0] << 8) | buf[1];
     return ret;
@@ -14676,12 +14694,16 @@ static esp_err_t max17048_read_reg(uint8_t reg, uint16_t *value)
 static esp_err_t init_max17048(void)
 {
     // Probe the MAX17048 on the shared I2C bus
+    if (!i2c_mutex || xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (MAX17048_ADDR << 1) | I2C_MASTER_WRITE, true);
     i2c_master_stop(cmd);
     esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
+    xSemaphoreGive(i2c_mutex);
 
     if (ret == ESP_OK) {
         max17048_found = true;
