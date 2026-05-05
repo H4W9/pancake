@@ -61,6 +61,9 @@
 // TLS (WPA-SEC upload)
 #include "esp_tls.h"
 
+// OTA (dual-boot partition switching)
+#include "esp_ota_ops.h"
+
 // NimBLE (BLE scanner)
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -9711,7 +9714,14 @@ static void main_tile_event_cb(lv_event_t *e)
         show_deauth_monitor_screen();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
-    }
+    } else if (strcmp(tile_name, "Marauder") == 0) {
+    	const esp_partition_t *marauder = esp_partition_find_first(
+        	ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+    	if (marauder) {
+        	esp_ota_set_boot_partition(marauder);
+    	}
+    	esp_restart();
+	}
 }
 
 // Attack tile event callback - after selecting networks
@@ -9878,6 +9888,7 @@ static void show_main_tiles(void)
     create_tile(tiles_container, LV_SYMBOL_SETTINGS, "Settings", UI_ACCENT_GREEN, main_tile_event_cb, "Settings");
     create_tile(tiles_container, LV_SYMBOL_GPS, "Deauth\nMonitor", UI_ACCENT_AMBER, main_tile_event_cb, "Deauth Monitor");
     create_tile(tiles_container, LV_SYMBOL_BLUETOOTH, "Bluetooth", UI_ACCENT_CYAN, main_tile_event_cb, "Bluetooth");
+	create_tile(tiles_container, LV_SYMBOL_POWER, "Marauder", UI_ACCENT_PINK, main_tile_event_cb, "Marauder");
     
     // Show title bar
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
