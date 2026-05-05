@@ -3160,28 +3160,6 @@ void app_main(void)
         return;
     }
 
-    // Create screen refresh task on PSRAM stack at priority 4 (< sniffer_dog priority 5)
-    display_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-    if (display_task_stack != NULL) {
-        display_task_handle = xTaskCreateStatic(
-            display_task,
-            "disp_refresh",
-            4096,
-            NULL,
-            4,   // priority 4 < sniffer_dog priority 5
-            display_task_stack,
-            &display_task_buffer);
-        if (display_task_handle == NULL) {
-            ESP_LOGE(TAG, "Failed to create display refresh task");
-            heap_caps_free(display_task_stack);
-            display_task_stack = NULL;
-        } else {
-            ESP_LOGI(TAG, "Display refresh task created (PSRAM stack, priority 4)");
-        }
-    } else {
-        ESP_LOGE(TAG, "Failed to allocate display task stack from PSRAM");
-    }
-
     // Screenshot worker (queue + background saver task)
     screenshot_queue = xQueueCreate(1, sizeof(screenshot_msg_t));
     if (screenshot_queue == NULL) {
@@ -3309,6 +3287,29 @@ void app_main(void)
     esp_timer_handle_t periodic_timer;
     ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 10 * 1000));
+
+    // LVGL is fully initialized (display driver, indev, and tick timer all registered).
+    // Now it is safe to start the screen refresh task.
+    display_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (display_task_stack != NULL) {
+        display_task_handle = xTaskCreateStatic(
+            display_task,
+            "disp_refresh",
+            4096,
+            NULL,
+            4,   // priority 4 < sniffer_dog priority 5
+            display_task_stack,
+            &display_task_buffer);
+        if (display_task_handle == NULL) {
+            ESP_LOGE(TAG, "Failed to create display refresh task");
+            heap_caps_free(display_task_stack);
+            display_task_stack = NULL;
+        } else {
+            ESP_LOGI(TAG, "Display refresh task created (PSRAM stack, priority 4)");
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate display task stack from PSRAM");
+    }
     
     // Initialize portal HTML buffer (1MB in PSRAM for large HTML files up to 900KB)
     ESP_LOGI(TAG, "Initializing portal HTML buffer in PSRAM...");
