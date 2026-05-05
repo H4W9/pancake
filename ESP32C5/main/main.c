@@ -329,6 +329,11 @@ static QueueHandle_t screenshot_queue = NULL;
 static TaskHandle_t screenshot_task_handle = NULL;
 static StaticTask_t screenshot_task_buffer;
 static StackType_t *screenshot_task_stack = NULL;
+
+// Screen refresh task (PSRAM stack, priority < sniffer_dog)
+static TaskHandle_t display_task_handle = NULL;
+static StaticTask_t display_task_buffer;
+static StackType_t *display_task_stack = NULL;
 static volatile bool screenshot_in_progress = false;
 
 #define SCREENSHOT_DIR "/sdcard/screenshots"
@@ -3034,6 +3039,24 @@ static void create_home_ui(void)
     show_main_tiles();
 }
 
+// ---------------------------------------------------------------------------
+// Screen refresh task
+// Runs lv_timer_handler() under lvgl_mutex.
+// PSRAM stack, priority 4 — lower than sniffer_dog (5) so snifferdog always
+// wins the CPU when it needs it.  The main loop handles UI state updates;
+// this task is the only caller of lv_timer_handler().
+// ---------------------------------------------------------------------------
+static void display_task(void *pvParameters)
+{
+    while (1) {
+        if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            lv_timer_handler();
+            xSemaphoreGive(lvgl_mutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 void app_main(void)
 {
 	//Initialize GPS UART and start background monitor task
@@ -3135,6 +3158,28 @@ void app_main(void)
     if (i2c_mutex == NULL) {
         ESP_LOGE(TAG, "Failed to create I2C mutex!");
         return;
+    }
+
+    // Create screen refresh task on PSRAM stack at priority 4 (< sniffer_dog priority 5)
+    display_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (display_task_stack != NULL) {
+        display_task_handle = xTaskCreateStatic(
+            display_task,
+            "disp_refresh",
+            4096,
+            NULL,
+            4,   // priority 4 < sniffer_dog priority 5
+            display_task_stack,
+            &display_task_buffer);
+        if (display_task_handle == NULL) {
+            ESP_LOGE(TAG, "Failed to create display refresh task");
+            heap_caps_free(display_task_stack);
+            display_task_stack = NULL;
+        } else {
+            ESP_LOGI(TAG, "Display refresh task created (PSRAM stack, priority 4)");
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate display task stack from PSRAM");
     }
 
     // Screenshot worker (queue + background saver task)
@@ -3384,9 +3429,8 @@ void app_main(void)
         //     last_log = now;
         // }
         
-        // Thread-safe LVGL handling
-        uint32_t sleep_ms = 10;
-        if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY) == pdTRUE) {
+        // Thread-safe LVGL state updates (lv_timer_handler runs in display_task)
+        if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             // Apply touch indicator changes outside indev callback
             if (touch_dot && show_touch_dot) {
                 if (touch_pressed_flag) {
@@ -4529,11 +4573,6 @@ void app_main(void)
                 }
             }
 
-            sleep_ms = lv_timer_handler();
-            
-            // Reset watchdog INSIDE mutex to catch long rendering operations
-            esp_task_wdt_reset();
-            
             xSemaphoreGive(lvgl_mutex);
         }
 
@@ -4546,7 +4585,7 @@ void app_main(void)
             xSemaphoreGive(sd_spi_mutex);
         }
         
-        vTaskDelay(pdMS_TO_TICKS(sleep_ms > 10 ? 10 : sleep_ms));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
