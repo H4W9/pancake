@@ -48,10 +48,7 @@
 // GPS
 #include "driver/uart.h"
 
-// ADC for battery voltage monitoring
-#include "esp_adc/adc_oneshot.h"
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
+// ADC includes removed — battery now uses MAX17048 fuel gauge over I2C
 
 // LwIP (ARP Poisoning)
 #include "lwip/etharp.h"
@@ -138,7 +135,7 @@ static int bt_device_count = 0;
 #define CTP_RST  8
 
 // Backlight control (set to -1 if LED is tied to 3V3 / no GPIO)
-#define LCD_BL_IO -1
+#define LCD_BL_IO 26   // -1
 #define LCD_BL_ACTIVE_LEVEL 1
 
 #define SCREEN_INACTIVITY_TIMEOUT_MS 30000
@@ -150,19 +147,11 @@ static int bt_device_count = 0;
 #define LCD_V_RES 320
 #define LCD_HOST SPI2_HOST
 
-// Battery ADC configuration - Waveshare ESP32-C5-WIFI6-KIT (DISABLED - using regular C5 chip)
-// Schematic: R10=200k, R16=100k voltage divider on BAT_ADC line
-// Note: GPIO6 = ADC1_CH5 on ESP32-C5 (not CH6!)
-#define BATTERY_ADC_CHANNEL    ADC_CHANNEL_5  // GPIO6 = ADC1_CH5 (BAT_ADC on Waveshare)
-#define BATTERY_ADC_UNIT       ADC_UNIT_1
-#define BATTERY_ADC_ATTEN      ADC_ATTEN_DB_12  // Full scale ~3.3V
-#define BATTERY_VOLTAGE_DIVIDER_RATIO  3.2f    // Calibrated: VBAT 4.14V / GPIO6 1.29V = 3.21
-#define BATTERY_ADC_SAMPLES            32      // Number of samples to average
-#define BATTERY_UPDATE_INTERVAL_MS     30000   // 30 seconds
-
-// Battery voltage thresholds
-#define BATTERY_VOLTAGE_CRITICAL  2.0f   // Below this: no battery symbol
-#define BATTERY_VOLTAGE_CHARGING  4.8f   // Above this: charging (lightning symbol)
+// MAX17048 fuel gauge configuration — I2C_NUM_0, SDA=9, SCL=10 (shared with FT6336U touch)
+#define MAX17048_ADDR              0x36
+#define MAX17048_REG_VCELL         0x02   // Cell voltage (12-bit, 1.25mV/LSB, upper 12 bits)
+#define MAX17048_REG_SOC           0x04   // State of charge (upper byte = %, lower byte = 1/256%)
+#define BATTERY_UPDATE_INTERVAL_MS 30000  // 30 seconds
 
 // ============================================================================
 // Dark / Light dual palette (LAB5 theme)
@@ -252,6 +241,7 @@ static lv_color_t *buf1 = NULL;
 static lv_color_t *buf2 = NULL;
 static SemaphoreHandle_t lvgl_mutex = NULL;
 SemaphoreHandle_t sd_spi_mutex = NULL;  // Mutex for SD/SPI access (shared with display) - used by attack_handshake.c
+static SemaphoreHandle_t i2c_mutex = NULL;  // Mutex for I2C_NUM_0 (FT6336U touch + MAX17048 battery)
 static volatile bool touch_pressed_flag = false;
 static volatile uint16_t touch_x_flag = 0;
 static volatile uint16_t touch_y_flag = 0;
@@ -360,8 +350,9 @@ static void gps_task(void *arg);
 static void screenshot_btn_event_cb(lv_event_t *e);
 
 // Battery voltage monitor forward declarations (DISABLED - using regular C5 chip)
-static esp_err_t init_battery_adc(void);
-static float read_battery_voltage(void);
+static esp_err_t init_max17048(void);
+static uint8_t read_max17048_percent(void);
+static float read_max17048_voltage(void);
 static void battery_monitor_task(void *arg);
 static esp_err_t save_snapshot_bmp(lv_img_dsc_t *shot, const char *filepath);
 static int find_next_screenshot_index(void);
@@ -989,8 +980,7 @@ static bool bt_tracking_mode = false;
 // Battery voltage monitor state (DISABLED - using regular C5 chip)
 static lv_obj_t *battery_label = NULL;  // Keep for UI layout
 static char last_voltage_str[32] = "-.--V";  // Persisted across screen changes
-static adc_oneshot_unit_handle_t battery_adc_handle = NULL;
-static adc_cali_handle_t battery_adc_cali_handle = NULL;
+static bool max17048_found = false;
 static StaticTask_t battery_task_buffer;
 static StackType_t *battery_task_stack = NULL;
 static TaskHandle_t battery_task_handle = NULL;
@@ -3137,6 +3127,13 @@ void app_main(void)
         return;
     }
 
+    // Create I2C mutex (FT6336U touch and MAX17048 battery share I2C_NUM_0)
+    i2c_mutex = xSemaphoreCreateMutex();
+    if (i2c_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create I2C mutex!");
+        return;
+    }
+
     // Screenshot worker (queue + background saver task)
     screenshot_queue = xQueueCreate(1, sizeof(screenshot_msg_t));
     if (screenshot_queue == NULL) {
@@ -3344,11 +3341,11 @@ void app_main(void)
     check_heap_integrity("Before main loop");
     print_memory_stats();
     
-    //Battery voltage monitor disabled - chip changed from Waveshare to regular C5
-    if (init_battery_adc() == ESP_OK) {
-        battery_task_stack = (StackType_t *)heap_caps_malloc(2048 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    // MAX17048 fuel gauge — shares I2C bus with FT6336U touch
+    if (init_max17048() == ESP_OK) {
+        battery_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
         if (battery_task_stack != NULL) {
-            battery_task_handle = xTaskCreateStatic(battery_monitor_task, "bat_mon", 2048, NULL,
+            battery_task_handle = xTaskCreateStatic(battery_monitor_task, "bat_mon", 4096, NULL,
                 tskIDLE_PRIORITY + 1, battery_task_stack, &battery_task_buffer);
             if (battery_task_handle == NULL) {
                 ESP_LOGE(TAG, "Failed to create battery monitor task");
@@ -4624,9 +4621,12 @@ void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
     
     // Debug counter kept but no console prints (avoid VFS write during draw)
     call_count++;
-    if (ft6336_read_touch(touch, &point) && point.touched) {
-        touched = true;
-        last_input_ms = now_ms;
+    if (i2c_mutex && xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (ft6336_read_touch(touch, &point) && point.touched) {
+            touched = true;
+            last_input_ms = now_ms;
+        }
+        xSemaphoreGive(i2c_mutex);
     }
 
     if (screen_dimmed) {
@@ -14662,125 +14662,111 @@ static void gps_task(void *arg)
 // === BATTERY VOLTAGE MONITOR IMPLEMENTATION ===
 // Disabled - chip changed from Waveshare to regular ESP32-C5
 
-#if 1  // Battery monitor enabled
-static esp_err_t init_battery_adc(void)
+#if 1  // MAX17048 battery fuel gauge
+
+// Read a 16-bit big-endian register from MAX17048
+static esp_err_t max17048_read_reg(uint8_t reg, uint16_t *value)
 {
-    // Configure ADC unit
-    adc_oneshot_unit_init_cfg_t init_cfg = {
-        .unit_id = BATTERY_ADC_UNIT,
-        .ulp_mode = ADC_ULP_MODE_DISABLE,
-    };
-    
-    esp_err_t ret = adc_oneshot_new_unit(&init_cfg, &battery_adc_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create ADC unit: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    
-    // Configure ADC channel
-    adc_oneshot_chan_cfg_t chan_cfg = {
-        .atten = BATTERY_ADC_ATTEN,
-        .bitwidth = ADC_BITWIDTH_12,
-    };
-    
-    ret = adc_oneshot_config_channel(battery_adc_handle, BATTERY_ADC_CHANNEL, &chan_cfg);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure ADC channel: %s", esp_err_to_name(ret));
-        adc_oneshot_del_unit(battery_adc_handle);
-        battery_adc_handle = NULL;
-        return ret;
-    }
-    
-    // Try to create calibration handle for more accurate readings
-    adc_cali_curve_fitting_config_t cali_cfg = {
-        .unit_id = BATTERY_ADC_UNIT,
-        .chan = BATTERY_ADC_CHANNEL,
-        .atten = BATTERY_ADC_ATTEN,
-        .bitwidth = ADC_BITWIDTH_12,
-    };
-    
-    ret = adc_cali_create_scheme_curve_fitting(&cali_cfg, &battery_adc_cali_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "ADC calibration not available, using raw values");
-        battery_adc_cali_handle = NULL;
-    } else {
-        ESP_LOGI(TAG, "ADC calibration enabled");
-    }
-    
-    ESP_LOGI(TAG, "Battery ADC initialized on channel %d", BATTERY_ADC_CHANNEL);
-    return ESP_OK;
+    uint8_t buf[2];
+    if (!i2c_mutex || xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MAX17048_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg, true);
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MAX17048_ADDR << 1) | I2C_MASTER_READ, true);
+    i2c_master_read_byte(cmd, &buf[0], I2C_MASTER_ACK);
+    i2c_master_read_byte(cmd, &buf[1], I2C_MASTER_NACK);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+
+    xSemaphoreGive(i2c_mutex);
+
+    if (ret == ESP_OK)
+        *value = ((uint16_t)buf[0] << 8) | buf[1];
+    return ret;
 }
 
-static float read_battery_voltage(void)
+static esp_err_t init_max17048(void)
 {
-    if (battery_adc_handle == NULL) {
-        return 0.0f;
-    }
-    
-    // Take multiple samples and average them for stability
-    int32_t sum = 0;
-    int valid_samples = 0;
-    
-    for (int i = 0; i < BATTERY_ADC_SAMPLES; i++) {
-        int raw_value = 0;
-        esp_err_t ret = adc_oneshot_read(battery_adc_handle, BATTERY_ADC_CHANNEL, &raw_value);
-        if (ret == ESP_OK) {
-            sum += raw_value;
-            valid_samples++;
-        }
-    }
-    
-    if (valid_samples == 0) {
-        return 0.0f;
-    }
-    
-    int avg_raw = sum / valid_samples;
-    
-    // Convert raw ADC to voltage (12-bit ADC, ~3.3V reference with DB_12 attenuation)
-    // Note: Calibration may not be available on all ESP32-C5 chips
-    float voltage_mv;
-    if (battery_adc_cali_handle != NULL) {
-        int calibrated_mv = 0;
-        adc_cali_raw_to_voltage(battery_adc_cali_handle, avg_raw, &calibrated_mv);
-        voltage_mv = (float)calibrated_mv;
+    // Probe the MAX17048 on the shared I2C bus
+    if (!i2c_mutex || xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MAX17048_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    xSemaphoreGive(i2c_mutex);
+
+    if (ret == ESP_OK) {
+        max17048_found = true;
+        ESP_LOGI(TAG, "MAX17048 detected at 0x%02X", MAX17048_ADDR);
     } else {
-        // Fallback: raw to voltage (12-bit, 3.3V ref)
-        voltage_mv = (avg_raw / 4095.0f) * 3300.0f;
+        ESP_LOGW(TAG, "MAX17048 not found (ret=%s) — battery display disabled", esp_err_to_name(ret));
     }
-    
-    // Apply voltage divider ratio to get actual battery voltage
-    float battery_voltage = (voltage_mv / 1000.0f) * BATTERY_VOLTAGE_DIVIDER_RATIO;
-    
-    return battery_voltage;
+    return ret;
+}
+
+// Returns battery percentage 0-100, or 255 if unavailable
+static uint8_t read_max17048_percent(void)
+{
+    if (!max17048_found) return 255;
+    uint16_t raw = 0;
+    if (max17048_read_reg(MAX17048_REG_SOC, &raw) != ESP_OK) return 255;
+    // Upper byte = integer %, lower byte = 1/256 fractional
+    uint8_t percent = raw >> 8;
+    if (percent > 100) percent = 100;
+    return percent;
+}
+
+// Returns cell voltage in volts, or 0.0 if unavailable
+static float read_max17048_voltage(void)
+{
+    if (!max17048_found) return 0.0f;
+    uint16_t raw = 0;
+    if (max17048_read_reg(MAX17048_REG_VCELL, &raw) != ESP_OK) return 0.0f;
+    // 1.25mV per LSB, value in upper 12 bits
+    return (raw >> 4) * 0.00125f;
 }
 
 static void battery_monitor_task(void *arg)
 {
     (void)arg;
     char voltage_str[32];
-    
+
     // Initial delay to let UI stabilize
     vTaskDelay(pdMS_TO_TICKS(2000));
-    
+
     for (;;) {
-        float voltage = read_battery_voltage();
-        
-        // Format battery indicator based on voltage using LVGL symbols
-        if (voltage < BATTERY_VOLTAGE_CRITICAL) {
-            // No battery / critical: empty battery symbol
-            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_EMPTY);
-        } else if (voltage > BATTERY_VOLTAGE_CHARGING) {
-            // Charging: charging symbol
-            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_CHARGE "");
+        uint8_t pct = read_max17048_percent();
+
+        if (pct == 255) {
+            // MAX17048 not responding
+            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_EMPTY " --");
+        } else if (pct >= 75) {
+            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_FULL " %d%%", pct);
+        } else if (pct >= 50) {
+            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_3 " %d%%", pct);
+        } else if (pct >= 25) {
+            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_2 " %d%%", pct);
+        } else if (pct >= 10) {
+            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_1 " %d%%", pct);
         } else {
-            // Normal battery: show battery with voltage
-            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_FULL " %.2fV", voltage);
+            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_EMPTY " %d%%", pct);
         }
-        
+
+        ESP_LOGI(TAG, "Battery: %d%%", pct);
+
         // Save to global buffer so new screens can show it immediately
         strncpy(last_voltage_str, voltage_str, sizeof(last_voltage_str) - 1);
         last_voltage_str[sizeof(last_voltage_str) - 1] = '\0';
-        
+
         // Update label with LVGL mutex protection
         if (lvgl_mutex && xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (battery_label != NULL && lv_obj_is_valid(battery_label)) {
@@ -14788,11 +14774,11 @@ static void battery_monitor_task(void *arg)
             }
             xSemaphoreGive(lvgl_mutex);
         }
-        
+
         vTaskDelay(pdMS_TO_TICKS(BATTERY_UPDATE_INTERVAL_MS));
     }
 }
-#endif  // Battery monitor disabled
+#endif  // MAX17048 battery fuel gauge
 
 static void evil_twin_start_btn_cb(lv_event_t *e)
 {
