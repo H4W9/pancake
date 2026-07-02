@@ -1971,9 +1971,19 @@ static void nvs_settings_save_dark_mode(bool enabled)
 
 static void init_backlight(void)
 {
+#if LCD_BL_IO >= 0
+    // Pancake backlight is on a GPIO (not tied to 3V3): drive it to turn the panel on.
+    gpio_config_t bk_cfg = {
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = 1ULL << LCD_BL_IO,
+    };
+    gpio_config(&bk_cfg);
+    gpio_set_level(LCD_BL_IO, LCD_BL_ACTIVE_LEVEL);
+#else
     // No backlight GPIO configured (LED tied to 3V3).
-    // Brightness is controlled via a software overlay on lv_layer_top().
     (void)0;
+#endif
+    // Brightness levels are handled by a software overlay on lv_layer_top().
 }
 
 static void set_backlight_percent(uint8_t percent)
