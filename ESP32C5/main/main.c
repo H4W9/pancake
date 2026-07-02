@@ -240,6 +240,17 @@ static lv_disp_draw_buf_t draw_buf;
 static lv_color_t *buf1 = NULL;
 static lv_color_t *buf2 = NULL;
 static SemaphoreHandle_t lvgl_mutex = NULL;
+
+// Dedicated display/LVGL refresh task. Runs the LVGL loop off the main task so a
+// busy higher-priority capture task (sniffer_dog is prio 5) preempts the screen
+// refresh instead of the reverse. Stack lives in PSRAM (like the other tasks).
+#define DISPLAY_TASK_STACK    16384
+#define DISPLAY_TASK_PRIORITY 4      // must stay BELOW sniffer_dog (5)
+static TaskHandle_t display_task_handle = NULL;
+static StaticTask_t display_task_buffer;
+static StackType_t *display_task_stack = NULL;
+static void display_refresh_task(void *pvParameters);
+
 SemaphoreHandle_t sd_spi_mutex = NULL;  // Mutex for SD/SPI access (shared with display) - used by attack_handshake.c
 static SemaphoreHandle_t i2c_mutex = NULL;  // Mutex for I2C_NUM_0 (FT6336U touch + MAX17048 battery)
 static volatile bool touch_pressed_flag = false;
@@ -1920,50 +1931,57 @@ static void nvs_settings_load(void)
     wifi_scanner_set_scan_time(scan_time_min_ms, scan_time_max_ms);
 }
 
-static void nvs_settings_save_timeout(int32_t ms)
+// These settings-save helpers are called from LVGL event callbacks, which run on
+// the display task's PSRAM stack. Internal-flash (NVS) writes disable the CPU
+// cache, making a PSRAM stack unreadable mid-write -> crash. So the helpers only
+// enqueue the change; nvs_writer_task (below, created with an INTERNAL-RAM stack)
+// performs the actual commit in a safe context.
+typedef struct {
+    uint8_t kind;   // 0=timeout 1=brightness 2=scan_time 3=dark_mode
+    int32_t a;
+    int32_t b;
+} nvs_save_req_t;
+
+static QueueHandle_t nvs_save_queue = NULL;
+
+static void nvs_writer_task(void *arg)
 {
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, NVS_KEY_TIMEOUT, ms);
+    (void)arg;
+    nvs_save_req_t req;
+    for (;;) {
+        if (xQueueReceive(nvs_save_queue, &req, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        nvs_handle_t h;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+            continue;
+        }
+        switch (req.kind) {
+            case 0: nvs_set_i32(h, NVS_KEY_TIMEOUT, req.a); break;
+            case 1: nvs_set_u8(h, NVS_KEY_BRIGHTNESS, (uint8_t)req.a); break;
+            case 2: nvs_set_u16(h, NVS_KEY_SCAN_MIN, (uint16_t)req.a);
+                    nvs_set_u16(h, NVS_KEY_SCAN_MAX, (uint16_t)req.b); break;
+            case 3: nvs_set_u8(h, NVS_KEY_DARK_MODE, req.a ? 1 : 0); break;
+            default: nvs_close(h); continue;
+        }
         nvs_commit(h);
         nvs_close(h);
-        ESP_LOGI(TAG, "NVS: saved timeout = %ldms", (long)ms);
+        ESP_LOGI(TAG, "NVS: committed setting kind=%u", req.kind);
     }
 }
 
-static void nvs_settings_save_brightness(uint8_t pct)
+static inline void nvs_save_enqueue(uint8_t kind, int32_t a, int32_t b)
 {
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, NVS_KEY_BRIGHTNESS, pct);
-        nvs_commit(h);
-        nvs_close(h);
-        ESP_LOGI(TAG, "NVS: saved brightness = %u%%", pct);
+    if (nvs_save_queue) {
+        nvs_save_req_t req = { kind, a, b };
+        xQueueSend(nvs_save_queue, &req, 0);   // non-blocking, safe from PSRAM stack
     }
 }
 
-static void nvs_settings_save_scan_time(uint16_t min_ms, uint16_t max_ms)
-{
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u16(h, NVS_KEY_SCAN_MIN, min_ms);
-        nvs_set_u16(h, NVS_KEY_SCAN_MAX, max_ms);
-        nvs_commit(h);
-        nvs_close(h);
-        ESP_LOGI(TAG, "NVS: saved scan time = %u-%ums", min_ms, max_ms);
-    }
-}
-
-static void nvs_settings_save_dark_mode(bool enabled)
-{
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, NVS_KEY_DARK_MODE, enabled ? 1 : 0);
-        nvs_commit(h);
-        nvs_close(h);
-        ESP_LOGI(TAG, "NVS: saved dark_mode = %d", enabled);
-    }
-}
+static void nvs_settings_save_timeout(int32_t ms)                     { nvs_save_enqueue(0, ms, 0); }
+static void nvs_settings_save_brightness(uint8_t pct)                 { nvs_save_enqueue(1, pct, 0); }
+static void nvs_settings_save_scan_time(uint16_t min_ms, uint16_t max_ms) { nvs_save_enqueue(2, min_ms, max_ms); }
+static void nvs_settings_save_dark_mode(bool enabled)                 { nvs_save_enqueue(3, enabled ? 1 : 0, 0); }
 
 // ============================================================================
 // Backlight / Brightness / Screen Dimming
@@ -3371,12 +3389,51 @@ void app_main(void)
         ESP_LOGW(TAG, "Battery ADC init failed - voltage monitor disabled");
     }
 
-    // Subscribe main task to watchdog to prevent IDLE task starvation during LVGL rendering
-    esp_task_wdt_add(NULL);
-    ESP_LOGI(TAG, "Main task subscribed to watchdog");
+    // Deferred-NVS writer: LVGL callbacks run on the display task's PSRAM stack and
+    // must not write internal flash, so settings saves are queued to this task,
+    // which uses a normal INTERNAL-RAM stack and can safely commit to NVS.
+    nvs_save_queue = xQueueCreate(8, sizeof(nvs_save_req_t));
+    if (nvs_save_queue != NULL) {
+        if (xTaskCreate(nvs_writer_task, "nvs_writer", 4096, NULL, 3, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create nvs_writer task; settings won't persist");
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to create nvs_save_queue; settings won't persist");
+    }
 
-    // ✅ Main loop diagnostics
-    ESP_LOGI(TAG, "[MAIN LOOP] Starting main event loop...");
+    // Launch the LVGL/display refresh loop as its own task with a PSRAM stack, at
+    // a priority BELOW sniffer_dog (5) so real-time capture preempts the screen
+    // refresh (not the reverse). The old code ran this loop inline in app_main at
+    // the default main-task priority (1), where a busy capture task starved it and
+    // the display froze. All LVGL access stays serialized by lvgl_mutex.
+    display_task_stack = (StackType_t *)heap_caps_malloc(DISPLAY_TASK_STACK * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (display_task_stack == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate display task stack from PSRAM");
+        return;
+    }
+    display_task_handle = xTaskCreateStatic(display_refresh_task, "display", DISPLAY_TASK_STACK, NULL,
+        DISPLAY_TASK_PRIORITY, display_task_stack, &display_task_buffer);
+    if (display_task_handle == NULL) {
+        ESP_LOGE(TAG, "Failed to create display refresh task");
+        heap_caps_free(display_task_stack);
+        display_task_stack = NULL;
+        return;
+    }
+    ESP_LOGI(TAG, "Display refresh task running (PSRAM stack, prio %d)", DISPLAY_TASK_PRIORITY);
+
+    // app_main (main_task) has nothing left to do; let it return so it self-deletes.
+    return;
+}
+
+// Dedicated LVGL/display refresh loop (see notes at the display_task_* declarations).
+static void display_refresh_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    // Subscribe THIS task to the watchdog: it performs the long LVGL rendering.
+    esp_task_wdt_add(NULL);
+    ESP_LOGI(TAG, "[DISPLAY] refresh task started");
+
     uint32_t loop_counter = 0;
     TickType_t last_log = xTaskGetTickCount();
 
