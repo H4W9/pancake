@@ -60,7 +60,7 @@ static esp_err_t init_wifi(void) {
     
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    
+
     // Register event handler only once
     if (!wifi_event_handler_registered) {
         esp_err_t reg_err = esp_event_handler_instance_register(WIFI_EVENT,
@@ -80,7 +80,19 @@ static esp_err_t init_wifi(void) {
     // AP mode will be enabled dynamically when needed (Evil Twin, etc.)
     wifi_config_t wifi_config = {0};
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+
+    // By default the WiFi driver persists STA/AP config to the NVS partition.
+    // Under a small/near-full NVS (e.g. loaded via M5Launcher's partition table)
+    // that write fails with ESP_ERR_NVS_NOT_ENOUGH_SPACE. Only in that case,
+    // fall back to RAM-only storage (we don't need to persist credentials) so
+    // boot doesn't abort. Normal builds keep flash persistence.
+    esp_err_t cfg_err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (cfg_err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        MY_LOG_INFO(TAG, "NVS full; using RAM storage for WiFi config");
+        ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+        cfg_err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    }
+    ESP_ERROR_CHECK(cfg_err);
     ESP_ERROR_CHECK(esp_wifi_start());
     
     uint8_t mac[6];
