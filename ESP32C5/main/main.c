@@ -75,6 +75,7 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "ble_honeypair.h"
+#include "ble_blueduck.h"
 
 #define TAG "WiFi_Hacker"
 
@@ -1031,6 +1032,21 @@ static lv_obj_t *hp_persona_label = NULL;
 static lv_obj_t *hp_exit_btn = NULL;
 static volatile bool hp_screen_active = false;
 
+// Which peripheral service table is registered in NimBLE (HoneyPair vs BlueDuck).
+// They both define HID 0x1812 so only one can be registered per BLE init.
+static bool s_ble_for_blueduck = false;
+
+// BLE BlueDuck UI state
+static lv_obj_t *bd_content = NULL;
+static lv_obj_t *bd_persona_dd = NULL;
+static lv_obj_t *bd_script_dd = NULL;
+static lv_obj_t *bd_startstop_btn = NULL;
+static lv_obj_t *bd_startstop_lbl = NULL;
+static lv_obj_t *bd_stats_label = NULL;
+static lv_obj_t *bd_exit_btn = NULL;
+static volatile bool bd_screen_active = false;
+static int bd_script_count = 0;
+
 // Battery voltage monitor state (DISABLED - using regular C5 chip)
 static lv_obj_t *battery_label = NULL;  // Keep for UI layout
 static char last_voltage_str[32] = "-.--V";  // Persisted across screen changes
@@ -1201,6 +1217,18 @@ static void reset_function_page_children(void) {
     hp_persona_label = NULL;
     hp_exit_btn = NULL;
     hp_screen_active = false;
+    // BLE BlueDuck: stop advertising/injection on any nav away
+    if (bd_screen_active) {
+        blueduck_stop();
+    }
+    bd_content = NULL;
+    bd_persona_dd = NULL;
+    bd_script_dd = NULL;
+    bd_startstop_btn = NULL;
+    bd_startstop_lbl = NULL;
+    bd_stats_label = NULL;
+    bd_exit_btn = NULL;
+    bd_screen_active = false;
     wifi_connect_ta = NULL;
     wifi_connect_keyboard = NULL;
     wifi_connect_status_label = NULL;
@@ -1373,6 +1401,16 @@ static void hp_startstop_cb(lv_event_t *e);
 static void hp_persona_dd_cb(lv_event_t *e);
 static void hp_exit_cb(lv_event_t *e);
 static void hp_update_stats_ui(void);
+
+// BLE BlueDuck UI
+static void show_blueduck_screen(void);
+static void bd_startstop_cb(lv_event_t *e);
+static void bd_exit_cb(lv_event_t *e);
+static void bd_update_stats_ui(void);
+
+// BLE peripheral mode switch (re-inits NimBLE if the registered service table
+// must change between HoneyPair and BlueDuck).
+static bool ensure_ble_periph_mode(bool for_blueduck);
 
 // Deauth Monitor functions
 static void show_deauth_monitor_screen(void);
@@ -3259,6 +3297,9 @@ void app_main(void)
     // BLE HoneyPair backend — shares the SD/SPI mutex + GPS snapshot for geotagged logs
     honeypair_init(sd_spi_mutex, local_gps_snapshot);
 
+    // BLE BlueDuck backend — same shared resources; scripts from SD
+    blueduck_init(sd_spi_mutex, local_gps_snapshot);
+
     // Create I2C mutex (FT6336U touch and MAX17048 battery share I2C_NUM_0)
     i2c_mutex = xSemaphoreCreateMutex();
     if (i2c_mutex == NULL) {
@@ -4533,6 +4574,16 @@ static void display_refresh_task(void *pvParameters)
                 if (hp_now - hp_last_us > 400000) {
                     hp_last_us = hp_now;
                     hp_update_stats_ui();
+                }
+            }
+
+            // BLE BlueDuck stats refresh (throttled to ~2.5 Hz)
+            if (bd_screen_active) {
+                static int64_t bd_last_us = 0;
+                int64_t bd_now = esp_timer_get_time();
+                if (bd_now - bd_last_us > 400000) {
+                    bd_last_us = bd_now;
+                    bd_update_stats_ui();
                 }
             }
 
@@ -13701,6 +13752,10 @@ static void show_bluetooth_screen(void)
     // BLE HoneyPair - Pink: advertise spoofed BLE personas and log pairing attempts
     lv_obj_t *honeypair_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Honey\nPair", lv_color_make(255, 45, 130), NULL, NULL);
     lv_obj_add_event_cb(honeypair_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"HoneyPair");
+
+    // BLE BlueDuck - Orange: HID keyboard persona, inject DuckyScript on connect
+    lv_obj_t *blueduck_tile = create_tile(tiles, LV_SYMBOL_KEYBOARD, "Blue\nDuck", lv_color_make(255, 90, 0), NULL, NULL);
+    lv_obj_add_event_cb(blueduck_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BlueDuck");
 }
 
 // BT Locator screen - scan BT devices, select one, then track RSSI every 10s
@@ -14858,6 +14913,12 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    // BLE BlueDuck
+    if (strcmp(attack_name, "BlueDuck") == 0) {
+        show_blueduck_screen();
+        return;
+    }
+
     // Stub screens for not-yet-implemented features
     if (strcmp(attack_name, "Package Monitor") == 0 ||
         strcmp(attack_name, "Channel View") == 0) {
@@ -15672,12 +15733,14 @@ static esp_err_t bt_nimble_init(void)
     ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC;
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC;
 
-    // GAP/GATT base services + peripheral feature service table. Must be
-    // registered before the host task starts. HoneyPair is the only advertising
-    // peripheral wired so far; blueduck registration is added with that feature.
+    // GAP/GATT base services + ONE peripheral feature service table. HoneyPair
+    // and BlueDuck both define HID 0x1812, so only one may be registered per
+    // init; s_ble_for_blueduck selects which. Switching peripheral features
+    // re-inits NimBLE (see ensure_ble_periph_mode). Must precede host start.
     ble_svc_gap_init();
     ble_svc_gatt_init();
-    honeypair_register_services();
+    if (s_ble_for_blueduck) blueduck_register_services();
+    else                    honeypair_register_services();
 
     // Start NimBLE host task
     nimble_port_freertos_init(nimble_host_task);
@@ -15691,8 +15754,22 @@ static esp_err_t bt_nimble_init(void)
         ESP_LOGE(TAG, "NimBLE failed to sync");
         return ESP_FAIL;
     }
-    
+
     return ESP_OK;
+}
+
+// Bring BLE up with the correct peripheral service table registered. HoneyPair
+// and BlueDuck can't be registered together (both use HID 0x1812), so switching
+// between them tears down and re-inits NimBLE. Scanning features use plain
+// ensure_ble_mode() and work regardless of which table is registered.
+static bool ensure_ble_periph_mode(bool for_blueduck)
+{
+    if (nimble_initialized && s_ble_for_blueduck != for_blueduck) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    s_ble_for_blueduck = for_blueduck;
+    return ensure_ble_mode();
 }
 
 /**
@@ -16381,7 +16458,8 @@ static void feature_led_update(void)
 
     // Priority 2: solid color reflecting the active new BLE feature.
     int r, g, b;
-    if (hp_screen_active && honeypair_is_active()) { r = 80; g = 0;  b = 40; }  // magenta — HoneyPair advertising
+    if (bd_screen_active && blueduck_is_active())  { r = 90; g = 30; b = 0;  }  // orange — BlueDuck advertising/injecting
+    else if (hp_screen_active && honeypair_is_active()) { r = 80; g = 0; b = 40; }  // magenta — HoneyPair advertising
     else if (gw_screen_active)                     { r = 40; g = 0;  b = 80; }  // purple — GATT Walker
     else if (lookout_screen_active)                { r = 0;  g = 0;  b = 80; }  // blue — BT Lookout scanning
     else                                           { r = 0;  g = 0;  b = 0;  }  // off — idle
@@ -16670,7 +16748,7 @@ static void show_honeypair_screen(void)
     lv_obj_center(ex);
     lv_obj_add_event_cb(hp_exit_btn, hp_exit_cb, LV_EVENT_CLICKED, NULL);
 
-    if (!ensure_ble_mode()) {
+    if (!ensure_ble_periph_mode(false)) {
         lv_label_set_text(hp_stats_label, "BLE init failed!");
         ui_locked = false;
         return;
@@ -16678,6 +16756,179 @@ static void show_honeypair_screen(void)
 
     hp_screen_active = true;
     hp_update_stats_ui();
+    ui_locked = false;
+}
+
+// ============================================================================
+// BLE BlueDuck — advertise as a HID keyboard persona; when a host connects,
+// inject a DuckyScript (.duck) payload from /sdcard/lab/ble/blueduck/scripts/.
+// Backend: ble_blueduck.c. Requires CONFIG_BT_NIMBLE_EXT_ADV=y.
+// ============================================================================
+
+static void bd_update_stats_ui(void)
+{
+    if (!bd_screen_active) return;
+    blueduck_stats_t st;
+    blueduck_get_stats(&st);
+    if (bd_stats_label) {
+        char s[160];
+        snprintf(s, sizeof(s), "%s%s\nPersona: %s\nConnects %d   Payloads %d",
+                 st.active ? "ADVERTISING" : "stopped",
+                 st.executing ? " (injecting)" : "",
+                 st.persona_name, st.connects, st.payloads_sent);
+        lv_label_set_text(bd_stats_label, s);
+    }
+}
+
+static void bd_startstop_cb(lv_event_t *e)
+{
+    (void)e;
+    if (blueduck_is_active()) {
+        blueduck_stop();
+        if (bd_startstop_lbl) lv_label_set_text(bd_startstop_lbl, "Start");
+    } else {
+        int pidx = bd_persona_dd ? (int)lv_dropdown_get_selected(bd_persona_dd) : 0;
+        const char *path = NULL;
+        if (bd_script_dd && bd_script_count > 0) {
+            path = blueduck_script_path((int)lv_dropdown_get_selected(bd_script_dd));
+        }
+        if (!path || !path[0]) {
+            if (bd_stats_label)
+                lv_label_set_text(bd_stats_label,
+                    "No script!\nAdd .duck files to\n/sdcard/lab/ble/blueduck/scripts/");
+            return;
+        }
+        blueduck_start(pidx, path);
+        if (bd_startstop_lbl) lv_label_set_text(bd_startstop_lbl, "Stop");
+    }
+    bd_update_stats_ui();
+}
+
+static void bd_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    blueduck_stop();
+
+    bd_screen_active = false;
+    bd_content = NULL;
+    bd_persona_dd = NULL;
+    bd_script_dd = NULL;
+    bd_startstop_btn = NULL;
+    bd_startstop_lbl = NULL;
+    bd_stats_label = NULL;
+    bd_exit_btn = NULL;
+
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+
+    nav_to_menu_flag = true;
+}
+
+static void show_blueduck_screen(void)
+{
+    ui_locked = true;
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    create_function_page_base("BLE BlueDuck");
+
+    bd_content = lv_obj_create(function_page);
+    lv_obj_set_size(bd_content, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(bd_content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(bd_content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(bd_content, 0, 0);
+    lv_obj_set_style_pad_all(bd_content, 6, 0);
+    lv_obj_clear_flag(bd_content, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *pl = lv_label_create(bd_content);
+    lv_label_set_text(pl, "Persona:");
+    lv_obj_set_style_text_color(pl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(pl, &lv_font_montserrat_14, 0);
+    lv_obj_align(pl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    char popts[512];
+    popts[0] = '\0';
+    int pcount = blueduck_persona_count();
+    for (int i = 0; i < pcount; i++) {
+        strncat(popts, blueduck_persona_name(i), sizeof(popts) - strlen(popts) - 2);
+        if (i < pcount - 1) strncat(popts, "\n", sizeof(popts) - strlen(popts) - 1);
+    }
+    bd_persona_dd = lv_dropdown_create(bd_content);
+    lv_dropdown_set_options(bd_persona_dd, popts);
+    lv_obj_set_width(bd_persona_dd, lv_pct(100));
+    lv_obj_align(bd_persona_dd, LV_ALIGN_TOP_MID, 0, 20);
+
+    lv_obj_t *sl = lv_label_create(bd_content);
+    lv_label_set_text(sl, "Script:");
+    lv_obj_set_style_text_color(sl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_14, 0);
+    lv_obj_align(sl, LV_ALIGN_TOP_LEFT, 0, 66);
+
+    // Scan .duck scripts from SD (needs mount + SD/SPI mutex).
+    bd_script_count = 0;
+    if (ensure_sd_mounted() == ESP_OK) {
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            bd_script_count = blueduck_scan_scripts();
+            xSemaphoreGive(sd_spi_mutex);
+        }
+    }
+    char sopts[512];
+    sopts[0] = '\0';
+    if (bd_script_count > 0) {
+        for (int i = 0; i < bd_script_count; i++) {
+            strncat(sopts, blueduck_script_name(i), sizeof(sopts) - strlen(sopts) - 2);
+            if (i < bd_script_count - 1) strncat(sopts, "\n", sizeof(sopts) - strlen(sopts) - 1);
+        }
+    } else {
+        strcpy(sopts, "(no .duck scripts)");
+    }
+    bd_script_dd = lv_dropdown_create(bd_content);
+    lv_dropdown_set_options(bd_script_dd, sopts);
+    lv_obj_set_width(bd_script_dd, lv_pct(100));
+    lv_obj_align(bd_script_dd, LV_ALIGN_TOP_MID, 0, 86);
+
+    bd_stats_label = lv_label_create(bd_content);
+    lv_label_set_text(bd_stats_label, "stopped\nPersona: -\nConnects 0   Payloads 0");
+    lv_obj_set_style_text_color(bd_stats_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(bd_stats_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(bd_stats_label, LV_ALIGN_TOP_LEFT, 0, 132);
+
+    bd_startstop_btn = lv_btn_create(bd_content);
+    lv_obj_set_size(bd_startstop_btn, 140, 42);
+    lv_obj_align(bd_startstop_btn, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(bd_startstop_btn, lv_color_make(255, 90, 0), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(bd_startstop_btn, 8, 0);
+    bd_startstop_lbl = lv_label_create(bd_startstop_btn);
+    lv_label_set_text(bd_startstop_lbl, "Start");
+    lv_obj_set_style_text_font(bd_startstop_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(bd_startstop_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(bd_startstop_lbl);
+    lv_obj_add_event_cb(bd_startstop_btn, bd_startstop_cb, LV_EVENT_CLICKED, NULL);
+
+    bd_exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(bd_exit_btn, 120, 40);
+    lv_obj_align(bd_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_set_style_bg_color(bd_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(bd_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(bd_exit_btn, 0, 0);
+    lv_obj_set_style_radius(bd_exit_btn, 10, 0);
+    lv_obj_t *ex = lv_label_create(bd_exit_btn);
+    lv_label_set_text(ex, LV_SYMBOL_CLOSE " Exit");
+    lv_obj_set_style_text_font(ex, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ex, ui_text_color(), 0);
+    lv_obj_center(ex);
+    lv_obj_add_event_cb(bd_exit_btn, bd_exit_cb, LV_EVENT_CLICKED, NULL);
+
+    if (!ensure_ble_periph_mode(true)) {
+        lv_label_set_text(bd_stats_label, "BLE init failed!");
+        ui_locked = false;
+        return;
+    }
+
+    bd_screen_active = true;
+    bd_update_stats_ui();
     ui_locked = false;
 }
 
