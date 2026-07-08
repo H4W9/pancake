@@ -36,6 +36,9 @@
 #include <math.h>
 #include <fcntl.h>
 #include "lvgl_memory.h"
+#include "oui_lookup.h"
+#include "sd_error_handler.h"
+#include "gatt_walker.h"
 #include <sys/unistd.h>
 #include <sys/reent.h>
 #include <dirent.h>
@@ -108,6 +111,7 @@ static int bt_smarttag_count = 0;
 // Generic BT device storage for scan_bt command
 typedef struct {
     uint8_t addr[6];
+    uint8_t addr_type;   // BLE address type (public/random) — needed for GATT connect
     int8_t rssi;
     char name[32];
     uint16_t company_id;
@@ -988,6 +992,17 @@ static char bt_locator_status_text[48] = "";
 // BT tracking mode support (for BT Locator)
 static bool bt_tracking_mode = false;
 
+// GATT Walker UI state (reuses the shared BLE scan task / bt_devices[])
+static lv_obj_t *gw_content = NULL;
+static lv_obj_t *gw_status_label = NULL;
+static lv_obj_t *gw_list = NULL;           // device list during scan, results after walk
+static lv_obj_t *gw_exit_btn = NULL;
+static volatile bool gw_screen_active = false;
+static bool gw_walk_started = false;       // false = scanning/selecting, true = walking device
+static bool gw_devlist_built = false;      // device list populated once after scan
+static bool gw_results_built = false;      // results rendered once after walk completes
+static int  gw_last_scan_count = -1;       // last displayed scan count (avoid redundant redraws)
+
 // Battery voltage monitor state (DISABLED - using regular C5 chip)
 static lv_obj_t *battery_label = NULL;  // Keep for UI layout
 static char last_voltage_str[32] = "-.--V";  // Persisted across screen changes
@@ -1134,6 +1149,11 @@ static void reset_function_page_children(void) {
     bt_locator_rssi_label = NULL;
     bt_locator_mac_label = NULL;
     bt_locator_exit_btn = NULL;
+    gw_content = NULL;
+    gw_list = NULL;
+    gw_status_label = NULL;
+    gw_exit_btn = NULL;
+    gw_screen_active = false;
     wifi_connect_ta = NULL;
     wifi_connect_keyboard = NULL;
     wifi_connect_status_label = NULL;
@@ -1281,6 +1301,14 @@ static bool bt_is_samsung_smarttag(const uint8_t *data, uint8_t len);
 // BLE Scan UI
 static void ble_scan_back_btn_cb(lv_event_t *e);
 static void ble_scan_update_list(void);
+
+// GATT Walker UI
+static void show_gatt_walker_screen(void);
+static void gw_device_selected_cb(lv_event_t *e);
+static void gw_build_device_list(void);
+static void gw_render_results(void);
+static void gw_screen_exit_cb(lv_event_t *e);
+static void gw_event_handler(gw_event_t event, const gw_result_t *result);
 
 // Deauth Monitor functions
 static void show_deauth_monitor_screen(void);
@@ -2450,6 +2478,11 @@ static esp_err_t ensure_sd_mounted(void)
     if (ret == ESP_OK) {
         sd_mounted_lazy = true;
         ESP_LOGI(TAG, "[SD_MOUNT] SD card mounted successfully on demand");
+        // Lazily load the OUI vendor database once the SD card is available.
+        // Fails gracefully (no PSRAM / file absent) — vendor lookups just return NULL.
+        if (!oui_lookup_is_loaded()) {
+            oui_lookup_init(OUI_DEFAULT_PATH);
+        }
         return ESP_OK;
     } else {
         ESP_LOGW(TAG, "[SD_MOUNT] SD mount failed: %s", esp_err_to_name(ret));
@@ -3154,6 +3187,10 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to create SD/SPI mutex!");
         return;
     }
+
+    // GATT Walker backend — shares the SD/SPI mutex for JSON result saving
+    gw_init(sd_spi_mutex);
+    gw_set_callback(gw_event_handler);
 
     // Create I2C mutex (FT6336U touch and MAX17048 battery share I2C_NUM_0)
     i2c_mutex = xSemaphoreCreateMutex();
@@ -4349,6 +4386,45 @@ static void display_refresh_task(void *pvParameters)
                 }
             }
 
+            // GATT Walker UI update (LVGL task only)
+            if (gw_screen_active) {
+                if (!gw_walk_started) {
+                    // Scanning / device-selection phase
+                    if (ble_scan_finished) {
+                        if (!gw_devlist_built) {
+                            gw_build_device_list();
+                            gw_devlist_built = true;
+                        }
+                    } else if (bt_device_count != gw_last_scan_count) {
+                        gw_last_scan_count = bt_device_count;
+                        if (gw_status_label && !gw_devlist_built) {
+                            char s[48];
+                            snprintf(s, sizeof(s), "BLE scanning... %d", bt_device_count);
+                            lv_label_set_text(gw_status_label, s);
+                        }
+                    }
+                } else if (gw_ui_needs_update) {
+                    // Walking phase — reflect backend progress/results
+                    gw_ui_needs_update = false;
+                    char statusbuf[96];
+                    strncpy(statusbuf, (const char *)gw_ui_status, sizeof(statusbuf) - 1);
+                    statusbuf[sizeof(statusbuf) - 1] = '\0';
+                    gw_state_t st = gw_get_state();
+                    if (st == GW_STATE_COMPLETE && !gw_results_built) {
+                        gw_render_results();
+                        gw_results_built = true;
+                    } else if (st == GW_STATE_FAILED && !gw_results_built) {
+                        if (gw_status_label) {
+                            lv_obj_clear_flag(gw_status_label, LV_OBJ_FLAG_HIDDEN);
+                            lv_label_set_text(gw_status_label, statusbuf);
+                        }
+                        gw_results_built = true;
+                    } else if (gw_status_label && !gw_results_built) {
+                        lv_label_set_text(gw_status_label, statusbuf);
+                    }
+                }
+            }
+
             // Deauth Monitor UI update
             if (deauth_monitor_update_flag && deauth_monitor_ui_active) {
                 deauth_monitor_update_flag = false;
@@ -4594,7 +4670,11 @@ static void display_refresh_task(void *pvParameters)
             }
 
             sleep_ms = lv_timer_handler();
-            
+
+            // Show/auto-dismiss the SD write-error modal if a failure was reported.
+            // Must run under lvgl_mutex since it creates/deletes LVGL objects.
+            sd_error_modal_update();
+
             // Reset watchdog INSIDE mutex to catch long rendering operations
             esp_task_wdt_reset();
             
@@ -13487,6 +13567,10 @@ static void show_bluetooth_screen(void)
     // BT Locator - Blue
     lv_obj_t *locator_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "BT Locator", COLOR_TILE_BLUE, NULL, NULL);
     lv_obj_add_event_cb(locator_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator");
+
+    // GATT Walker - Purple: connect to a BLE device and enumerate GATT services/characteristics
+    lv_obj_t *gattwalk_tile = create_tile(tiles, LV_SYMBOL_LIST, "GATT\nWalk", lv_color_make(140, 82, 255), NULL, NULL);
+    lv_obj_add_event_cb(gattwalk_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"GATT Walk");
 }
 
 // BT Locator screen - scan BT devices, select one, then track RSSI every 10s
@@ -14626,6 +14710,12 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    // GATT Walker
+    if (strcmp(attack_name, "GATT Walk") == 0) {
+        show_gatt_walker_screen();
+        return;
+    }
+
     // Stub screens for not-yet-implemented features
     if (strcmp(attack_name, "Package Monitor") == 0 ||
         strcmp(attack_name, "Channel View") == 0) {
@@ -15284,6 +15374,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     if (bt_device_count < BT_MAX_DEVICES) {
         bt_device_info_t *dev = &bt_devices[bt_device_count];
         memcpy(dev->addr, desc->addr.val, 6);
+        dev->addr_type = desc->addr.type;   // capture for GATT Walker connect
         dev->rssi = desc->rssi;
         dev->name[0] = '\0';
         dev->company_id = 0;
@@ -15492,11 +15583,24 @@ static void ble_scan_update_list(void)
             char short_name[13];
             strncpy(short_name, dev->name, 12);
             short_name[12] = '\0';
-            snprintf(item_text, sizeof(item_text), "%d %s%s %s", 
+            snprintf(item_text, sizeof(item_text), "%d %s%s %s",
                      dev->rssi, short_name, type_str, addr_str);
         } else {
-            snprintf(item_text, sizeof(item_text), "%d%s %s", 
-                     dev->rssi, type_str, addr_str);
+            // No friendly name — fall back to the OUI vendor name if the
+            // database is loaded. NimBLE stores addresses LSB-first, so the
+            // OUI (first displayed octet) is {addr[5], addr[4], addr[3]}.
+            const uint8_t oui3[3] = { dev->addr[5], dev->addr[4], dev->addr[3] };
+            const char *vendor = oui_lookup(oui3);
+            if (vendor) {
+                char short_vendor[13];
+                strncpy(short_vendor, vendor, 12);
+                short_vendor[12] = '\0';
+                snprintf(item_text, sizeof(item_text), "%d %s%s %s",
+                         dev->rssi, short_vendor, type_str, addr_str);
+            } else {
+                snprintf(item_text, sizeof(item_text), "%d%s %s",
+                         dev->rssi, type_str, addr_str);
+            }
         }
         
         lv_obj_t *item = lv_label_create(ble_scan_list);
@@ -15783,9 +15887,272 @@ static void bt_scan_task(void *pvParameters)
     bt_locator_needs_ui_update = true;  // Also update BT Locator if active
     
     ESP_LOGI(TAG, "BLE scan complete: %d devices found", bt_device_count);
-    
+
     bt_scan_task_handle = NULL;
     vTaskDelete(NULL);
+}
+
+// ============================================================================
+// GATT Walker — connect to a BLE device and enumerate GATT services/chars.
+// Backend: gatt_walker.c (ported from Jimgat_Dev). Reuses the shared BLE scan
+// task and bt_devices[] for target selection. UI is driven natively here by
+// polling the gw_ui_* volatiles from the LVGL task.
+// ============================================================================
+
+// NimBLE-context event callback — NO LVGL here. UI is polled from the LVGL
+// loop via the gw_ui_* volatiles the backend updates.
+static void gw_event_handler(gw_event_t event, const gw_result_t *result)
+{
+    (void)result;
+    ESP_LOGD(TAG, "GATT Walker event: %d", (int)event);
+}
+
+// Populate gw_list with clickable device buttons after the scan completes.
+static void gw_build_device_list(void)
+{
+    if (!gw_list) return;
+    lv_obj_clean(gw_list);
+
+    for (int i = 0; i < bt_device_count; i++) {
+        bt_device_info_t *dev = &bt_devices[i];
+        char addr_str[18];
+        bt_format_addr(dev->addr, addr_str);
+
+        char item_text[80];
+        if (dev->name[0] != '\0') {
+            char short_name[16];
+            strncpy(short_name, dev->name, 15);
+            short_name[15] = '\0';
+            snprintf(item_text, sizeof(item_text), "%d dBm  %s  %s",
+                     dev->rssi, short_name, addr_str);
+        } else {
+            // Fall back to the OUI vendor (NimBLE addr is LSB-first).
+            const uint8_t oui3[3] = { dev->addr[5], dev->addr[4], dev->addr[3] };
+            const char *vendor = oui_lookup(oui3);
+            if (vendor) {
+                char short_vendor[16];
+                strncpy(short_vendor, vendor, 15);
+                short_vendor[15] = '\0';
+                snprintf(item_text, sizeof(item_text), "%d dBm  %s  %s",
+                         dev->rssi, short_vendor, addr_str);
+            } else {
+                snprintf(item_text, sizeof(item_text), "%d dBm  %s",
+                         dev->rssi, addr_str);
+            }
+        }
+
+        lv_obj_t *btn = lv_btn_create(gw_list);
+        lv_obj_set_size(btn, lv_pct(100), 32);
+        lv_obj_set_style_bg_color(btn, ui_card_color(), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(btn, lv_color_make(50, 50, 50), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_set_style_radius(btn, 4, 0);
+
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, item_text);
+        lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 5, 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
+
+        lv_obj_add_event_cb(btn, gw_device_selected_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+
+    if (gw_status_label) lv_obj_add_flag(gw_status_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(gw_list, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Device tapped — stop scanning and start the GATT walk.
+static void gw_device_selected_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= bt_device_count) return;
+
+    // Copy the target — bt_devices[] could be mutated by a stray scan callback.
+    bt_device_info_t dev = bt_devices[idx];
+
+    // A GATT connect cannot proceed while discovery is active — stop it fully.
+    if (bt_scan_active) {
+        bt_scan_active = false;
+    }
+    bt_stop_scan();
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    if (gw_list) lv_obj_add_flag(gw_list, LV_OBJ_FLAG_HIDDEN);
+    if (gw_status_label) {
+        lv_obj_clear_flag(gw_status_label, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(gw_status_label, "Connecting...");
+    }
+
+    gw_walk_started = true;
+    gw_results_built = false;
+
+    double lat = current_gps.valid ? current_gps.latitude : 0.0;
+    double lon = current_gps.valid ? current_gps.longitude : 0.0;
+    bool ok = gw_walk(dev.addr, dev.addr_type, dev.name, dev.rssi,
+                      lat, lon, current_gps.valid);
+    if (!ok) {
+        if (gw_status_label) lv_label_set_text(gw_status_label, "Walk failed to start");
+        gw_walk_started = false;
+    }
+}
+
+// Render the completed walk's services/characteristics into gw_list.
+static void gw_render_results(void)
+{
+    if (!gw_list) return;
+    const gw_result_t *r = gw_get_result();
+    if (!r) return;
+
+    lv_obj_clean(gw_list);
+
+    char hdr[96];
+    snprintf(hdr, sizeof(hdr), "%d services  (saved to SD)", r->svc_count);
+    lv_obj_t *hlbl = lv_label_create(gw_list);
+    lv_label_set_text(hlbl, hdr);
+    lv_obj_set_width(hlbl, lv_pct(100));
+    lv_obj_set_style_text_color(hlbl, ui_accent_color(), 0);
+    lv_obj_set_style_text_font(hlbl, &lv_font_montserrat_14, 0);
+
+    for (int s = 0; s < r->svc_count; s++) {
+        const gw_svc_t *svc = &r->svcs[s];
+        char sline[80];
+        snprintf(sline, sizeof(sline), "SVC %s", svc->uuid_str);
+        lv_obj_t *slbl = lv_label_create(gw_list);
+        lv_label_set_text(slbl, sline);
+        lv_obj_set_width(slbl, lv_pct(100));
+        lv_obj_set_style_text_color(slbl, ui_text_color(), 0);
+        lv_obj_set_style_text_font(slbl, &lv_font_montserrat_12, 0);
+        lv_label_set_long_mode(slbl, LV_LABEL_LONG_WRAP);
+
+        for (int c = 0; c < svc->chr_count; c++) {
+            const gw_chr_t *chr = &svc->chrs[c];
+            char props[20];
+            gw_chr_props_str(chr->properties, props, sizeof(props));
+            char cline[180];
+            if (chr->read_ok && chr->read_len > 0) {
+                char preview[33];
+                int n = chr->read_len < 32 ? chr->read_len : 32;
+                int p = 0;
+                for (int k = 0; k < n; k++) {
+                    uint8_t b = chr->read_data[k];
+                    preview[p++] = (b >= 32 && b < 127) ? (char)b : '.';
+                }
+                preview[p] = '\0';
+                snprintf(cline, sizeof(cline), "  [%s] %s = %s",
+                         props, chr->uuid_str, preview);
+            } else {
+                snprintf(cline, sizeof(cline), "  [%s] %s", props, chr->uuid_str);
+            }
+            lv_obj_t *clbl = lv_label_create(gw_list);
+            lv_label_set_text(clbl, cline);
+            lv_obj_set_width(clbl, lv_pct(100));
+            lv_obj_set_style_text_color(clbl, lv_color_make(180, 180, 180), 0);
+            lv_obj_set_style_text_font(clbl, &lv_font_montserrat_12, 0);
+            lv_label_set_long_mode(clbl, LV_LABEL_LONG_WRAP);
+        }
+    }
+
+    if (gw_status_label) lv_obj_add_flag(gw_status_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(gw_list, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Exit button — stop scan, cancel/disconnect any walk, tear down BLE, go back.
+static void gw_screen_exit_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (bt_scan_active) {
+        bt_scan_active = false;
+    }
+    bt_stop_scan();
+    gw_cancel();
+    gw_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    gw_screen_active = false;
+    gw_content = NULL;
+    gw_list = NULL;
+    gw_status_label = NULL;
+    gw_exit_btn = NULL;
+
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+
+    nav_to_menu_flag = true;
+}
+
+// GATT Walker screen — scan for BLE devices, pick one, walk its GATT table.
+static void show_gatt_walker_screen(void)
+{
+    ui_locked = true;
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    create_function_page_base("GATT Walker");
+    gw_screen_active = true;
+    gw_walk_started = false;
+    gw_devlist_built = false;
+    gw_results_built = false;
+    gw_last_scan_count = -1;
+
+    gw_content = lv_obj_create(function_page);
+    lv_obj_set_size(gw_content, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(gw_content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(gw_content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(gw_content, 0, 0);
+    lv_obj_set_style_pad_all(gw_content, 5, 0);
+    lv_obj_clear_flag(gw_content, LV_OBJ_FLAG_SCROLLABLE);
+
+    gw_status_label = lv_label_create(gw_content);
+    lv_label_set_text(gw_status_label, "BLE scanning...");
+    lv_obj_set_style_text_color(gw_status_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(gw_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(gw_status_label);
+
+    gw_list = lv_obj_create(gw_content);
+    lv_obj_set_size(gw_list, lv_pct(100), LCD_V_RES - 30 - 50 - 10);
+    lv_obj_align(gw_list, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(gw_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(gw_list, ui_accent_color(), 0);
+    lv_obj_set_style_border_width(gw_list, 1, 0);
+    lv_obj_set_flex_flow(gw_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(gw_list, 4, 0);
+    lv_obj_set_style_pad_gap(gw_list, 4, 0);
+    lv_obj_set_scrollbar_mode(gw_list, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_add_flag(gw_list, LV_OBJ_FLAG_HIDDEN);
+
+    gw_exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(gw_exit_btn, 120, 40);
+    lv_obj_align(gw_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_set_style_bg_color(gw_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(gw_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(gw_exit_btn, 0, 0);
+    lv_obj_set_style_radius(gw_exit_btn, 10, 0);
+    lv_obj_t *exit_lbl = lv_label_create(gw_exit_btn);
+    lv_label_set_text(exit_lbl, LV_SYMBOL_CLOSE " Exit");
+    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(exit_lbl, ui_text_color(), 0);
+    lv_obj_center(exit_lbl);
+    lv_obj_add_event_cb(gw_exit_btn, gw_screen_exit_cb, LV_EVENT_CLICKED, NULL);
+
+    if (!ensure_ble_mode()) {
+        lv_label_set_text(gw_status_label, "BLE init failed!");
+        ui_locked = false;
+        return;
+    }
+
+    bt_scan_active = true;
+    BaseType_t task_ret = xTaskCreate(bt_scan_task, "bt_scan_task", 4096, NULL, 5,
+                                      &bt_scan_task_handle);
+    if (task_ret != pdPASS) {
+        bt_scan_active = false;
+        lv_label_set_text(gw_status_label, "Failed to start scan!");
+    }
+
+    ui_locked = false;
 }
 
 /**
