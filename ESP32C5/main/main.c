@@ -1363,6 +1363,10 @@ static void lookout_exit_cb(lv_event_t *e);
 static void lookout_led_set(uint8_t r, uint8_t g, uint8_t b);
 static void lookout_scan_task(void *pvParameters);
 
+// NeoPixel (GPIO27) status LED policy for the new BLE features. Single writer,
+// called only from the LVGL/main task to keep RMT access single-threaded.
+static void feature_led_update(void);
+
 // BLE HoneyPair UI
 static void show_honeypair_screen(void);
 static void hp_startstop_cb(lv_event_t *e);
@@ -4490,9 +4494,6 @@ static void display_refresh_task(void *pvParameters)
 
             // BT Lookout UI update (LVGL task only)
             if (lookout_screen_active) {
-                // Drive the alert LED flash pattern from the main task
-                bt_lookout_tick(lookout_led_set);
-
                 // Consume any new detection and add a row to the list
                 bt_lookout_detection_t det;
                 if (bt_lookout_poll_detection(&det) && lookout_list) {
@@ -4532,6 +4533,17 @@ static void display_refresh_task(void *pvParameters)
                 if (hp_now - hp_last_us > 400000) {
                     hp_last_us = hp_now;
                     hp_update_stats_ui();
+                }
+            }
+
+            // NeoPixel status LED for the new BLE features (throttled ~20 Hz).
+            // Unconditional so the LED also clears after leaving a feature.
+            {
+                static int64_t led_last_us = 0;
+                int64_t led_now = esp_timer_get_time();
+                if (led_now - led_last_us > 50000) {
+                    led_last_us = led_now;
+                    feature_led_update();
                 }
             }
 
@@ -15455,24 +15467,52 @@ static bool bt_is_samsung_smarttag(const uint8_t *data, uint8_t len)
  */
 static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
 {
-    if (event->type != BLE_GAP_EVENT_DISC) {
+    // Normalize legacy (BLE_GAP_EVENT_DISC) and extended (BLE_GAP_EVENT_EXT_DISC)
+    // discovery events into common fields. With CONFIG_BT_NIMBLE_EXT_ADV enabled
+    // (required by HoneyPair/BlueDuck), NimBLE reports advertisements as EXT_DISC,
+    // so the scanner must handle both or it sees no devices.
+    const uint8_t *addr_val;
+    uint8_t        addr_type;
+    int            rssi;
+    const uint8_t *adv_data;
+    uint8_t        adv_data_len;
+    bool           is_scan_response;
+
+#if CONFIG_BT_NIMBLE_EXT_ADV
+    if (event->type == BLE_GAP_EVENT_EXT_DISC) {
+        struct ble_gap_ext_disc_desc *d = &event->ext_disc;
+        addr_val         = d->addr.val;
+        addr_type        = d->addr.type;
+        rssi             = d->rssi;
+        adv_data         = d->data;
+        adv_data_len     = d->length_data;
+        is_scan_response = (d->props & BLE_HCI_ADV_SCAN_RSP_MASK) != 0;
+    } else
+#endif
+    if (event->type == BLE_GAP_EVENT_DISC) {
+        struct ble_gap_disc_desc *d = &event->disc;
+        addr_val         = d->addr.val;
+        addr_type        = d->addr.type;
+        rssi             = d->rssi;
+        adv_data         = d->data;
+        adv_data_len     = d->length_data;
+        is_scan_response = (d->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
+    } else {
         return 0;
     }
-    
-    struct ble_gap_disc_desc *desc = &event->disc;
-    
+
     // MAC tracking mode - update RSSI for tracked device (BT Locator)
     if (bt_tracking_mode) {
-        if (memcmp(desc->addr.val, bt_tracking_mac, 6) == 0) {
-            bt_tracking_rssi = desc->rssi;
+        if (memcmp(addr_val, bt_tracking_mac, 6) == 0) {
+            bt_tracking_rssi = rssi;
             bt_tracking_found = true;
         }
         return 0;
     }
-    
+
     // Parse advertising data
     struct ble_hs_adv_fields fields;
-    int rc = ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data);
+    int rc = ble_hs_adv_parse_fields(&fields, adv_data, adv_data_len);
     if (rc != 0) {
         return 0;
     }
@@ -15488,20 +15528,17 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
             memcpy(lk_name, fields.name, nl);
             lk_name[nl] = '\0';
         }
-        bt_lookout_on_adv(desc->addr.val, desc->rssi, lk_name[0] ? lk_name : NULL);
+        bt_lookout_on_adv(addr_val, rssi, lk_name[0] ? lk_name : NULL);
     }
-
-    // Check if this is a Scan Response packet (contains names more often)
-    bool is_scan_response = (desc->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
     
     // Check if device already seen
-    bool already_seen = bt_is_device_found(desc->addr.val);
+    bool already_seen = bt_is_device_found(addr_val);
     
     // If already seen, only process scan responses to update names
     if (already_seen) {
         // Try to update name from scan response if we don't have one
         if (is_scan_response && fields.name != NULL && fields.name_len > 0) {
-            int dev_idx = bt_find_device_index(desc->addr.val);
+            int dev_idx = bt_find_device_index(addr_val);
             if (dev_idx >= 0 && bt_devices[dev_idx].name[0] == '\0') {
                 int name_len = fields.name_len < 31 ? fields.name_len : 31;
                 memcpy(bt_devices[dev_idx].name, fields.name, name_len);
@@ -15512,14 +15549,14 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     }
     
     // Add to found devices list
-    bt_add_found_device(desc->addr.val);
+    bt_add_found_device(addr_val);
     
     // Store device info
     if (bt_device_count < BT_MAX_DEVICES) {
         bt_device_info_t *dev = &bt_devices[bt_device_count];
-        memcpy(dev->addr, desc->addr.val, 6);
-        dev->addr_type = desc->addr.type;   // capture for GATT Walker connect
-        dev->rssi = desc->rssi;
+        memcpy(dev->addr, addr_val, 6);
+        dev->addr_type = addr_type;   // capture for GATT Walker connect
+        dev->rssi = rssi;
         dev->name[0] = '\0';
         dev->company_id = 0;
         dev->is_airtag = false;
@@ -16320,12 +16357,39 @@ static void show_gatt_walker_screen(void)
 // and lists detections when a target appears. Backend: bt_lookout.c.
 // ============================================================================
 
-// NeoPixel LED bridge for watchlist alerts (index 0). No-op if LED uninit'd.
+// NeoPixel LED bridge (index 0). No-op if LED uninit'd. Sole low-level writer.
 static void lookout_led_set(uint8_t r, uint8_t g, uint8_t b)
 {
     if (!g_led_strip) return;
     led_strip_set_pixel(g_led_strip, 0, r, g, b);
     led_strip_refresh(g_led_strip);
+}
+
+// NeoPixel status policy for the new BLE features. Priority: BT Lookout alert
+// flash (red) overrides a solid per-feature color; off when nothing active.
+// Called only from the LVGL/main task so RMT stays single-threaded. Only
+// refreshes the LED when the target color changes (avoids RMT spam).
+static void feature_led_update(void)
+{
+    static int last_r = -1, last_g = -1, last_b = -1;
+
+    // Priority 1: BT Lookout alert flash owns the LED while flashing.
+    if (lookout_screen_active && bt_lookout_tick(lookout_led_set)) {
+        last_r = last_g = last_b = -1;   // force re-assert of solid color when flash ends
+        return;
+    }
+
+    // Priority 2: solid color reflecting the active new BLE feature.
+    int r, g, b;
+    if (hp_screen_active && honeypair_is_active()) { r = 80; g = 0;  b = 40; }  // magenta — HoneyPair advertising
+    else if (gw_screen_active)                     { r = 40; g = 0;  b = 80; }  // purple — GATT Walker
+    else if (lookout_screen_active)                { r = 0;  g = 0;  b = 80; }  // blue — BT Lookout scanning
+    else                                           { r = 0;  g = 0;  b = 0;  }  // off — idle
+
+    if (r != last_r || g != last_g || b != last_b) {
+        lookout_led_set((uint8_t)r, (uint8_t)g, (uint8_t)b);
+        last_r = r; last_g = g; last_b = b;
+    }
 }
 
 // Continuous BLE scan for the watchlist. Tears down cleanly when the screen is
@@ -16342,7 +16406,8 @@ static void lookout_scan_task(void *pvParameters)
 
     bt_stop_scan();
     bt_lookout_stop();
-    lookout_led_set(0, 0, 0);        // ensure LED off on teardown
+    // LED is turned off by feature_led_update() in the LVGL task once
+    // lookout_screen_active clears — keeps all RMT writes on one task.
     lookout_scan_task_handle = NULL;
     vTaskDelete(NULL);
 }
