@@ -39,6 +39,8 @@
 #include "oui_lookup.h"
 #include "sd_error_handler.h"
 #include "gatt_walker.h"
+#include "bt_lookout.h"
+#include "led_strip.h"
 #include <sys/unistd.h>
 #include <sys/reent.h>
 #include <dirent.h>
@@ -68,6 +70,11 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
+#include "host/ble_gap.h"
+#include "host/ble_sm.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+#include "ble_honeypair.h"
 
 #define TAG "WiFi_Hacker"
 
@@ -351,6 +358,8 @@ typedef struct {
 
 // Use GPS definitions from wifi_common.h via wifi_cli.h
 static gps_data_t current_gps = {0};
+// GPS snapshot accessor for BLE peripheral features (honeypair/blueduck geotag).
+static const gps_data_t *local_gps_snapshot(void) { return &current_gps; }
 static char gps_rx_buffer[GPS_BUF_SIZE];
 static StaticTask_t gps_task_buffer;
 static StackType_t *gps_task_stack = NULL;
@@ -1003,6 +1012,25 @@ static bool gw_devlist_built = false;      // device list populated once after s
 static bool gw_results_built = false;      // results rendered once after walk completes
 static int  gw_last_scan_count = -1;       // last displayed scan count (avoid redundant redraws)
 
+// BT Lookout (BLE watchlist) UI state
+static lv_obj_t *lookout_content = NULL;
+static lv_obj_t *lookout_status_label = NULL;
+static lv_obj_t *lookout_list = NULL;
+static lv_obj_t *lookout_exit_btn = NULL;
+static volatile bool lookout_screen_active = false;   // cleared by reset_function_page_children on nav away
+static TaskHandle_t lookout_scan_task_handle = NULL;
+static int lookout_detection_total = 0;
+
+// BLE HoneyPair UI state
+static lv_obj_t *hp_content = NULL;
+static lv_obj_t *hp_persona_dd = NULL;
+static lv_obj_t *hp_startstop_btn = NULL;
+static lv_obj_t *hp_startstop_lbl = NULL;
+static lv_obj_t *hp_stats_label = NULL;
+static lv_obj_t *hp_persona_label = NULL;
+static lv_obj_t *hp_exit_btn = NULL;
+static volatile bool hp_screen_active = false;
+
 // Battery voltage monitor state (DISABLED - using regular C5 chip)
 static lv_obj_t *battery_label = NULL;  // Keep for UI layout
 static char last_voltage_str[32] = "-.--V";  // Persisted across screen changes
@@ -1154,6 +1182,25 @@ static void reset_function_page_children(void) {
     gw_status_label = NULL;
     gw_exit_btn = NULL;
     gw_screen_active = false;
+    // BT Lookout: clearing the active flag signals lookout_scan_task to tear
+    // down (stop scan, stop watchlist, LED off) even on title-bar back nav.
+    lookout_content = NULL;
+    lookout_list = NULL;
+    lookout_status_label = NULL;
+    lookout_exit_btn = NULL;
+    lookout_screen_active = false;
+    // BLE HoneyPair: stop advertising on any nav away (title back button included)
+    if (hp_screen_active) {
+        honeypair_stop();
+    }
+    hp_content = NULL;
+    hp_persona_dd = NULL;
+    hp_startstop_btn = NULL;
+    hp_startstop_lbl = NULL;
+    hp_stats_label = NULL;
+    hp_persona_label = NULL;
+    hp_exit_btn = NULL;
+    hp_screen_active = false;
     wifi_connect_ta = NULL;
     wifi_connect_keyboard = NULL;
     wifi_connect_status_label = NULL;
@@ -1309,6 +1356,19 @@ static void gw_build_device_list(void);
 static void gw_render_results(void);
 static void gw_screen_exit_cb(lv_event_t *e);
 static void gw_event_handler(gw_event_t event, const gw_result_t *result);
+
+// BT Lookout UI
+static void show_bt_lookout_screen(void);
+static void lookout_exit_cb(lv_event_t *e);
+static void lookout_led_set(uint8_t r, uint8_t g, uint8_t b);
+static void lookout_scan_task(void *pvParameters);
+
+// BLE HoneyPair UI
+static void show_honeypair_screen(void);
+static void hp_startstop_cb(lv_event_t *e);
+static void hp_persona_dd_cb(lv_event_t *e);
+static void hp_exit_cb(lv_event_t *e);
+static void hp_update_stats_ui(void);
 
 // Deauth Monitor functions
 static void show_deauth_monitor_screen(void);
@@ -3192,6 +3252,9 @@ void app_main(void)
     gw_init(sd_spi_mutex);
     gw_set_callback(gw_event_handler);
 
+    // BLE HoneyPair backend — shares the SD/SPI mutex + GPS snapshot for geotagged logs
+    honeypair_init(sd_spi_mutex, local_gps_snapshot);
+
     // Create I2C mutex (FT6336U touch and MAX17048 battery share I2C_NUM_0)
     i2c_mutex = xSemaphoreCreateMutex();
     if (i2c_mutex == NULL) {
@@ -4422,6 +4485,53 @@ static void display_refresh_task(void *pvParameters)
                     } else if (gw_status_label && !gw_results_built) {
                         lv_label_set_text(gw_status_label, statusbuf);
                     }
+                }
+            }
+
+            // BT Lookout UI update (LVGL task only)
+            if (lookout_screen_active) {
+                // Drive the alert LED flash pattern from the main task
+                bt_lookout_tick(lookout_led_set);
+
+                // Consume any new detection and add a row to the list
+                bt_lookout_detection_t det;
+                if (bt_lookout_poll_detection(&det) && lookout_list) {
+                    if (lookout_detection_total == 0) {
+                        lv_obj_clean(lookout_list);   // drop the placeholder hint
+                    }
+                    // Cap the list — keep the newest ~30 rows
+                    while (lv_obj_get_child_cnt(lookout_list) >= 30) {
+                        lv_obj_del(lv_obj_get_child(lookout_list, 0));
+                    }
+                    // det.mac is NimBLE LE order → print MSB-first for display
+                    char row[112];
+                    snprintf(row, sizeof(row), "%s  %d dBm  %02X:%02X:%02X:%02X:%02X:%02X",
+                             det.name, det.rssi,
+                             det.mac[5], det.mac[4], det.mac[3],
+                             det.mac[2], det.mac[1], det.mac[0]);
+                    lv_obj_t *rl = lv_label_create(lookout_list);
+                    lv_label_set_text(rl, row);
+                    lv_obj_set_width(rl, lv_pct(100));
+                    lv_obj_set_style_text_color(rl, lv_color_make(255, 80, 80), 0);
+                    lv_obj_set_style_text_font(rl, &lv_font_montserrat_12, 0);
+                    lv_label_set_long_mode(rl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+
+                    lookout_detection_total++;
+                    if (lookout_status_label) {
+                        char s[64];
+                        snprintf(s, sizeof(s), "%d hits - scanning...", lookout_detection_total);
+                        lv_label_set_text(lookout_status_label, s);
+                    }
+                }
+            }
+
+            // BLE HoneyPair stats refresh (throttled to ~2.5 Hz)
+            if (hp_screen_active) {
+                static int64_t hp_last_us = 0;
+                int64_t hp_now = esp_timer_get_time();
+                if (hp_now - hp_last_us > 400000) {
+                    hp_last_us = hp_now;
+                    hp_update_stats_ui();
                 }
             }
 
@@ -13571,6 +13681,14 @@ static void show_bluetooth_screen(void)
     // GATT Walker - Purple: connect to a BLE device and enumerate GATT services/characteristics
     lv_obj_t *gattwalk_tile = create_tile(tiles, LV_SYMBOL_LIST, "GATT\nWalk", lv_color_make(140, 82, 255), NULL, NULL);
     lv_obj_add_event_cb(gattwalk_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"GATT Walk");
+
+    // BT Lookout - Orange: watchlist monitor with LED alerts on target detection
+    lv_obj_t *lookout_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nLookout", lv_color_make(255, 149, 0), NULL, NULL);
+    lv_obj_add_event_cb(lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Lookout");
+
+    // BLE HoneyPair - Pink: advertise spoofed BLE personas and log pairing attempts
+    lv_obj_t *honeypair_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Honey\nPair", lv_color_make(255, 45, 130), NULL, NULL);
+    lv_obj_add_event_cb(honeypair_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"HoneyPair");
 }
 
 // BT Locator screen - scan BT devices, select one, then track RSSI every 10s
@@ -14716,6 +14834,18 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    // BT Lookout
+    if (strcmp(attack_name, "BT Lookout") == 0) {
+        show_bt_lookout_screen();
+        return;
+    }
+
+    // BLE HoneyPair
+    if (strcmp(attack_name, "HoneyPair") == 0) {
+        show_honeypair_screen();
+        return;
+    }
+
     // Stub screens for not-yet-implemented features
     if (strcmp(attack_name, "Package Monitor") == 0 ||
         strcmp(attack_name, "Channel View") == 0) {
@@ -15346,7 +15476,21 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     if (rc != 0) {
         return 0;
     }
-    
+
+    // BT Lookout watchlist — check every advertisement (before dedup) so a
+    // target still triggers even if it's already in the scan list. The backend
+    // applies its own 30s per-device cooldown. addr.val is NimBLE LE order,
+    // which is exactly what bt_lookout_on_adv() expects.
+    if (bt_lookout_is_active()) {
+        char lk_name[32] = "";
+        if (fields.name != NULL && fields.name_len > 0) {
+            int nl = fields.name_len < 31 ? fields.name_len : 31;
+            memcpy(lk_name, fields.name, nl);
+            lk_name[nl] = '\0';
+        }
+        bt_lookout_on_adv(desc->addr.val, desc->rssi, lk_name[0] ? lk_name : NULL);
+    }
+
     // Check if this is a Scan Response packet (contains names more often)
     bool is_scan_response = (desc->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
     
@@ -15482,7 +15626,22 @@ static esp_err_t bt_nimble_init(void)
     // Configure BLE host callbacks
     ble_hs_cfg.sync_cb = bt_on_sync;
     ble_hs_cfg.reset_cb = bt_on_reset;
-    
+
+    // Security manager: Just Works pairing (needed by HoneyPair to log pairings)
+    ble_hs_cfg.sm_io_cap        = BLE_SM_IO_CAP_NO_IO;
+    ble_hs_cfg.sm_bonding       = 1;
+    ble_hs_cfg.sm_mitm          = 0;
+    ble_hs_cfg.sm_sc            = 1;
+    ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC;
+
+    // GAP/GATT base services + peripheral feature service table. Must be
+    // registered before the host task starts. HoneyPair is the only advertising
+    // peripheral wired so far; blueduck registration is added with that feature.
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    honeypair_register_services();
+
     // Start NimBLE host task
     nimble_port_freertos_init(nimble_host_task);
     
@@ -16152,6 +16311,308 @@ static void show_gatt_walker_screen(void)
         lv_label_set_text(gw_status_label, "Failed to start scan!");
     }
 
+    ui_locked = false;
+}
+
+// ============================================================================
+// BT Lookout — BLE watchlist monitor. Loads target MAC/OUI entries from
+// /sdcard/lab/bluetooth/lookout.csv, scans continuously, flashes the NeoPixel
+// and lists detections when a target appears. Backend: bt_lookout.c.
+// ============================================================================
+
+// NeoPixel LED bridge for watchlist alerts (index 0). No-op if LED uninit'd.
+static void lookout_led_set(uint8_t r, uint8_t g, uint8_t b)
+{
+    if (!g_led_strip) return;
+    led_strip_set_pixel(g_led_strip, 0, r, g, b);
+    led_strip_refresh(g_led_strip);
+}
+
+// Continuous BLE scan for the watchlist. Tears down cleanly when the screen is
+// left (lookout_screen_active cleared by reset_function_page_children or exit).
+static void lookout_scan_task(void *pvParameters)
+{
+    (void)pvParameters;
+    bt_reset_counters();
+    bt_start_scan();                 // BLE_HS_FOREVER — runs until cancelled
+
+    while (lookout_screen_active) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+
+    bt_stop_scan();
+    bt_lookout_stop();
+    lookout_led_set(0, 0, 0);        // ensure LED off on teardown
+    lookout_scan_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Exit button — stop everything and return to the menu.
+static void lookout_exit_cb(lv_event_t *e)
+{
+    (void)e;
+
+    lookout_screen_active = false;   // signal scan task to stop + tear down
+    for (int i = 0; i < 20 && lookout_scan_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    lookout_content = NULL;
+    lookout_list = NULL;
+    lookout_status_label = NULL;
+    lookout_exit_btn = NULL;
+
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+
+    nav_to_menu_flag = true;
+}
+
+// BT Lookout screen — load watchlist, scan continuously, show detections.
+static void show_bt_lookout_screen(void)
+{
+    ui_locked = true;
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    create_function_page_base("BT Lookout");
+    lookout_detection_total = 0;
+
+    lookout_content = lv_obj_create(function_page);
+    lv_obj_set_size(lookout_content, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(lookout_content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(lookout_content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(lookout_content, 0, 0);
+    lv_obj_set_style_pad_all(lookout_content, 5, 0);
+    lv_obj_clear_flag(lookout_content, LV_OBJ_FLAG_SCROLLABLE);
+
+    lookout_status_label = lv_label_create(lookout_content);
+    lv_label_set_text(lookout_status_label, "Loading watchlist...");
+    lv_obj_set_style_text_color(lookout_status_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(lookout_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(lookout_status_label, LV_ALIGN_TOP_LEFT, 2, 0);
+
+    lookout_list = lv_obj_create(lookout_content);
+    lv_obj_set_size(lookout_list, lv_pct(100), LCD_V_RES - 30 - 50 - 28);
+    lv_obj_align(lookout_list, LV_ALIGN_TOP_MID, 0, 22);
+    lv_obj_set_style_bg_color(lookout_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(lookout_list, ui_accent_color(), 0);
+    lv_obj_set_style_border_width(lookout_list, 1, 0);
+    lv_obj_set_flex_flow(lookout_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(lookout_list, 4, 0);
+    lv_obj_set_style_pad_gap(lookout_list, 3, 0);
+    lv_obj_set_scrollbar_mode(lookout_list, LV_SCROLLBAR_MODE_AUTO);
+
+    lookout_exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(lookout_exit_btn, 120, 40);
+    lv_obj_align(lookout_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_set_style_bg_color(lookout_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(lookout_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(lookout_exit_btn, 0, 0);
+    lv_obj_set_style_radius(lookout_exit_btn, 10, 0);
+    lv_obj_t *exit_lbl = lv_label_create(lookout_exit_btn);
+    lv_label_set_text(exit_lbl, LV_SYMBOL_CLOSE " Exit");
+    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(exit_lbl, ui_text_color(), 0);
+    lv_obj_center(exit_lbl);
+    lv_obj_add_event_cb(lookout_exit_btn, lookout_exit_cb, LV_EVENT_CLICKED, NULL);
+
+    // Load the watchlist CSV from SD (creates an empty one with header if absent).
+    int entries = 0;
+    if (ensure_sd_mounted() == ESP_OK) {
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            entries = bt_lookout_load(BT_LOOKOUT_CSV_PATH);
+            xSemaphoreGive(sd_spi_mutex);
+        }
+    }
+
+    if (!ensure_ble_mode()) {
+        lv_label_set_text(lookout_status_label, "BLE init failed!");
+        ui_locked = false;
+        return;
+    }
+
+    if (entries <= 0) {
+        lv_label_set_text(lookout_status_label, "Watchlist empty - edit lookout.csv");
+    } else {
+        char s[64];
+        snprintf(s, sizeof(s), "Watching %d entries - scanning...", entries);
+        lv_label_set_text(lookout_status_label, s);
+    }
+
+    lv_obj_t *hint = lv_label_create(lookout_list);
+    lv_label_set_text(hint, "Detections will appear here.");
+    lv_obj_set_width(hint, lv_pct(100));
+    lv_obj_set_style_text_color(hint, lv_color_make(150, 150, 150), 0);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+
+    lookout_screen_active = true;
+    bt_lookout_start();
+    BaseType_t task_ret = xTaskCreate(lookout_scan_task, "lookout_scan", 4096, NULL, 5,
+                                      &lookout_scan_task_handle);
+    if (task_ret != pdPASS) {
+        lookout_screen_active = false;
+        bt_lookout_stop();
+        lv_label_set_text(lookout_status_label, "Failed to start scan!");
+    }
+
+    ui_locked = false;
+}
+
+// ============================================================================
+// BLE HoneyPair — advertise as spoofed BLE personas (keyboard, AirPods, watch,
+// etc.), accept connections and log pairing / GATT-read attempts to SD.
+// Backend: ble_honeypair.c. Requires CONFIG_BT_NIMBLE_EXT_ADV=y.
+// ============================================================================
+
+static void hp_update_stats_ui(void)
+{
+    if (!hp_screen_active) return;
+    honeypair_stats_t st;
+    honeypair_get_stats(&st);
+    if (hp_persona_label) {
+        char p[48];
+        snprintf(p, sizeof(p), "Persona: %s", st.persona_name);
+        lv_label_set_text(hp_persona_label, p);
+    }
+    if (hp_stats_label) {
+        char s[128];
+        snprintf(s, sizeof(s), "%s\nConnects %d   Pairs %d\nGATT reads %d   Disc %d",
+                 st.active ? "ADVERTISING" : "stopped",
+                 st.connects, st.pairs, st.gatt_reads, st.disconnects);
+        lv_label_set_text(hp_stats_label, s);
+    }
+}
+
+static void hp_persona_dd_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!hp_persona_dd) return;
+    // Applies live if advertising; otherwise just stores the chosen persona.
+    honeypair_set_persona((int)lv_dropdown_get_selected(hp_persona_dd));
+    hp_update_stats_ui();
+}
+
+static void hp_startstop_cb(lv_event_t *e)
+{
+    (void)e;
+    if (honeypair_is_active()) {
+        honeypair_stop();
+        if (hp_startstop_lbl) lv_label_set_text(hp_startstop_lbl, "Start");
+    } else {
+        int idx = hp_persona_dd ? (int)lv_dropdown_get_selected(hp_persona_dd) : 0;
+        honeypair_start(idx);
+        if (hp_startstop_lbl) lv_label_set_text(hp_startstop_lbl, "Stop");
+    }
+    hp_update_stats_ui();
+}
+
+static void hp_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    honeypair_stop();
+
+    hp_screen_active = false;
+    hp_content = NULL;
+    hp_persona_dd = NULL;
+    hp_startstop_btn = NULL;
+    hp_startstop_lbl = NULL;
+    hp_stats_label = NULL;
+    hp_persona_label = NULL;
+    hp_exit_btn = NULL;
+
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+
+    nav_to_menu_flag = true;
+}
+
+static void show_honeypair_screen(void)
+{
+    ui_locked = true;
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    create_function_page_base("BLE HoneyPair");
+
+    hp_content = lv_obj_create(function_page);
+    lv_obj_set_size(hp_content, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(hp_content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(hp_content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(hp_content, 0, 0);
+    lv_obj_set_style_pad_all(hp_content, 6, 0);
+    lv_obj_clear_flag(hp_content, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *dd_lbl = lv_label_create(hp_content);
+    lv_label_set_text(dd_lbl, "Persona:");
+    lv_obj_set_style_text_color(dd_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(dd_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(dd_lbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    // Build the newline-separated option list from the backend persona table.
+    char opts[512];
+    opts[0] = '\0';
+    int pcount = honeypair_persona_count();
+    for (int i = 0; i < pcount; i++) {
+        strncat(opts, honeypair_persona_name(i), sizeof(opts) - strlen(opts) - 2);
+        if (i < pcount - 1) strncat(opts, "\n", sizeof(opts) - strlen(opts) - 1);
+    }
+    hp_persona_dd = lv_dropdown_create(hp_content);
+    lv_dropdown_set_options(hp_persona_dd, opts);
+    lv_obj_set_width(hp_persona_dd, lv_pct(100));
+    lv_obj_align(hp_persona_dd, LV_ALIGN_TOP_MID, 0, 22);
+    lv_obj_add_event_cb(hp_persona_dd, hp_persona_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    hp_persona_label = lv_label_create(hp_content);
+    lv_label_set_text(hp_persona_label, "Persona: -");
+    lv_obj_set_style_text_color(hp_persona_label, ui_accent_color(), 0);
+    lv_obj_set_style_text_font(hp_persona_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(hp_persona_label, LV_ALIGN_TOP_LEFT, 0, 74);
+
+    hp_stats_label = lv_label_create(hp_content);
+    lv_label_set_text(hp_stats_label, "stopped\nConnects 0   Pairs 0\nGATT reads 0   Disc 0");
+    lv_obj_set_style_text_color(hp_stats_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(hp_stats_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(hp_stats_label, LV_ALIGN_TOP_LEFT, 0, 100);
+
+    hp_startstop_btn = lv_btn_create(hp_content);
+    lv_obj_set_size(hp_startstop_btn, 140, 42);
+    lv_obj_align(hp_startstop_btn, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(hp_startstop_btn, ui_accent_color(), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(hp_startstop_btn, 8, 0);
+    hp_startstop_lbl = lv_label_create(hp_startstop_btn);
+    lv_label_set_text(hp_startstop_lbl, "Start");
+    lv_obj_set_style_text_font(hp_startstop_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(hp_startstop_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(hp_startstop_lbl);
+    lv_obj_add_event_cb(hp_startstop_btn, hp_startstop_cb, LV_EVENT_CLICKED, NULL);
+
+    hp_exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(hp_exit_btn, 120, 40);
+    lv_obj_align(hp_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_set_style_bg_color(hp_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(hp_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(hp_exit_btn, 0, 0);
+    lv_obj_set_style_radius(hp_exit_btn, 10, 0);
+    lv_obj_t *ex = lv_label_create(hp_exit_btn);
+    lv_label_set_text(ex, LV_SYMBOL_CLOSE " Exit");
+    lv_obj_set_style_text_font(ex, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ex, ui_text_color(), 0);
+    lv_obj_center(ex);
+    lv_obj_add_event_cb(hp_exit_btn, hp_exit_cb, LV_EVENT_CLICKED, NULL);
+
+    if (!ensure_ble_mode()) {
+        lv_label_set_text(hp_stats_label, "BLE init failed!");
+        ui_locked = false;
+        return;
+    }
+
+    hp_screen_active = true;
+    hp_update_stats_ui();
     ui_locked = false;
 }
 
