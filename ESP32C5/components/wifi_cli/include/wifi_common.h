@@ -109,7 +109,7 @@ typedef struct {
     float accuracy;
     int satellites;
     bool valid;
-    char time_utc[16];   // "HH:MM:SS" UTC from NMEA (optional; empty if unknown)
+    char time_utc[10];   // "HH:MM:SS" UTC from NMEA (optional; empty if unknown)
 } gps_data_t;
 
 // Target BSSID structure
