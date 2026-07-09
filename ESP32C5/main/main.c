@@ -8465,11 +8465,20 @@ static void wardrive_promisc_task(void *pvParameters) {
         wdp_ducb_update(ch_idx, reward);
         wd_ui_update_flag = true;
 
-        if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+        // Write newly-seen networks in small chunks, releasing the SD/SPI mutex
+        // between chunks so the display can interleave bus access during a burst
+        // (avoids UI freezes when many networks accumulated in one dwell cycle).
+        #define WDP_WRITE_CHUNK 16
         char timestamp[32];
         get_timestamp_string(timestamp, sizeof(timestamp));
+        int chunk_written = 0;
+        bool holding_sd = false;
         for (int i = 0; i < wdp_seen_count; i++) {
             if (wdp_seen_networks[i].written_to_file) continue;
+            if (!holding_sd) {
+                if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+                holding_sd = true;
+            }
             wdp_network_t *net = &wdp_seen_networks[i];
             char mac_str[18];
             snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -8483,12 +8492,19 @@ static void wardrive_promisc_task(void *pvParameters) {
                     net->channel, net->rssi, net->latitude, net->longitude);
             net->written_to_file = true;
             networks_since_flush++;
+            if (networks_since_flush >= WDP_FILE_FLUSH_INTERVAL) {
+                fflush(file);
+                networks_since_flush = 0;
+            }
+            if (++chunk_written >= WDP_WRITE_CHUNK) {
+                // Release the bus and yield so the display task can run, then resume.
+                if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+                holding_sd = false;
+                chunk_written = 0;
+                vTaskDelay(1);
+            }
         }
-        if (networks_since_flush >= WDP_FILE_FLUSH_INTERVAL) {
-            fflush(file);
-            networks_since_flush = 0;
-        }
-        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        if (holding_sd && sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
         int64_t now = esp_timer_get_time();
         if (now - last_stats_us >= WDP_STATS_INTERVAL_US) {

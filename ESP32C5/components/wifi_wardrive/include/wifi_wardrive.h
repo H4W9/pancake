@@ -42,14 +42,31 @@ float wifi_wardrive_get_longitude(void);
 // ============================================================================
 
 /**
- * @brief Initialize SD card
+ * @brief Initialize SD card (default: 20 MHz, no auto-format)
  */
 esp_err_t wifi_wardrive_init_sd(void);
+
+/**
+ * @brief Initialize SD card with explicit SPI frequency and format option.
+ *        freq_khz: SPI clock (try 20000, then 10000, then 5000 for stubborn cards).
+ *        format_if_failed: auto-format as FAT32 if card responds but has no filesystem.
+ */
+esp_err_t wifi_wardrive_init_sd_ex(uint32_t freq_khz, bool format_if_failed);
 
 /**
  * @brief Check if SD card is mounted
  */
 bool wifi_wardrive_is_sd_mounted(void);
+
+/**
+ * @brief Unmount the SD card cleanly. Safe to call when not mounted (no-op).
+ */
+void wifi_wardrive_unmount_sd(void);
+
+/**
+ * @brief Format the SD card FAT filesystem (card must be mounted)
+ */
+esp_err_t wifi_wardrive_format_sd(void);
 
 // ============================================================================
 // WARDRIVE FUNCTIONS
