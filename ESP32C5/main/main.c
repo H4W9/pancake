@@ -76,6 +76,7 @@
 #include "services/gatt/ble_svc_gatt.h"
 #include "ble_honeypair.h"
 #include "ble_blueduck.h"
+#include "ble_whisperpair.h"
 
 #define TAG "WiFi_Hacker"
 
@@ -1048,6 +1049,17 @@ static lv_obj_t *bd_exit_btn = NULL;
 static volatile bool bd_screen_active = false;
 static int bd_script_count = 0;
 
+// BLE WhisperPair UI state
+static lv_obj_t *wp_content = NULL;
+static lv_obj_t *wp_device_dd = NULL;     // device selector dropdown
+static lv_obj_t *wp_mode_dd = NULL;       // mode selector (Probe vs Exploit)
+static lv_obj_t *wp_result_label = NULL;
+static lv_obj_t *wp_exit_btn = NULL;
+static volatile bool wp_screen_active = false;
+static uint8_t wp_selected_mac[6] = {0};
+static volatile int8_t wp_selected_rssi = 0;
+static char wp_selected_name[32] = "";
+
 // Battery voltage monitor state (DISABLED - using regular C5 chip)
 static lv_obj_t *battery_label = NULL;  // Keep for UI layout
 static char last_voltage_str[32] = "-.--V";  // Persisted across screen changes
@@ -1230,6 +1242,16 @@ static void reset_function_page_children(void) {
     bd_stats_label = NULL;
     bd_exit_btn = NULL;
     bd_screen_active = false;
+    // BLE WhisperPair: cancel probe/exploit on any nav away
+    if (wp_screen_active) {
+        wp_cancel();
+    }
+    wp_content = NULL;
+    wp_device_dd = NULL;
+    wp_mode_dd = NULL;
+    wp_result_label = NULL;
+    wp_exit_btn = NULL;
+    wp_screen_active = false;
     wifi_connect_ta = NULL;
     wifi_connect_keyboard = NULL;
     wifi_connect_status_label = NULL;
@@ -1408,6 +1430,14 @@ static void show_blueduck_screen(void);
 static void bd_startstop_cb(lv_event_t *e);
 static void bd_exit_cb(lv_event_t *e);
 static void bd_update_stats_ui(void);
+
+// BLE WhisperPair UI
+static void show_whisperpair_screen(void);
+static void wp_device_dd_cb(lv_event_t *e);
+static void wp_mode_dd_cb(lv_event_t *e);
+static void wp_startstop_cb(lv_event_t *e);
+static void wp_exit_cb(lv_event_t *e);
+static void wp_result_callback(wp_result_t result, const char *detail, const uint8_t mac[6], wp_mode_t mode);
 
 // BLE peripheral mode switch (re-inits NimBLE if the registered service table
 // must change between HoneyPair and BlueDuck).
@@ -3307,6 +3337,9 @@ void app_main(void)
     // BLE BlueDuck backend — same shared resources; scripts from SD
     blueduck_init(sd_spi_mutex, local_gps_snapshot);
 
+    // BLE WhisperPair backend — shares the SD/SPI mutex for logging
+    wp_init(sd_spi_mutex);
+
     // Create I2C mutex (FT6336U touch and MAX17048 battery share I2C_NUM_0)
     i2c_mutex = xSemaphoreCreateMutex();
     if (i2c_mutex == NULL) {
@@ -4591,6 +4624,18 @@ static void display_refresh_task(void *pvParameters)
                 if (bd_now - bd_last_us > 400000) {
                     bd_last_us = bd_now;
                     bd_update_stats_ui();
+                }
+            }
+
+            // BLE WhisperPair status refresh (throttled to ~2.5 Hz)
+            if (wp_screen_active && wp_is_active()) {
+                static int64_t wp_last_us = 0;
+                int64_t wp_now = esp_timer_get_time();
+                if (wp_now - wp_last_us > 400000) {
+                    wp_last_us = wp_now;
+                    if (wp_result_label) {
+                        lv_label_set_text(wp_result_label, wp_status());
+                    }
                 }
             }
 
@@ -13794,6 +13839,10 @@ static void show_bluetooth_screen(void)
     // BLE BlueDuck - Orange: HID keyboard persona, inject DuckyScript on connect
     lv_obj_t *blueduck_tile = create_tile(tiles, LV_SYMBOL_KEYBOARD, "Blue\nDuck", lv_color_make(255, 90, 0), NULL, NULL);
     lv_obj_add_event_cb(blueduck_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BlueDuck");
+
+    // BLE WhisperPair - Yellow: Fast Pair vulnerability probe/exploit
+    lv_obj_t *whisperpair_tile = create_tile(tiles, LV_SYMBOL_EDIT, "Whisper\nPair", lv_color_make(255, 200, 0), NULL, NULL);
+    lv_obj_add_event_cb(whisperpair_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"WhisperPair");
 }
 
 // BT Locator screen - scan BT devices, select one, then track RSSI every 10s
@@ -14954,6 +15003,12 @@ void attack_event_cb(lv_event_t *e)
     // BLE BlueDuck
     if (strcmp(attack_name, "BlueDuck") == 0) {
         show_blueduck_screen();
+        return;
+    }
+
+    // BLE WhisperPair
+    if (strcmp(attack_name, "WhisperPair") == 0) {
+        show_whisperpair_screen();
         return;
     }
 
@@ -16502,6 +16557,7 @@ static void feature_led_update(void)
     // ── New BLE peripheral/central tools (screen-gated) ──────────────────
     if (bd_screen_active && blueduck_is_active())       { r = 90; g = 30; b = 0;  } // orange — BlueDuck advertising/injecting
     else if (hp_screen_active && honeypair_is_active()) { r = 80; g = 0;  b = 40; } // magenta — HoneyPair advertising
+    else if (wp_screen_active && wp_is_active())        { r = 80; g = 80; b = 0;  } // yellow — WhisperPair probe/exploit
     else if (gw_screen_active)                          { r = 40; g = 0;  b = 80; } // purple — GATT Walker
     else if (lookout_screen_active)                     { r = 0;  g = 0;  b = 80; } // blue — BT Lookout
     // ── Aggressive WiFi attacks (red) ────────────────────────────────────
@@ -16993,6 +17049,181 @@ static void show_blueduck_screen(void)
 
     bd_screen_active = true;
     bd_update_stats_ui();
+    ui_locked = false;
+}
+
+// ============================================================================
+// BLE WhisperPair — Fast Pair vulnerability probe/exploit
+// ============================================================================
+
+static void wp_result_callback(wp_result_t result, const char *detail, const uint8_t mac[6], wp_mode_t mode)
+{
+    if (!wp_result_label) return;
+    const char *result_str = "";
+    switch (result) {
+        case WP_RESULT_VULNERABLE: result_str = "Vulnerable!"; break;
+        case WP_RESULT_PATCHED:    result_str = "Patched"; break;
+        case WP_RESULT_NO_SERVICE: result_str = "No FP Service"; break;
+        case WP_RESULT_CONNECT_FAIL: result_str = "Connect Failed"; break;
+        case WP_RESULT_ERROR:      result_str = "Error"; break;
+    }
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s\n%s", result_str, detail ? detail : "");
+    lv_label_set_text(wp_result_label, buf);
+}
+
+static void wp_device_dd_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!wp_device_dd) return;
+    int sel = (int)lv_dropdown_get_selected(wp_device_dd);
+    if (sel < 0 || sel >= bt_device_count) return;
+    memcpy(wp_selected_mac, bt_devices[sel].addr, 6);
+    wp_selected_rssi = bt_devices[sel].rssi;
+    strncpy(wp_selected_name, bt_devices[sel].name, sizeof(wp_selected_name) - 1);
+    wp_selected_name[sizeof(wp_selected_name) - 1] = '\0';
+    if (wp_result_label) lv_label_set_text(wp_result_label, "Device selected.\nReady to probe.");
+}
+
+static void wp_mode_dd_cb(lv_event_t *e)
+{
+    (void)e;
+}
+
+static void wp_startstop_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wp_is_active()) {
+        wp_cancel();
+        if (wp_result_label) lv_label_set_text(wp_result_label, "Cancelled.");
+        return;
+    }
+
+    if (wp_selected_mac[0] == 0 && wp_selected_mac[1] == 0 &&
+        wp_selected_mac[2] == 0 && wp_selected_mac[3] == 0 &&
+        wp_selected_mac[4] == 0 && wp_selected_mac[5] == 0) {
+        if (wp_result_label) lv_label_set_text(wp_result_label, "No device selected.");
+        return;
+    }
+
+    wp_mode_t mode = wp_mode_dd ? (lv_dropdown_get_selected(wp_mode_dd) == 0 ? WP_MODE_PROBE : WP_MODE_EXPLOIT) : WP_MODE_PROBE;
+    const char *mode_str = (mode == WP_MODE_PROBE) ? "Probe" : "Exploit";
+    char buf[96];
+    snprintf(buf, sizeof(buf), "Starting %s...", mode_str);
+    if (wp_result_label) lv_label_set_text(wp_result_label, buf);
+
+    if (!wp_start(wp_selected_mac, bt_devices[lv_dropdown_get_selected(wp_device_dd)].addr_type,
+                  wp_selected_name, wp_selected_rssi, mode, wp_result_callback)) {
+        if (wp_result_label) lv_label_set_text(wp_result_label, "Failed to start probe.");
+    }
+}
+
+static void wp_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    wp_cancel();
+    wp_screen_active = false;
+    wp_content = NULL;
+    wp_device_dd = NULL;
+    wp_mode_dd = NULL;
+    wp_result_label = NULL;
+    wp_exit_btn = NULL;
+
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+
+    nav_to_menu_flag = true;
+}
+
+static void show_whisperpair_screen(void)
+{
+    ui_locked = true;
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    create_function_page_base("BLE WhisperPair");
+
+    wp_content = lv_obj_create(function_page);
+    lv_obj_set_size(wp_content, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(wp_content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(wp_content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(wp_content, 0, 0);
+    lv_obj_set_style_pad_all(wp_content, 6, 0);
+    lv_obj_clear_flag(wp_content, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *dl = lv_label_create(wp_content);
+    lv_label_set_text(dl, "Fast Pair Device:");
+    lv_obj_set_style_text_color(dl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(dl, &lv_font_montserrat_14, 0);
+    lv_obj_align(dl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    char dopts[1024];
+    dopts[0] = '\0';
+    for (int i = 0; i < bt_device_count; i++) {
+        char line[96];
+        snprintf(line, sizeof(line), "%s (%d dBm)", bt_devices[i].name[0] ? bt_devices[i].name : "Unknown", bt_devices[i].rssi);
+        strncat(dopts, line, sizeof(dopts) - strlen(dopts) - 2);
+        if (i < bt_device_count - 1) strncat(dopts, "\n", sizeof(dopts) - strlen(dopts) - 1);
+    }
+    if (bt_device_count == 0) strcpy(dopts, "(no devices found)");
+
+    wp_device_dd = lv_dropdown_create(wp_content);
+    lv_dropdown_set_options(wp_device_dd, dopts);
+    lv_obj_set_width(wp_device_dd, lv_pct(100));
+    lv_obj_align(wp_device_dd, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_add_event_cb(wp_device_dd, wp_device_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *ml = lv_label_create(wp_content);
+    lv_label_set_text(ml, "Mode:");
+    lv_obj_set_style_text_color(ml, ui_text_color(), 0);
+    lv_obj_set_style_text_font(ml, &lv_font_montserrat_14, 0);
+    lv_obj_align(ml, LV_ALIGN_TOP_LEFT, 0, 66);
+
+    wp_mode_dd = lv_dropdown_create(wp_content);
+    lv_dropdown_set_options(wp_mode_dd, "Probe\nExploit");
+    lv_obj_set_width(wp_mode_dd, lv_pct(100));
+    lv_obj_align(wp_mode_dd, LV_ALIGN_TOP_MID, 0, 86);
+    lv_obj_add_event_cb(wp_mode_dd, wp_mode_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    wp_result_label = lv_label_create(wp_content);
+    lv_label_set_text(wp_result_label, "Device selected.\nReady to probe.");
+    lv_obj_set_style_text_color(wp_result_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(wp_result_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(wp_result_label, LV_ALIGN_TOP_LEFT, 0, 132);
+
+    lv_obj_t *start_btn = lv_btn_create(wp_content);
+    lv_obj_set_size(start_btn, 140, 42);
+    lv_obj_align(start_btn, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(start_btn, lv_color_make(255, 200, 0), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(start_btn, 8, 0);
+    lv_obj_t *start_lbl = lv_label_create(start_btn);
+    lv_label_set_text(start_lbl, "Probe");
+    lv_obj_set_style_text_font(start_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(start_lbl, lv_color_hex(0x000000), 0);
+    lv_obj_center(start_lbl);
+    lv_obj_add_event_cb(start_btn, wp_startstop_cb, LV_EVENT_CLICKED, NULL);
+
+    wp_exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(wp_exit_btn, 120, 40);
+    lv_obj_align(wp_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_set_style_bg_color(wp_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(wp_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(wp_exit_btn, 0, 0);
+    lv_obj_set_style_radius(wp_exit_btn, 10, 0);
+    lv_obj_t *ex = lv_label_create(wp_exit_btn);
+    lv_label_set_text(ex, LV_SYMBOL_CLOSE " Exit");
+    lv_obj_set_style_text_font(ex, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ex, ui_text_color(), 0);
+    lv_obj_center(ex);
+    lv_obj_add_event_cb(wp_exit_btn, wp_exit_cb, LV_EVENT_CLICKED, NULL);
+
+    if (!bt_scan_active) {
+        if (wp_result_label) lv_label_set_text(wp_result_label, "No BLE scan active.\nStart BLE scan first.");
+    }
+
+    wp_screen_active = true;
     ui_locked = false;
 }
 
