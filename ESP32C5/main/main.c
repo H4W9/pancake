@@ -16442,8 +16442,9 @@ static void lookout_led_set(uint8_t r, uint8_t g, uint8_t b)
     led_strip_refresh(g_led_strip);
 }
 
-// NeoPixel status policy for the new BLE features. Priority: BT Lookout alert
-// flash (red) overrides a solid per-feature color; off when nothing active.
+// NeoPixel status policy for ALL features (mirrors the zip's led_update_mode).
+// Priority: BT Lookout alert flash (red) overrides a solid per-feature color
+// that reflects the loudest active operation (attacks > scans); off when idle.
 // Called only from the LVGL/main task so RMT stays single-threaded. Only
 // refreshes the LED when the target color changes (avoids RMT spam).
 static void feature_led_update(void)
@@ -16456,13 +16457,37 @@ static void feature_led_update(void)
         return;
     }
 
-    // Priority 2: solid color reflecting the active new BLE feature.
+    // Priority 2: solid color reflecting the active feature/mode. Ordered most-
+    // to-least "loud" so the highest-severity active operation wins the LED.
     int r, g, b;
-    if (bd_screen_active && blueduck_is_active())  { r = 90; g = 30; b = 0;  }  // orange — BlueDuck advertising/injecting
-    else if (hp_screen_active && honeypair_is_active()) { r = 80; g = 0; b = 40; }  // magenta — HoneyPair advertising
-    else if (gw_screen_active)                     { r = 40; g = 0;  b = 80; }  // purple — GATT Walker
-    else if (lookout_screen_active)                { r = 0;  g = 0;  b = 80; }  // blue — BT Lookout scanning
-    else                                           { r = 0;  g = 0;  b = 0;  }  // off — idle
+    // ── New BLE peripheral/central tools (screen-gated) ──────────────────
+    if (bd_screen_active && blueduck_is_active())       { r = 90; g = 30; b = 0;  } // orange — BlueDuck advertising/injecting
+    else if (hp_screen_active && honeypair_is_active()) { r = 80; g = 0;  b = 40; } // magenta — HoneyPair advertising
+    else if (gw_screen_active)                          { r = 40; g = 0;  b = 80; } // purple — GATT Walker
+    else if (lookout_screen_active)                     { r = 0;  g = 0;  b = 80; } // blue — BT Lookout
+    // ── Aggressive WiFi attacks (red) ────────────────────────────────────
+    else if (wifi_attacks_is_deauth_active() || targeted_deauth_active ||
+             wifi_attacks_is_blackout_active() || wifi_attacks_is_sae_overflow_active())
+                                                        { r = 80; g = 0;  b = 0;  } // red — denial of service
+    // ── Rogue AP / captive portal (orange) ───────────────────────────────
+    else if (wifi_attacks_is_karma_active() || wifi_attacks_is_portal_active())
+                                                        { r = 80; g = 30; b = 0;  } // orange — fake AP
+    // ── Handshake capture (yellow) ───────────────────────────────────────
+    else if (handshake_attack_active)                   { r = 70; g = 70; b = 0;  } // yellow — WPA capture
+    // ── Deauth monitor / MITM (amber) ────────────────────────────────────
+    else if (deauth_monitor_active || mitm_arp_active)  { r = 80; g = 40; b = 0;  } // amber — watching/intercepting
+    // ── Passive sniffing (green) ─────────────────────────────────────────
+    else if (sniffer_task_active || sniffer_dog_active) { r = 0;  g = 80; b = 0;  } // green — listening
+    // ── Wardriving (cyan) ────────────────────────────────────────────────
+    else if (wardrive_active)                           { r = 0;  g = 50; b = 50; } // cyan — geo-mapping
+    // ── BLE / AirTag / BT locator scanning (purple) ──────────────────────
+    else if (ble_scan_ui_active || bt_scan_active ||
+             airtag_scan_ui_active || bt_locator_tracking_active)
+                                                        { r = 40; g = 0;  b = 80; } // purple — Bluetooth scanning
+    // ── WiFi AP scanning (blue) ──────────────────────────────────────────
+    else if (wifi_scanner_is_scanning())                { r = 0;  g = 0;  b = 80; } // blue — scanning for APs
+    // ── Idle (off) ───────────────────────────────────────────────────────
+    else                                                { r = 0;  g = 0;  b = 0;  }
 
     if (r != last_r || g != last_g || b != last_b) {
         lookout_led_set((uint8_t)r, (uint8_t)g, (uint8_t)b);
