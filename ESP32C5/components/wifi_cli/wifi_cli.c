@@ -1,4 +1,6 @@
 // wifi_cli.c - CLI Coordinator and Command Registration
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "wifi_cli.h"
 #include "wifi_scanner.h"
 #include "wifi_sniffer.h"
@@ -94,7 +96,18 @@ static esp_err_t init_wifi(void) {
     }
     ESP_ERROR_CHECK(cfg_err);
     ESP_ERROR_CHECK(esp_wifi_start());
-    
+
+    /* Pin world regulatory domain (channels 1-13, MANUAL) so the driver never
+       updates it mid-association from an AP's Country IE.  nchan=13 covers EU
+       and US (1-11 subset) equally.  MANUAL policy = no AP can reset it at runtime. */
+    {
+        wifi_country_t wc = { .cc = "01", .schan = 1, .nchan = 13,
+                              .policy = WIFI_COUNTRY_POLICY_MANUAL };
+        esp_wifi_set_country(&wc);
+    }
+    vTaskDelay(pdMS_TO_TICKS(400));   // let background tasks run after start
+    apply_wifi_power_settings();      // apply Normal/Max TX power for current mode
+
     uint8_t mac[6];
     esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
     if (ret == ESP_OK) {

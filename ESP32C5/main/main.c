@@ -290,6 +290,7 @@ static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel 
 #define NVS_KEY_SCAN_MIN    "scan_min"
 #define NVS_KEY_SCAN_MAX    "scan_max"
 #define NVS_KEY_DARK_MODE   "dark_mode"
+#define NVS_KEY_MAX_POWER   "max_power"
 
 // ============================================================================
 // Theme-aware style helpers
@@ -2046,6 +2047,10 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_DARK_MODE, &dm) == ESP_OK) {
             dark_mode_enabled = (dm != 0);
         }
+        uint8_t mp = 0;
+        if (nvs_get_u8(h, NVS_KEY_MAX_POWER, &mp) == ESP_OK) {
+            g_max_power_mode = (mp != 0);
+        }
         nvs_close(h);
         ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d",
                  (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms,
@@ -2067,7 +2072,7 @@ static void nvs_settings_load(void)
 // enqueue the change; nvs_writer_task (below, created with an INTERNAL-RAM stack)
 // performs the actual commit in a safe context.
 typedef struct {
-    uint8_t kind;   // 0=timeout 1=brightness 2=scan_time 3=dark_mode
+    uint8_t kind;   // 0=timeout 1=brightness 2=scan_time 3=dark_mode 4=max_power
     int32_t a;
     int32_t b;
 } nvs_save_req_t;
@@ -2092,6 +2097,7 @@ static void nvs_writer_task(void *arg)
             case 2: nvs_set_u16(h, NVS_KEY_SCAN_MIN, (uint16_t)req.a);
                     nvs_set_u16(h, NVS_KEY_SCAN_MAX, (uint16_t)req.b); break;
             case 3: nvs_set_u8(h, NVS_KEY_DARK_MODE, req.a ? 1 : 0); break;
+            case 4: nvs_set_u8(h, NVS_KEY_MAX_POWER, req.a ? 1 : 0); break;
             default: nvs_close(h); continue;
         }
         nvs_commit(h);
@@ -2112,6 +2118,7 @@ static void nvs_settings_save_timeout(int32_t ms)                     { nvs_save
 static void nvs_settings_save_brightness(uint8_t pct)                 { nvs_save_enqueue(1, pct, 0); }
 static void nvs_settings_save_scan_time(uint16_t min_ms, uint16_t max_ms) { nvs_save_enqueue(2, min_ms, max_ms); }
 static void nvs_settings_save_dark_mode(bool enabled)                 { nvs_save_enqueue(3, enabled ? 1 : 0, 0); }
+static void nvs_settings_save_max_power(bool enabled)                 { nvs_save_enqueue(4, enabled ? 1 : 0, 0); }
 
 // ============================================================================
 // Backlight / Brightness / Screen Dimming
@@ -13656,6 +13663,15 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_screen_timeout_popup();
     } else if (strcmp(tile_name, "Screen Brightness") == 0) {
         show_screen_brightness_popup();
+    } else if (strcmp(tile_name, "Max Power") == 0) {
+        g_max_power_mode = !g_max_power_mode;
+        nvs_settings_save_max_power(g_max_power_mode);
+        // Apply immediately if WiFi is running; otherwise it's applied on next
+        // esp_wifi_start() (wifi_cli.c) and persists via NVS.
+        if (current_radio_mode == RADIO_MODE_WIFI) {
+            apply_wifi_power_settings();
+        }
+        show_settings_screen();   // re-render so the tile reflects the new state
     }
 }
 
@@ -13691,6 +13707,12 @@ static void show_settings_screen(void)
     
     // Screen Brightness - Orange
     create_tile(tiles, LV_SYMBOL_IMAGE, "Screen\nBrightness", COLOR_MATERIAL_ORANGE, settings_tile_event_cb, "Screen Brightness");
+
+    // Max TX Power - toggles max WiFi transmit power (label reflects state)
+    create_tile(tiles, LV_SYMBOL_CHARGE,
+                g_max_power_mode ? "Max Power\nON" : "Max Power\nOFF",
+                g_max_power_mode ? lv_color_make(0, 170, 60) : lv_color_make(120, 120, 120),
+                settings_tile_event_cb, "Max Power");
 }
 
 // WiFi Monitor screen
@@ -15401,6 +15423,7 @@ static bool ensure_ble_mode(void)
         case RADIO_MODE_WIFI: {
             // Deinitialize WiFi and switch to BLE
             ESP_LOGI(TAG, "Switching from WiFi to BLE mode...");
+            wifi_scanner_abort();   // clear any stuck in-progress scan before stop
             esp_wifi_stop();
             esp_wifi_deinit();
             // STA netif is kept for reuse on WiFi re-init

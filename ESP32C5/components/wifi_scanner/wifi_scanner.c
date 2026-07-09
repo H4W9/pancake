@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_timer.h"
+#include "esp_attr.h"
 #include <string.h>
 
 static const char *TAG = "wifi_scanner";
@@ -12,9 +13,9 @@ static volatile bool g_scan_in_progress = false;
 static volatile bool g_scan_done = false;
 
 // Shared scan results (defined in wifi_common.c, used by other components)
-wifi_ap_record_t g_shared_scan_results[MAX_SCAN_RESULTS];
+EXT_RAM_BSS_ATTR wifi_ap_record_t g_shared_scan_results[MAX_SCAN_RESULTS];
 uint16_t g_shared_scan_count = 0;
-int g_shared_selected_indices[MAX_SCAN_RESULTS];
+EXT_RAM_BSS_ATTR int g_shared_selected_indices[MAX_SCAN_RESULTS];
 int g_shared_selected_count = 0;
 
 // Target BSSID monitoring (for deauth attacks)
@@ -44,9 +45,15 @@ static void wifi_scanner_event_handler(void *arg, esp_event_base_t event_base,
 }
 
 esp_err_t wifi_scanner_init(void) {
-    // Register event handler for scan completion
-    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,
-                               &wifi_scanner_event_handler, NULL);
+    // Guard: only register once regardless of how many times this is called.
+    // wifi_cli_init() and main.c both call this; duplicate registrations each
+    // consume ~60 B of internal heap permanently and cause double result reads.
+    static bool s_handler_registered = false;
+    if (!s_handler_registered) {
+        esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,
+                                   &wifi_scanner_event_handler, NULL);
+        s_handler_registered = true;
+    }
     return ESP_OK;
 }
 
@@ -103,6 +110,14 @@ bool wifi_scanner_is_done(void) {
     return g_scan_done;
 }
 
+void wifi_scanner_abort(void) {
+    if (g_scan_in_progress) {
+        esp_wifi_scan_stop();
+        g_scan_in_progress = false;
+    }
+    g_scan_done = false;
+}
+
 esp_err_t wifi_scanner_select_network(int index, bool selected) {
     if (index < 0 || index >= g_shared_scan_count) {
         return ESP_ERR_INVALID_ARG;
@@ -118,7 +133,7 @@ esp_err_t wifi_scanner_select_network(int index, bool selected) {
             }
         }
         
-        if (!already_selected && g_shared_selected_count < MAX_SCAN_RESULTS) {
+        if (!already_selected && g_shared_selected_count < 20) {
             g_shared_selected_indices[g_shared_selected_count++] = index;
         }
     } else {
