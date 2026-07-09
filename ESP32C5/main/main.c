@@ -17219,8 +17219,17 @@ static void show_whisperpair_screen(void)
     lv_obj_center(ex);
     lv_obj_add_event_cb(wp_exit_btn, wp_exit_cb, LV_EVENT_CLICKED, NULL);
 
-    if (!bt_scan_active) {
-        if (wp_result_label) lv_label_set_text(wp_result_label, "No BLE scan active.\nStart BLE scan first.");
+    // Seed the selection from the first listed device so the default dropdown
+    // position (index 0) is immediately actionable without a change event.
+    if (bt_device_count > 0) {
+        memcpy(wp_selected_mac, bt_devices[0].addr, 6);
+        wp_selected_rssi = bt_devices[0].rssi;
+        strncpy(wp_selected_name, bt_devices[0].name, sizeof(wp_selected_name) - 1);
+        wp_selected_name[sizeof(wp_selected_name) - 1] = '\0';
+    } else {
+        memset(wp_selected_mac, 0, 6);
+        if (wp_result_label)
+            lv_label_set_text(wp_result_label, "No devices found.\nRun a BLE scan first.");
     }
 
     wp_screen_active = true;
