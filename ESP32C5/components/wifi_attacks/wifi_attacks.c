@@ -562,10 +562,51 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
     last_password_wrong = false;
     connectAttemptCount = 0;
 
-    // Build the AP config up front so it can be applied BEFORE esp_wifi_start().
-    // The ESP32-C5 driver latches the beacon SSID at AP start; configuring after
-    // start leaves it broadcasting the IDF default "ESP_xxxxxx".
-    // (Zero Width Space appended below to prevent iPhone SSID grouping.)
+    // Mirror the proven-working Rogue AP bring-up: disconnect STA, (re)create the
+    // AP netif, start APSTA, and set the AP config AFTER esp_wifi_start(). On this
+    // ESP32-C5 that ordering is what makes the beacon actually use the SSID.
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap_netif) {
+        ESP_LOGI(TAG, "Creating AP netif...");
+        esp_wifi_stop();
+        ap_netif = esp_netif_create_default_wifi_ap();
+        if (!ap_netif) {
+            ESP_LOGE(TAG, "Failed to create AP netif");
+            esp_wifi_start();
+            apply_wifi_power_settings();
+            return ESP_FAIL;
+        }
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        esp_wifi_start();
+        apply_wifi_power_settings();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    } else {
+        wifi_mode_t mode;
+        esp_wifi_get_mode(&mode);
+        if (mode != WIFI_MODE_APSTA) {
+            esp_wifi_set_mode(WIFI_MODE_APSTA);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    // Stop DHCP server to configure custom IP
+    esp_netif_dhcps_stop(ap_netif);
+
+    // Set static IP 172.0.0.1 for AP
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+
+    esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set AP IP to 172.0.0.1: %s", esp_err_to_name(ret));
+    }
+
+    // Configure AP with the cloned Evil Twin SSID AFTER start (matches Rogue AP).
     wifi_config_t ap_config = {
                 .ap = {
                     .ssid = "",
@@ -599,46 +640,9 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
         ap_config.ap.authmode = WIFI_AUTH_OPEN;
     }
 
-    // Ensure the AP netif exists (created once, then persists for the session).
-    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (!ap_netif) {
-        ESP_LOGI(TAG, "Creating AP netif...");
-        esp_wifi_stop();
-        ap_netif = esp_netif_create_default_wifi_ap();
-        if (!ap_netif) {
-            ESP_LOGE(TAG, "Failed to create AP netif");
-            esp_wifi_start();
-            apply_wifi_power_settings();
-            return ESP_FAIL;
-        }
-    }
-
-    // Bulletproof AP bring-up: STOP -> set mode+config -> START. On the ESP32-C5,
-    // esp_wifi_set_config() does not re-latch the beacon SSID on a running AP, so
-    // fully cycling the interface with the config in place forces the beacon to
-    // regenerate with the cloned SSID (otherwise it broadcasts "ESP_xxxxxx").
-    esp_wifi_stop();
-    esp_wifi_set_mode(WIFI_MODE_APSTA);
     esp_err_t cfg_ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
     if (cfg_ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_set_config(AP) failed: %s", esp_err_to_name(cfg_ret));
-    }
-    esp_wifi_start();
-    apply_wifi_power_settings();
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    // Stop DHCP server to configure custom IP
-    esp_netif_dhcps_stop(ap_netif);
-
-    // Set static IP 172.0.0.1 for AP
-    esp_netif_ip_info_t ip_info;
-    ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
-    ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
-    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
-
-    esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set AP IP to 172.0.0.1: %s", esp_err_to_name(ret));
     }
 
     // Register event handler for password verification (WIFI_EVENT_STA_CONNECTED/DISCONNECTED)
@@ -1854,26 +1858,14 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
     // Enable Karma mode - no WiFi connection verification attempts
     karma_mode = true;
 
-    // Build the AP config up front so it can be applied BEFORE esp_wifi_start().
-    // The ESP32-C5 driver latches the beacon SSID when the AP starts; setting
-    // the config after start leaves it broadcasting the IDF default "ESP_xxxxxx"
-    // instead of the portal SSID. (no Zero Width Space - this is not Evil Twin)
-    wifi_config_t ap_config = {
-        .ap = {
-            .ssid = "",
-            .ssid_len = 0,
-            .channel = 1,
-            .password = "",
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN
-        }
-    };
-    size_t ssid_len = strlen(portal_ssid);
-    if (ssid_len > sizeof(ap_config.ap.ssid)) ssid_len = sizeof(ap_config.ap.ssid);
-    memcpy(ap_config.ap.ssid, portal_ssid, ssid_len);
-    ap_config.ap.ssid_len = ssid_len;
+    // Mirror the proven-working Rogue AP bring-up (same board + author): disconnect
+    // the STA, (re)create the AP netif, start APSTA, and set the AP config AFTER
+    // esp_wifi_start(). On this ESP32-C5 that ordering is what actually makes the
+    // beacon use the SSID — the Rogue AP path does exactly this and broadcasts its
+    // custom SSID correctly, so Portal now matches it (differing only in OPEN auth).
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(200));
 
-    // Ensure the AP netif exists (created once, then persists for the session).
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (!ap_netif) {
         ESP_LOGI(TAG, "Creating AP netif...");
@@ -1885,22 +1877,18 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
             apply_wifi_power_settings();
             return ESP_FAIL;
         }
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        esp_wifi_start();
+        apply_wifi_power_settings();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    } else {
+        wifi_mode_t mode;
+        esp_wifi_get_mode(&mode);
+        if (mode != WIFI_MODE_APSTA) {
+            esp_wifi_set_mode(WIFI_MODE_APSTA);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
     }
-
-    // Bulletproof AP bring-up: STOP -> set mode+config -> START. On the ESP32-C5,
-    // esp_wifi_set_config() does NOT re-latch the beacon SSID on an already-running
-    // AP (nor reliably when set only before the very first start), so the AP keeps
-    // broadcasting the IDF default "ESP_xxxxxx". Fully cycling the interface with
-    // the config in place forces the beacon to regenerate with our SSID every time.
-    esp_wifi_stop();
-    esp_wifi_set_mode(WIFI_MODE_APSTA);
-    esp_err_t cfg_ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-    if (cfg_ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_set_config(AP) failed: %s", esp_err_to_name(cfg_ret));
-    }
-    esp_wifi_start();
-    apply_wifi_power_settings();
-    vTaskDelay(pdMS_TO_TICKS(500));
 
     // Stop DHCP server to configure custom IP
     esp_netif_dhcps_stop(ap_netif);
@@ -1915,7 +1903,28 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to set AP IP to 172.0.0.1: %s", esp_err_to_name(ret));
     }
-    
+
+    // Configure AP with the portal SSID AFTER start (matches Rogue AP). OPEN auth,
+    // no Zero Width Space (this is not Evil Twin).
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "",
+            .ssid_len = 0,
+            .channel = 1,
+            .password = "",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_OPEN
+        }
+    };
+    size_t ssid_len = strlen(portal_ssid);
+    if (ssid_len > sizeof(ap_config.ap.ssid)) ssid_len = sizeof(ap_config.ap.ssid);
+    memcpy(ap_config.ap.ssid, portal_ssid, ssid_len);
+    ap_config.ap.ssid_len = ssid_len;
+    esp_err_t cfg_ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (cfg_ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_config(AP) failed: %s", esp_err_to_name(cfg_ret));
+    }
+
     // Start DHCP server
     ret = esp_netif_dhcps_start(ap_netif);
     if (ret != ESP_OK) {
