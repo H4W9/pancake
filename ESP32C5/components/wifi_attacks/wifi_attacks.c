@@ -599,10 +599,9 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
         ap_config.ap.authmode = WIFI_AUTH_OPEN;
     }
 
-    // Get or create AP netif (like ensure_ap_mode in original)
+    // Ensure the AP netif exists (created once, then persists for the session).
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (!ap_netif) {
-        // AP netif doesn't exist - need to stop WiFi, create it, and restart
         ESP_LOGI(TAG, "Creating AP netif...");
         esp_wifi_stop();
         ap_netif = esp_netif_create_default_wifi_ap();
@@ -612,24 +611,21 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
             apply_wifi_power_settings();
             return ESP_FAIL;
         }
-        esp_wifi_set_mode(WIFI_MODE_APSTA);
-        // Apply SSID BEFORE start so the beacon comes up with the right name.
-        esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-        esp_wifi_start();
-        apply_wifi_power_settings();
-        vTaskDelay(pdMS_TO_TICKS(500));
-    } else {
-        // AP netif exists - ensure we're in APSTA mode for raw frame transmission.
-        // Apply SSID before the mode switch (STA->APSTA starts the AP).
-        wifi_mode_t mode;
-        esp_wifi_get_mode(&mode);
-        esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-        if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
-            ESP_LOGI(TAG, "Switching WiFi to APSTA mode for Evil Twin");
-            esp_wifi_set_mode(WIFI_MODE_APSTA);
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
     }
+
+    // Bulletproof AP bring-up: STOP -> set mode+config -> START. On the ESP32-C5,
+    // esp_wifi_set_config() does not re-latch the beacon SSID on a running AP, so
+    // fully cycling the interface with the config in place forces the beacon to
+    // regenerate with the cloned SSID (otherwise it broadcasts "ESP_xxxxxx").
+    esp_wifi_stop();
+    esp_wifi_set_mode(WIFI_MODE_APSTA);
+    esp_err_t cfg_ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (cfg_ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_config(AP) failed: %s", esp_err_to_name(cfg_ret));
+    }
+    esp_wifi_start();
+    apply_wifi_power_settings();
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     // Stop DHCP server to configure custom IP
     esp_netif_dhcps_stop(ap_netif);
@@ -644,9 +640,6 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to set AP IP to 172.0.0.1: %s", esp_err_to_name(ret));
     }
-
-    // Final re-apply of AP config (idempotent; ensures the SSID sticks).
-    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
 
     // Register event handler for password verification (WIFI_EVENT_STA_CONNECTED/DISCONNECTED)
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &evil_twin_event_handler, NULL);
@@ -1880,10 +1873,9 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
     memcpy(ap_config.ap.ssid, portal_ssid, ssid_len);
     ap_config.ap.ssid_len = ssid_len;
 
-    // Get or create AP netif (like ensure_ap_mode in original)
+    // Ensure the AP netif exists (created once, then persists for the session).
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (!ap_netif) {
-        // AP netif doesn't exist - need to stop WiFi, create it, and restart
         ESP_LOGI(TAG, "Creating AP netif...");
         esp_wifi_stop();
         ap_netif = esp_netif_create_default_wifi_ap();
@@ -1893,25 +1885,22 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
             apply_wifi_power_settings();
             return ESP_FAIL;
         }
-        esp_wifi_set_mode(WIFI_MODE_APSTA);
-        // Apply SSID BEFORE start so the beacon comes up with the right name.
-        esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-        esp_wifi_start();
-        apply_wifi_power_settings();
-        vTaskDelay(pdMS_TO_TICKS(500));
-    } else {
-        // AP netif exists - ensure we're in APSTA mode. Apply the SSID BEFORE the
-        // mode switch: switching STA->APSTA starts the AP, which latches whatever
-        // config is current at that moment.
-        wifi_mode_t mode;
-        esp_wifi_get_mode(&mode);
-        esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-        if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
-            ESP_LOGI(TAG, "Switching WiFi to APSTA mode for Portal");
-            esp_wifi_set_mode(WIFI_MODE_APSTA);
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
     }
+
+    // Bulletproof AP bring-up: STOP -> set mode+config -> START. On the ESP32-C5,
+    // esp_wifi_set_config() does NOT re-latch the beacon SSID on an already-running
+    // AP (nor reliably when set only before the very first start), so the AP keeps
+    // broadcasting the IDF default "ESP_xxxxxx". Fully cycling the interface with
+    // the config in place forces the beacon to regenerate with our SSID every time.
+    esp_wifi_stop();
+    esp_wifi_set_mode(WIFI_MODE_APSTA);
+    esp_err_t cfg_ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (cfg_ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_config(AP) failed: %s", esp_err_to_name(cfg_ret));
+    }
+    esp_wifi_start();
+    apply_wifi_power_settings();
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     // Stop DHCP server to configure custom IP
     esp_netif_dhcps_stop(ap_netif);
@@ -1926,9 +1915,6 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to set AP IP to 172.0.0.1: %s", esp_err_to_name(ret));
     }
-
-    // Final re-apply of AP config (idempotent; ensures the SSID sticks).
-    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
     
     // Start DHCP server
     ret = esp_netif_dhcps_start(ap_netif);
