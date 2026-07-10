@@ -561,7 +561,44 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
     // Reset password verification flag
     last_password_wrong = false;
     connectAttemptCount = 0;
-    
+
+    // Build the AP config up front so it can be applied BEFORE esp_wifi_start().
+    // The ESP32-C5 driver latches the beacon SSID at AP start; configuring after
+    // start leaves it broadcasting the IDF default "ESP_xxxxxx".
+    // (Zero Width Space appended below to prevent iPhone SSID grouping.)
+    wifi_config_t ap_config = {
+                .ap = {
+                    .ssid = "",
+                    .ssid_len = 0,
+                    .channel = 1,
+                    .password = "",
+                    .max_connection = 4,
+                    .authmode = WIFI_AUTH_OPEN
+                }
+    };
+    size_t ssid_len = strlen(evilTwinSSID);
+
+    // Add Zero Width Space (UTF-8: 0xE2 0x80 0x8B) to prevent iPhone grouping
+    if (ssid_len + 3 <= sizeof(ap_config.ap.ssid)) {
+        memcpy(ap_config.ap.ssid, evilTwinSSID, ssid_len);
+        ap_config.ap.ssid[ssid_len] = 0xE2;
+        ap_config.ap.ssid[ssid_len + 1] = 0x80;
+        ap_config.ap.ssid[ssid_len + 2] = 0x8B;
+        ap_config.ap.ssid_len = ssid_len + 3;
+    } else {
+        // SSID too long, just copy without Zero Width Space
+        if (ssid_len > sizeof(ap_config.ap.ssid)) ssid_len = sizeof(ap_config.ap.ssid);
+        memcpy(ap_config.ap.ssid, evilTwinSSID, ssid_len);
+        ap_config.ap.ssid_len = ssid_len;
+    }
+
+    if (strlen(evilTwinPassword) > 0) {
+        strcpy((char *)ap_config.ap.password, evilTwinPassword);
+        ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    } else {
+        ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
     // Get or create AP netif (like ensure_ap_mode in original)
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (!ap_netif) {
@@ -576,70 +613,41 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
             return ESP_FAIL;
         }
         esp_wifi_set_mode(WIFI_MODE_APSTA);
+        // Apply SSID BEFORE start so the beacon comes up with the right name.
+        esp_wifi_set_config(WIFI_IF_AP, &ap_config);
         esp_wifi_start();
         apply_wifi_power_settings();
         vTaskDelay(pdMS_TO_TICKS(500));
     } else {
-        // AP netif exists - ensure we're in APSTA mode for raw frame transmission
+        // AP netif exists - ensure we're in APSTA mode for raw frame transmission.
+        // Apply SSID before the mode switch (STA->APSTA starts the AP).
         wifi_mode_t mode;
         esp_wifi_get_mode(&mode);
+        esp_wifi_set_config(WIFI_IF_AP, &ap_config);
         if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
             ESP_LOGI(TAG, "Switching WiFi to APSTA mode for Evil Twin");
             esp_wifi_set_mode(WIFI_MODE_APSTA);
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
-    
+
     // Stop DHCP server to configure custom IP
     esp_netif_dhcps_stop(ap_netif);
-    
+
     // Set static IP 172.0.0.1 for AP
     esp_netif_ip_info_t ip_info;
     ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
     ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
     ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
-    
+
     esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to set AP IP to 172.0.0.1: %s", esp_err_to_name(ret));
     }
-    
-    // Configure AP with Evil Twin SSID (with Zero Width Space)
-    wifi_config_t ap_config = {
-                .ap = {
-                    .ssid = "",
-                    .ssid_len = 0,
-                    .channel = 1,
-                    .password = "",
-                    .max_connection = 4,
-                    .authmode = WIFI_AUTH_OPEN
-                }
-    };
-    size_t ssid_len = strlen(evilTwinSSID);
-    
-    // Add Zero Width Space (UTF-8: 0xE2 0x80 0x8B) to prevent iPhone grouping
-    if (ssid_len + 3 <= sizeof(ap_config.ap.ssid)) {
-        memcpy(ap_config.ap.ssid, evilTwinSSID, ssid_len);
-        ap_config.ap.ssid[ssid_len] = 0xE2;
-        ap_config.ap.ssid[ssid_len + 1] = 0x80;
-        ap_config.ap.ssid[ssid_len + 2] = 0x8B;
-        ap_config.ap.ssid_len = ssid_len + 3;
-    } else {
-        // SSID too long, just copy without Zero Width Space
-        strncpy((char *)ap_config.ap.ssid, evilTwinSSID, sizeof(ap_config.ap.ssid));
-        ap_config.ap.ssid_len = ssid_len;
-    }
-    
-    if (strlen(evilTwinPassword) > 0) {
-        strcpy((char *)ap_config.ap.password, evilTwinPassword);
-        ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
-    } else {
-        ap_config.ap.authmode = WIFI_AUTH_OPEN;
-    }
 
-    // Set AP config (mode is already APSTA from netif creation or init)
+    // Final re-apply of AP config (idempotent; ensures the SSID sticks).
     esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-    
+
     // Register event handler for password verification (WIFI_EVENT_STA_CONNECTED/DISCONNECTED)
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &evil_twin_event_handler, NULL);
     
@@ -1852,7 +1860,26 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
     
     // Enable Karma mode - no WiFi connection verification attempts
     karma_mode = true;
-    
+
+    // Build the AP config up front so it can be applied BEFORE esp_wifi_start().
+    // The ESP32-C5 driver latches the beacon SSID when the AP starts; setting
+    // the config after start leaves it broadcasting the IDF default "ESP_xxxxxx"
+    // instead of the portal SSID. (no Zero Width Space - this is not Evil Twin)
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "",
+            .ssid_len = 0,
+            .channel = 1,
+            .password = "",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_OPEN
+        }
+    };
+    size_t ssid_len = strlen(portal_ssid);
+    if (ssid_len > sizeof(ap_config.ap.ssid)) ssid_len = sizeof(ap_config.ap.ssid);
+    memcpy(ap_config.ap.ssid, portal_ssid, ssid_len);
+    ap_config.ap.ssid_len = ssid_len;
+
     // Get or create AP netif (like ensure_ap_mode in original)
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (!ap_netif) {
@@ -1867,50 +1894,40 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
             return ESP_FAIL;
         }
         esp_wifi_set_mode(WIFI_MODE_APSTA);
+        // Apply SSID BEFORE start so the beacon comes up with the right name.
+        esp_wifi_set_config(WIFI_IF_AP, &ap_config);
         esp_wifi_start();
         apply_wifi_power_settings();
         vTaskDelay(pdMS_TO_TICKS(500));
     } else {
-        // AP netif exists - ensure we're in APSTA mode
+        // AP netif exists - ensure we're in APSTA mode. Apply the SSID BEFORE the
+        // mode switch: switching STA->APSTA starts the AP, which latches whatever
+        // config is current at that moment.
         wifi_mode_t mode;
         esp_wifi_get_mode(&mode);
+        esp_wifi_set_config(WIFI_IF_AP, &ap_config);
         if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
             ESP_LOGI(TAG, "Switching WiFi to APSTA mode for Portal");
             esp_wifi_set_mode(WIFI_MODE_APSTA);
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
-    
+
     // Stop DHCP server to configure custom IP
     esp_netif_dhcps_stop(ap_netif);
-    
+
     // Set static IP 172.0.0.1 for AP
     esp_netif_ip_info_t ip_info;
     ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
     ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
     ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
-    
+
     esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to set AP IP to 172.0.0.1: %s", esp_err_to_name(ret));
     }
-    
-    // Configure AP with portal SSID (no Zero Width Space - this is not Evil Twin)
-    wifi_config_t ap_config = {
-        .ap = {
-            .ssid = "",
-            .ssid_len = 0,
-            .channel = 1,
-            .password = "",
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN
-        }
-    };
-    size_t ssid_len = strlen(portal_ssid);
-    memcpy(ap_config.ap.ssid, portal_ssid, ssid_len);
-    ap_config.ap.ssid_len = ssid_len;
-    
-    // Set AP config (mode is already APSTA from ensure or from Evil Twin's init)
+
+    // Final re-apply of AP config (idempotent; ensures the SSID sticks).
     esp_wifi_set_config(WIFI_IF_AP, &ap_config);
     
     // Start DHCP server
