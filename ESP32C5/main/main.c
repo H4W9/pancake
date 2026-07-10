@@ -156,9 +156,27 @@ static int bt_device_count = 0;
 #define SCREEN_BACKLIGHT_ACTIVE_PERCENT 80
 #define SCREEN_BACKLIGHT_DIM_PERCENT 0
 
+// Native panel scan dimensions (landscape). These are the PHYSICAL panel size
+// used for draw-buffer allocation and the boot black-fill. They never change.
 #define LCD_H_RES 480
 #define LCD_V_RES 320
 #define LCD_HOST SPI2_HOST
+
+// ============================================================================
+// Screen orientation (0 / 90 / 180 / 270 degrees)
+// ----------------------------------------------------------------------------
+// 0 and 180 are landscape (480x320); 90 and 270 are portrait (320x480).
+// g_disp_w / g_disp_h are the LOGICAL dimensions LVGL lays out in for the
+// current orientation. All UI layout should use disp_w()/disp_h(), NOT the
+// LCD_H_RES/LCD_V_RES macros (those stay pinned to the native panel size).
+// Defaults to 0deg / 480x320 so behaviour is identical to before until changed.
+// ============================================================================
+static int g_screen_orient = 0;           // 0, 90, 180, 270
+static int g_disp_w = LCD_H_RES;           // logical width  (480 land / 320 port)
+static int g_disp_h = LCD_V_RES;           // logical height (320 land / 480 port)
+static inline int disp_w(void) { return g_disp_w; }
+static inline int disp_h(void) { return g_disp_h; }
+static inline bool orient_is_portrait(void) { return g_screen_orient == 90 || g_screen_orient == 270; }
 
 // MAX17048 fuel gauge configuration — I2C_NUM_0, SDA=9, SCL=10 (shared with FT6336U touch)
 #define MAX17048_ADDR              0x36
@@ -292,6 +310,7 @@ static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel 
 #define NVS_KEY_SCAN_MAX    "scan_max"
 #define NVS_KEY_DARK_MODE   "dark_mode"
 #define NVS_KEY_MAX_POWER   "max_power"
+#define NVS_KEY_ORIENT      "scr_orient"
 
 // ============================================================================
 // Theme-aware style helpers
@@ -341,6 +360,9 @@ static void style_neutral_button(lv_obj_t *btn) {
 
 static esp_lcd_panel_handle_t panel_handle;
 static esp_lcd_panel_io_handle_t lcd_io_handle;
+static lv_disp_drv_t *g_disp_drv = NULL;   // set once LVGL disp is registered
+static lv_disp_t     *g_disp = NULL;
+static void apply_display_orientation(int orient);
 static ft6336_handle_t touch_handle;
 static lv_obj_t *touch_dot;  // DEBUG: visual touch indicator
 static lv_obj_t *title_bar;
@@ -2046,8 +2068,9 @@ static void init_display(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
+    // Apply the saved orientation's swap_xy/mirror. LVGL disp + overlay aren't up
+    // yet (NULL-guarded inside), so this only programs the panel + logical dims.
+    apply_display_orientation(g_screen_orient);
 
     vTaskDelay(pdMS_TO_TICKS(50));
 }
@@ -2088,6 +2111,19 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_MAX_POWER, &mp) == ESP_OK) {
             g_max_power_mode = (mp != 0);
         }
+        int32_t orient = 0;
+        if (nvs_get_i32(h, NVS_KEY_ORIENT, &orient) == ESP_OK &&
+            (orient == 0 || orient == 90 || orient == 180 || orient == 270)) {
+            g_screen_orient = (int)orient;
+        } else {
+            g_screen_orient = 0;
+        }
+        // Sync logical dimensions to the loaded orientation.
+        if (g_screen_orient == 90 || g_screen_orient == 270) {
+            g_disp_w = LCD_V_RES; g_disp_h = LCD_H_RES;
+        } else {
+            g_disp_w = LCD_H_RES; g_disp_h = LCD_V_RES;
+        }
         nvs_close(h);
         ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d",
                  (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms,
@@ -2109,7 +2145,7 @@ static void nvs_settings_load(void)
 // enqueue the change; nvs_writer_task (below, created with an INTERNAL-RAM stack)
 // performs the actual commit in a safe context.
 typedef struct {
-    uint8_t kind;   // 0=timeout 1=brightness 2=scan_time 3=dark_mode 4=max_power
+    uint8_t kind;   // 0=timeout 1=brightness 2=scan_time 3=dark_mode 4=max_power 5=orient
     int32_t a;
     int32_t b;
 } nvs_save_req_t;
@@ -2135,6 +2171,7 @@ static void nvs_writer_task(void *arg)
                     nvs_set_u16(h, NVS_KEY_SCAN_MAX, (uint16_t)req.b); break;
             case 3: nvs_set_u8(h, NVS_KEY_DARK_MODE, req.a ? 1 : 0); break;
             case 4: nvs_set_u8(h, NVS_KEY_MAX_POWER, req.a ? 1 : 0); break;
+            case 5: nvs_set_i32(h, NVS_KEY_ORIENT, req.a); break;
             default: nvs_close(h); continue;
         }
         nvs_commit(h);
@@ -2156,6 +2193,7 @@ static void nvs_settings_save_brightness(uint8_t pct)                 { nvs_save
 static void nvs_settings_save_scan_time(uint16_t min_ms, uint16_t max_ms) { nvs_save_enqueue(2, min_ms, max_ms); }
 static void nvs_settings_save_dark_mode(bool enabled)                 { nvs_save_enqueue(3, enabled ? 1 : 0, 0); }
 static void nvs_settings_save_max_power(bool enabled)                 { nvs_save_enqueue(4, enabled ? 1 : 0, 0); }
+static void nvs_settings_save_orient(int32_t orient)                  { nvs_save_enqueue(5, orient, 0); }
 
 // ============================================================================
 // Backlight / Brightness / Screen Dimming
@@ -2546,6 +2584,9 @@ static void init_i2c(void)
 
 static void init_touch(void)
 {
+    // Init the touch controller in the NATIVE 0deg frame (480x320). Orientation
+    // is handled by touch_apply_orientation(), which assumes raw coords are always
+    // in this native frame — so this must NOT use disp_w()/disp_h().
     esp_err_t ret = ft6336_init(&touch_handle, I2C_NUM_0, CTP_INT, CTP_RST,
                                 LCD_H_RES, LCD_V_RES);
     if (ret != ESP_OK) {
@@ -2941,7 +2982,7 @@ static void show_sd_loading_popup(const char *text) {
     }
     
     sd_loading_popup = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(sd_loading_popup, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_size(sd_loading_popup, disp_w(), disp_h());
     lv_obj_set_pos(sd_loading_popup, 0, 0);
     style_modal_overlay(sd_loading_popup, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30);
 
@@ -3396,25 +3437,28 @@ void app_main(void)
     lv_disp_draw_buf_init(&draw_buf, buf1, buf2, LCD_H_RES * 15);
     static lv_disp_drv_t disp_drv;
     lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res = LCD_H_RES;
-    disp_drv.ver_res = LCD_V_RES;
+    disp_drv.hor_res = disp_w();   // respects the NVS-loaded orientation
+    disp_drv.ver_res = disp_h();
     disp_drv.flush_cb = lvgl_flush_cb;
     disp_drv.draw_buf = &draw_buf;
     disp_drv.user_data = panel_handle;
-    lv_disp_drv_register(&disp_drv);
+    g_disp = lv_disp_drv_register(&disp_drv);
+    g_disp_drv = &disp_drv;
 
     const esp_lcd_panel_io_callbacks_t cbs = {
         .on_color_trans_done = on_color_trans_done,
     };
     ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(lcd_io_handle, &cbs, &disp_drv));
 
+    // Clear the panel in its CURRENT scan orientation (disp_w x disp_h). buf1 is
+    // sized for the native width so a disp_w-wide row always fits.
     uint16_t black = 0x0000;
-    for (int i = 0; i < LCD_H_RES * 30; i++) {
+    for (int i = 0; i < disp_w() * 30; i++) {
         ((uint16_t*)buf1)[i] = black;
     }
-    for (int y = 0; y < LCD_V_RES; y += 30) {
-        int lines = (y + 30 <= LCD_V_RES) ? 30 : (LCD_V_RES - y);
-        esp_lcd_panel_draw_bitmap(panel_handle, 0, y, LCD_H_RES, y + lines, buf1);
+    for (int y = 0; y < disp_h(); y += 30) {
+        int lines = (y + 30 <= disp_h()) ? 30 : (disp_h() - y);
+        esp_lcd_panel_draw_bitmap(panel_handle, 0, y, disp_w(), y + lines, buf1);
     }
     
     lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);
@@ -3443,7 +3487,7 @@ void app_main(void)
     // Create software brightness overlay on lv_layer_top()
     // This sits above all content but does NOT intercept touch events
     brightness_overlay = lv_obj_create(lv_layer_top());
-    lv_obj_set_size(brightness_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_size(brightness_overlay, disp_w(), disp_h());
     lv_obj_set_pos(brightness_overlay, 0, 0);
     lv_obj_set_style_bg_color(brightness_overlay, lv_color_black(), 0);
     lv_obj_set_style_border_width(brightness_overlay, 0, 0);
@@ -4198,7 +4242,7 @@ static void display_refresh_task(void *pvParameters)
                     vTaskDelay(pdMS_TO_TICKS(1));
                     continue;
                 }
-                lv_obj_set_size(scan_list, lv_pct(100), LCD_V_RES - 30);
+                lv_obj_set_size(scan_list, lv_pct(100), disp_h() - 30);
                 lv_obj_align(scan_list, LV_ALIGN_BOTTOM_MID, 0, 0);
                 lv_obj_set_style_bg_color(scan_list, ui_bg_color(), 0);
                 lv_obj_set_style_text_color(scan_list, ui_text_color(), 0);
@@ -4284,7 +4328,7 @@ static void display_refresh_task(void *pvParameters)
                 }
                 
                 // Resize scan_list to leave space for Next button
-                lv_obj_set_size(scan_list, lv_pct(100), LCD_V_RES - 30 - 50);
+                lv_obj_set_size(scan_list, lv_pct(100), disp_h() - 30 - 50);
                 lv_obj_align(scan_list, LV_ALIGN_TOP_MID, 0, 30);
                 
                 // Add "Next" button at the bottom - Material Blue
@@ -5002,6 +5046,81 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
     }
 }
 
+// ============================================================================
+// Screen orientation apply
+// ----------------------------------------------------------------------------
+// Programs the panel's swap_xy/mirror for the requested orientation, updates the
+// logical dimensions (g_disp_w/g_disp_h), and — once LVGL is up — pushes the new
+// resolution to the display driver and resizes the brightness overlay.
+//
+// The swap_xy/mirror combinations below follow the standard "each 90deg toggles
+// swap_xy and flips one mirror axis" rule, anchored on the known-good 0deg config
+// (swap_xy=true, mirror=true,true). If a given orientation comes out flipped or
+// rotated the wrong way on real hardware, adjust that single case's booleans.
+// ============================================================================
+static void apply_display_orientation(int orient)
+{
+    bool sx, mx, my;
+    switch (orient) {
+        case 90:  sx = false; mx = true;  my = false; break;  // portrait
+        case 180: sx = true;  mx = false; my = false; break;  // landscape flipped
+        case 270: sx = false; mx = false; my = true;  break;  // portrait flipped
+        case 0:
+        default:  sx = true;  mx = true;  my = true;  orient = 0; break;  // landscape (native)
+    }
+    g_screen_orient = orient;
+
+    if (panel_handle) {
+        esp_lcd_panel_swap_xy(panel_handle, sx);
+        esp_lcd_panel_mirror(panel_handle, mx, my);
+    }
+
+    if (orient == 90 || orient == 270) {
+        g_disp_w = LCD_V_RES; g_disp_h = LCD_H_RES;   // portrait 320x480
+    } else {
+        g_disp_w = LCD_H_RES; g_disp_h = LCD_V_RES;   // landscape 480x320
+    }
+
+    if (g_disp_drv && g_disp) {
+        g_disp_drv->hor_res = g_disp_w;
+        g_disp_drv->ver_res = g_disp_h;
+        lv_disp_drv_update(g_disp, g_disp_drv);
+    }
+    if (brightness_overlay) {
+        lv_obj_set_size(brightness_overlay, g_disp_w, g_disp_h);
+        lv_obj_set_pos(brightness_overlay, 0, 0);
+    }
+}
+
+// Map a raw FT6336 touch point (reported in the fixed 0deg glass frame, i.e.
+// x in [0,LCD_H_RES), y in [0,LCD_V_RES)) into the current orientation's logical
+// coordinate space. Identity at 0deg. If touch feels rotated the wrong way on
+// hardware, swap the 90 and 270 cases (CW vs CCW panel wiring).
+static void touch_apply_orientation(uint16_t rx, uint16_t ry, int32_t *lx, int32_t *ly)
+{
+    const int W0 = LCD_H_RES;   // native 0deg logical width  (480)
+    const int H0 = LCD_V_RES;   // native 0deg logical height (320)
+    switch (g_screen_orient) {
+        case 90:
+            *lx = ry;
+            *ly = (W0 - 1) - rx;
+            break;
+        case 180:
+            *lx = (W0 - 1) - rx;
+            *ly = (H0 - 1) - ry;
+            break;
+        case 270:
+            *lx = (H0 - 1) - ry;
+            *ly = rx;
+            break;
+        case 0:
+        default:
+            *lx = rx;
+            *ly = ry;
+            break;
+    }
+}
+
 void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
 {
     static int call_count = 0;
@@ -5045,12 +5164,14 @@ void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
     }
 
     if (touched) {
-        data->point.x = point.x;
-        data->point.y = point.y;
+        int32_t lx, ly;
+        touch_apply_orientation(point.x, point.y, &lx, &ly);
+        data->point.x = lx;
+        data->point.y = ly;
         data->state = LV_INDEV_STATE_PRESSED;
         touch_pressed_flag = true;
-        touch_x_flag = point.x;
-        touch_y_flag = point.y;
+        touch_x_flag = (uint16_t)lx;
+        touch_y_flag = (uint16_t)ly;
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
         touch_pressed_flag = false;
@@ -5432,7 +5553,7 @@ static void blackout_yes_btn_cb(lv_event_t *e)
     
     // Content container
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);
+    lv_obj_set_size(content, lv_pct(100), disp_h() - 30 - 70);
     lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 35);
     lv_obj_set_style_bg_color(content, ui_bg_color(), 0);
     lv_obj_set_style_border_width(content, 0, 0);
@@ -5527,7 +5648,7 @@ static void snifferdog_yes_btn_cb(lv_event_t *e)
     
     // Create compact status panel
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);
+    lv_obj_set_size(content, lv_pct(100), disp_h() - 30 - 70);
     lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 35);
     lv_obj_set_style_bg_color(content, ui_bg_color(), 0);
     lv_obj_set_style_border_width(content, 0, 0);
@@ -6128,7 +6249,7 @@ static void sniffer_ap_click_cb(lv_event_t *e) {
     sniffer_observe_ap_index = ap_index;
     
     function_page = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(function_page, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_size(function_page, disp_w(), disp_h());
     lv_obj_set_style_bg_color(function_page, ui_bg_color(), 0);
     lv_obj_set_style_border_width(function_page, 0, 0);
     lv_obj_set_style_radius(function_page, 0, 0);
@@ -6173,7 +6294,7 @@ static void sniffer_ap_click_cb(lv_event_t *e) {
     
     // Client list (stored in static for refresh)
     sniffer_observe_client_list = lv_list_create(function_page);
-    lv_obj_set_size(sniffer_observe_client_list, lv_pct(100), LCD_V_RES - 35 - 50);
+    lv_obj_set_size(sniffer_observe_client_list, lv_pct(100), disp_h() - 35 - 50);
     lv_obj_align(sniffer_observe_client_list, LV_ALIGN_TOP_MID, 0, 35);
     lv_obj_set_style_bg_color(sniffer_observe_client_list, ui_bg_color(), 0);
     lv_obj_set_style_bg_opa(sniffer_observe_client_list, LV_OPA_COVER, 0);
@@ -6303,7 +6424,7 @@ static void show_targeted_deauth_screen(void) {
     
     // Content area
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);
+    lv_obj_set_size(content, lv_pct(100), disp_h() - 30 - 70);
     lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(content, 0, 0);
@@ -6472,7 +6593,7 @@ static void sniffer_karma_btn_cb(lv_event_t *e)
     } else {
         // Show popup - no probes available
         lv_obj_t *overlay = lv_obj_create(lv_scr_act());
-        lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
+        lv_obj_set_size(overlay, disp_w(), disp_h());
         lv_obj_set_pos(overlay, 0, 0);
         lv_obj_set_style_bg_color(overlay, ui_bg_color(), 0);
         lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
@@ -6528,7 +6649,7 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     }
     
     function_page = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(function_page, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_size(function_page, disp_w(), disp_h());
     lv_obj_set_style_bg_color(function_page, ui_bg_color(), 0);
     lv_obj_set_style_border_width(function_page, 0, 0);
     lv_obj_set_style_radius(function_page, 0, 0);
@@ -6576,7 +6697,7 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     
     // Scrollable list for networks with clients
     sniffer_ap_list = lv_list_create(function_page);
-    lv_obj_set_size(sniffer_ap_list, lv_pct(100), LCD_V_RES - 30 - 50);  // Leave space for title and buttons
+    lv_obj_set_size(sniffer_ap_list, lv_pct(100), disp_h() - 30 - 50);  // Leave space for title and buttons
     lv_obj_align(sniffer_ap_list, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_color(sniffer_ap_list, ui_bg_color(), 0);
     lv_obj_set_style_bg_opa(sniffer_ap_list, LV_OPA_COVER, 0);
@@ -8734,7 +8855,7 @@ static void wardrive_start_btn_cb(lv_event_t *e)
 
     // ─── Recent networks table (main area) ───────────────────────
     wd_ui_table = lv_table_create(function_page);
-    lv_obj_set_size(wd_ui_table, 464, LCD_V_RES - 80 - 56);
+    lv_obj_set_size(wd_ui_table, disp_w() - 16, disp_h() - 80 - 56);
     lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 82);
     lv_obj_set_style_bg_color(wd_ui_table, lv_color_make(15, 15, 15), 0);
     lv_obj_set_style_border_color(wd_ui_table, lv_color_make(50, 50, 50), 0);
@@ -8884,7 +9005,7 @@ static void show_karma_page(void)
     wifi_attacks_refresh_sd_html_list();
 
     karma_content = lv_obj_create(function_page);
-    lv_obj_set_size(karma_content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(karma_content, lv_pct(100), disp_h() - 30);
     lv_obj_align(karma_content, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(karma_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(karma_content, 0, 0);
@@ -9177,7 +9298,7 @@ static void karma_start_btn_cb(lv_event_t *e)
 
     // Content container below title bar (leave space for button at bottom)
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);  // Leave 70px for button
+    lv_obj_set_size(content, lv_pct(100), disp_h() - 30 - 70);  // Leave 70px for button
     lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);  // Start below title bar
     lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(content, 0, 0);
@@ -9336,7 +9457,7 @@ static void show_portal_page(void)
     wifi_attacks_refresh_sd_html_list();
 
     portal_content = lv_obj_create(function_page);
-    lv_obj_set_size(portal_content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(portal_content, lv_pct(100), disp_h() - 30);
     lv_obj_align(portal_content, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(portal_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(portal_content, 0, 0);
@@ -9539,7 +9660,7 @@ static void portal_start_btn_cb(lv_event_t *e)
 
     // Content container below title bar (leave space for button at bottom)
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);  // Leave 70px for button
+    lv_obj_set_size(content, lv_pct(100), disp_h() - 30 - 70);  // Leave 70px for button
     lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);  // Start below title bar
     lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(content, 0, 0);
@@ -10200,7 +10321,7 @@ static void attack_tile_event_cb(lv_event_t *e)
         if (selected_count != 1) {
             // Show popup: "Select only one network"
             lv_obj_t *overlay = lv_obj_create(lv_scr_act());
-            lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
+            lv_obj_set_size(overlay, disp_w(), disp_h());
             lv_obj_set_pos(overlay, 0, 0);
             lv_obj_set_style_bg_color(overlay, ui_bg_color(), 0);
             lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
@@ -10268,7 +10389,7 @@ static void show_main_tiles(void)
     reset_function_page_children();
     
     tiles_container = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(tiles_container, lv_pct(100), 290);
+    lv_obj_set_size(tiles_container, lv_pct(100), disp_h() - 30);  // fill below the 30px title bar
     lv_obj_align(tiles_container, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles_container, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles_container, 0, 0);
@@ -10472,7 +10593,7 @@ static void sta_connect_check_timer_cb(lv_timer_t *timer)
         
         // Show failure popup
         lv_obj_t *overlay = lv_obj_create(lv_scr_act());
-        lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
+        lv_obj_set_size(overlay, disp_w(), disp_h());
         lv_obj_set_pos(overlay, 0, 0);
         lv_obj_set_style_bg_color(overlay, ui_bg_color(), 0);
         lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
@@ -10707,7 +10828,7 @@ static void show_wifi_connect_screen(void)
     
     // Content panel (opaque dark bg, same technique as Snifferdog)
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);
+    lv_obj_set_size(content, lv_pct(100), disp_h() - 30 - 70);
     lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_color(content, ui_bg_color(), 0);
     lv_obj_set_style_border_width(content, 0, 0);
@@ -11081,7 +11202,7 @@ static void arp_host_click_cb(lv_event_t *e)
     
     // Show popup overlay with attack status and Stop button
     arp_poison_overlay = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(arp_poison_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_size(arp_poison_overlay, disp_w(), disp_h());
     lv_obj_set_pos(arp_poison_overlay, 0, 0);
     lv_obj_set_style_bg_color(arp_poison_overlay, ui_bg_color(), 0);
     lv_obj_set_style_bg_opa(arp_poison_overlay, LV_OPA_80, 0);
@@ -11155,7 +11276,7 @@ static void arp_poison_show_host_table(void)
     create_function_page_base("ARP Poison");
     
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(content, lv_pct(100), disp_h() - 30);
     lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(content, ui_bg_color(), 0);
     lv_obj_set_style_border_width(content, 0, 0);
@@ -11254,7 +11375,7 @@ static void show_arp_poison_page(void)
     
     // Show scanning overlay
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(content, lv_pct(100), disp_h() - 30);
     lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(content, ui_bg_color(), 0);
     lv_obj_set_style_border_width(content, 0, 0);
@@ -11768,7 +11889,7 @@ static void mitm_show_active_screen(void)
     create_function_page_base("MITM Capture");
 
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(content, lv_pct(100), disp_h() - 30);
     lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(content, ui_bg_color(), 0);
     lv_obj_set_style_border_width(content, 0, 0);
@@ -11943,7 +12064,7 @@ static void mitm_show_results_screen(void)
     create_function_page_base("MITM Results");
 
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(content, lv_pct(100), disp_h() - 30);
     lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(content, ui_bg_color(), 0);
     lv_obj_set_style_border_width(content, 0, 0);
@@ -12074,7 +12195,7 @@ static void show_mitm_page(void)
     create_function_page_base("MITM");
 
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(content, lv_pct(100), disp_h() - 30);
     lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(content, ui_bg_color(), 0);
     lv_obj_set_style_border_width(content, 0, 0);
@@ -12133,7 +12254,7 @@ static void rogue_ap_start_btn_cb(lv_event_t *e)
     create_function_page_base("Rogue AP Active");
     
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(content, lv_pct(100), disp_h() - 30);
     lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(content, ui_bg_color(), 0);
     lv_obj_set_style_border_width(content, 0, 0);
@@ -12205,7 +12326,7 @@ static void show_rogue_ap_page(void)
     wifi_attacks_refresh_sd_html_list();
     
     rogue_ap_content = lv_obj_create(function_page);
-    lv_obj_set_size(rogue_ap_content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(rogue_ap_content, lv_pct(100), disp_h() - 30);
     lv_obj_align(rogue_ap_content, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(rogue_ap_content, ui_bg_color(), 0);
     lv_obj_set_style_border_width(rogue_ap_content, 0, 0);
@@ -12764,7 +12885,7 @@ static void show_wpa_sec_upload_page(void)
 
     // Status list (terminal-style: black bg, cyan border)
     wpasec_status_list = lv_list_create(function_page);
-    lv_obj_set_size(wpasec_status_list, lv_pct(96), LCD_V_RES - 30 - 100);
+    lv_obj_set_size(wpasec_status_list, lv_pct(96), disp_h() - 30 - 100);
     lv_obj_align(wpasec_status_list, LV_ALIGN_TOP_MID, 0, 92);
     lv_obj_set_style_bg_color(wpasec_status_list, ui_bg_color(), 0);
     lv_obj_set_style_border_color(wpasec_status_list, lv_color_make(0, 188, 212), 0);
@@ -12851,7 +12972,7 @@ static void show_attack_tiles_screen(void)
     
     // Selected networks list
     lv_obj_t *network_list = lv_obj_create(function_page);
-    lv_obj_set_size(network_list, lv_pct(100), LCD_V_RES - 30 - 130 - 40);  // Remaining height
+    lv_obj_set_size(network_list, lv_pct(100), disp_h() - 30 - 130 - 40);  // Remaining height
     lv_obj_align(network_list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(network_list, ui_bg_color(), 0);
     lv_obj_set_style_border_width(network_list, 0, 0);
@@ -12902,7 +13023,7 @@ static void show_global_attacks_screen(void)
     create_function_page_base("Global WiFi Attacks");
     
     lv_obj_t *tiles = lv_obj_create(function_page);
-    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(tiles, lv_pct(100), disp_h() - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
@@ -12938,7 +13059,7 @@ static void show_sniff_karma_screen(void)
     create_function_page_base("WiFi Sniff & Karma");
     
     lv_obj_t *tiles = lv_obj_create(function_page);
-    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(tiles, lv_pct(100), disp_h() - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
@@ -12986,7 +13107,7 @@ static void show_eviltwin_passwords_screen(void)
     
     // Scrollable list container
     lv_obj_t *list = lv_obj_create(function_page);
-    lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(list, lv_pct(100), disp_h() - 30);
     lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(list, ui_bg_color(), 0);
     lv_obj_set_style_border_width(list, 0, 0);
@@ -13060,7 +13181,7 @@ static void show_portal_data_screen(void)
     
     // Scrollable list container
     lv_obj_t *list = lv_obj_create(function_page);
-    lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(list, lv_pct(100), disp_h() - 30);
     lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(list, ui_bg_color(), 0);
     lv_obj_set_style_border_width(list, 0, 0);
@@ -13111,7 +13232,7 @@ static void show_handshakes_list_screen(void)
     
     // Scrollable list container
     lv_obj_t *list = lv_obj_create(function_page);
-    lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(list, lv_pct(100), disp_h() - 30);
     lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(list, ui_bg_color(), 0);
     lv_obj_set_style_border_width(list, 0, 0);
@@ -13328,7 +13449,7 @@ static void show_scan_time_popup(void)
 
     // Modal overlay
     scantime_popup = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(scantime_popup, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_size(scantime_popup, disp_w(), disp_h());
     lv_obj_set_pos(scantime_popup, 0, 0);
     lv_obj_set_style_bg_color(scantime_popup, ui_bg_color(), 0);
     lv_obj_set_style_bg_opa(scantime_popup, LV_OPA_70, 0);
@@ -13504,7 +13625,7 @@ static void show_screen_timeout_popup(void)
 
     // Modal overlay
     timeout_popup = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(timeout_popup, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_size(timeout_popup, disp_w(), disp_h());
     lv_obj_set_pos(timeout_popup, 0, 0);
     lv_obj_set_style_bg_color(timeout_popup, ui_bg_color(), 0);
     lv_obj_set_style_bg_opa(timeout_popup, LV_OPA_70, 0);
@@ -13642,7 +13763,7 @@ static void show_screen_brightness_popup(void)
 
     // Modal overlay
     brightness_popup = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(brightness_popup, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_size(brightness_popup, disp_w(), disp_h());
     lv_obj_set_pos(brightness_popup, 0, 0);
     lv_obj_set_style_bg_color(brightness_popup, ui_bg_color(), 0);
     lv_obj_set_style_bg_opa(brightness_popup, LV_OPA_70, 0);
@@ -13752,6 +13873,18 @@ static void settings_tile_event_cb(lv_event_t *e)
             apply_wifi_power_settings();
         }
         show_settings_screen();   // re-render so the tile reflects the new state
+    } else if (strcmp(tile_name, "Orientation") == 0) {
+        // Cycle 0 -> 90 -> 180 -> 270 -> 0
+        int next;
+        switch (g_screen_orient) {
+            case 0:   next = 90;  break;
+            case 90:  next = 180; break;
+            case 180: next = 270; break;
+            default:  next = 0;   break;
+        }
+        apply_display_orientation(next);     // reprograms panel + LVGL resolution
+        nvs_settings_save_orient(next);
+        show_settings_screen();              // rebuild so layout re-runs at new dims
     }
 }
 
@@ -13761,7 +13894,7 @@ static void show_settings_screen(void)
     create_function_page_base("Settings");
     
     lv_obj_t *tiles = lv_obj_create(function_page);
-    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(tiles, lv_pct(100), disp_h() - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
@@ -13793,6 +13926,13 @@ static void show_settings_screen(void)
                 g_max_power_mode ? "Max Power\nON" : "Max Power\nOFF",
                 g_max_power_mode ? lv_color_make(0, 170, 60) : lv_color_make(120, 120, 120),
                 settings_tile_event_cb, "Max Power");
+
+    // Screen Orientation - Indigo. Cycles 0/90/180/270; label shows current value.
+    // (lv_label copies the string, so a local buffer is fine.)
+    char orient_lbl[24];
+    snprintf(orient_lbl, sizeof(orient_lbl), "Rotate\n%d deg", g_screen_orient);
+    create_tile(tiles, LV_SYMBOL_LOOP, orient_lbl, COLOR_MATERIAL_INDIGO,
+                settings_tile_event_cb, "Orientation");
 }
 
 // WiFi Monitor screen
@@ -13801,7 +13941,7 @@ static void show_wifi_monitor_screen(void)
     create_function_page_base("Compromised Data");
     
     lv_obj_t *tiles = lv_obj_create(function_page);
-    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(tiles, lv_pct(100), disp_h() - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
@@ -13826,7 +13966,7 @@ static void show_bluetooth_screen(void)
     create_function_page_base("Bluetooth");
     
     lv_obj_t *tiles = lv_obj_create(function_page);
-    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(tiles, lv_pct(100), disp_h() - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
@@ -13879,7 +14019,7 @@ static void show_bt_locator_screen(void)
     
     // Content container - positioned below title bar (30px)
     bt_locator_content = lv_obj_create(function_page);
-    lv_obj_set_size(bt_locator_content, lv_pct(100), LCD_V_RES - 30 - 50);  // Leave space for title and exit btn
+    lv_obj_set_size(bt_locator_content, lv_pct(100), disp_h() - 30 - 50);  // Leave space for title and exit btn
     lv_obj_align(bt_locator_content, LV_ALIGN_TOP_MID, 0, 30);  // Start below title bar
     lv_obj_set_style_bg_opa(bt_locator_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(bt_locator_content, 0, 0);
@@ -13904,7 +14044,7 @@ static void show_bt_locator_screen(void)
     
     // Scrollable list for devices (hidden until scan complete)
     bt_locator_list = lv_obj_create(bt_locator_content);
-    lv_obj_set_size(bt_locator_list, lv_pct(100), LCD_V_RES - 30 - 70 - 25);  // Same height as BLE Scan list
+    lv_obj_set_size(bt_locator_list, lv_pct(100), disp_h() - 30 - 70 - 25);  // Same height as BLE Scan list
     lv_obj_align(bt_locator_list, LV_ALIGN_TOP_MID, 0, 20);  // Below header
     lv_obj_set_style_bg_color(bt_locator_list, ui_bg_color(), 0);
     lv_obj_set_style_border_color(bt_locator_list, ui_accent_color(), 0);
@@ -14020,7 +14160,7 @@ static void show_evil_twin_page(void)
     wifi_attacks_refresh_sd_html_list();
 
     evil_twin_content = lv_obj_create(function_page);
-    lv_obj_set_size(evil_twin_content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_set_size(evil_twin_content, lv_pct(100), disp_h() - 30);
     lv_obj_align(evil_twin_content, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(evil_twin_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(evil_twin_content, 0, 0);
@@ -14332,7 +14472,7 @@ void attack_event_cb(lv_event_t *e)
         // Build list of attacked networks with SSID, Freq, BSSID
         if (deauth_list) { deauth_list = NULL; }
         deauth_list = lv_list_create(function_page);
-        lv_obj_set_size(deauth_list, lv_pct(100), LCD_V_RES - 30 - 36 - 70);  // Leave space for stop tile
+        lv_obj_set_size(deauth_list, lv_pct(100), disp_h() - 30 - 36 - 70);  // Leave space for stop tile
         lv_obj_align(deauth_list, LV_ALIGN_TOP_MID, 0, 60);
         lv_obj_set_style_bg_color(deauth_list, ui_bg_color(), 0);
         lv_obj_set_style_text_color(deauth_list, ui_text_color(), 0);
@@ -14620,7 +14760,7 @@ void attack_event_cb(lv_event_t *e)
         reset_function_page_children();
         show_function_page("Browse Networks");
         scan_list = lv_list_create(function_page);
-        lv_obj_set_size(scan_list, lv_pct(100), LCD_V_RES - 30);
+        lv_obj_set_size(scan_list, lv_pct(100), disp_h() - 30);
         lv_obj_align(scan_list, LV_ALIGN_BOTTOM_MID, 0, 0);
         lv_obj_set_style_bg_color(scan_list, ui_bg_color(), 0);
         lv_obj_set_style_text_color(scan_list, ui_text_color(), 0);
@@ -14721,7 +14861,7 @@ void attack_event_cb(lv_event_t *e)
         show_function_page("Browse Clients");
         
         lv_obj_t *list = lv_list_create(function_page);
-        lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30 - 50);
+        lv_obj_set_size(list, lv_pct(100), disp_h() - 30 - 50);
         lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 30);
         lv_obj_set_style_bg_color(list, ui_bg_color(), 0);
         lv_obj_set_style_text_color(list, ui_text_color(), 0);
@@ -14839,7 +14979,7 @@ void attack_event_cb(lv_event_t *e)
         show_function_page("Show Probes");
         
         lv_obj_t *list = lv_list_create(function_page);
-        lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30 - 50);
+        lv_obj_set_size(list, lv_pct(100), disp_h() - 30 - 50);
         lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 30);
         lv_obj_set_style_bg_color(list, ui_bg_color(), 0);
         lv_obj_set_style_text_color(list, ui_text_color(), 0);
@@ -14925,7 +15065,7 @@ void attack_event_cb(lv_event_t *e)
         
         // Scrollable list for devices (starts below status label)
         ble_scan_list = lv_obj_create(function_page);
-        lv_obj_set_size(ble_scan_list, lv_pct(100), LCD_V_RES - 30 - 70 - 25);  // Leave space for title, status and exit button
+        lv_obj_set_size(ble_scan_list, lv_pct(100), disp_h() - 30 - 70 - 25);  // Leave space for title, status and exit button
         lv_obj_align(ble_scan_list, LV_ALIGN_TOP_MID, 0, 55);
         lv_obj_set_style_bg_color(ble_scan_list, ui_bg_color(), 0);
         lv_obj_set_style_border_color(ble_scan_list, lv_color_make(0, 100, 0), 0);
@@ -15318,7 +15458,7 @@ static void evil_twin_start_btn_cb(lv_event_t *e)
 
     // Create scrollable content container
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 45);  // Leave space for header and Exit button
+    lv_obj_set_size(content, lv_pct(100), disp_h() - 30 - 45);  // Leave space for header and Exit button
     lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_color(content, ui_bg_color(), 0);
     lv_obj_set_style_border_width(content, 0, 0);
@@ -16488,7 +16628,7 @@ static void show_gatt_walker_screen(void)
     gw_last_scan_count = -1;
 
     gw_content = lv_obj_create(function_page);
-    lv_obj_set_size(gw_content, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_set_size(gw_content, lv_pct(100), disp_h() - 30 - 50);
     lv_obj_align(gw_content, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(gw_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(gw_content, 0, 0);
@@ -16502,7 +16642,7 @@ static void show_gatt_walker_screen(void)
     lv_obj_center(gw_status_label);
 
     gw_list = lv_obj_create(gw_content);
-    lv_obj_set_size(gw_list, lv_pct(100), LCD_V_RES - 30 - 50 - 10);
+    lv_obj_set_size(gw_list, lv_pct(100), disp_h() - 30 - 50 - 10);
     lv_obj_align(gw_list, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_color(gw_list, ui_bg_color(), 0);
     lv_obj_set_style_border_color(gw_list, ui_accent_color(), 0);
@@ -16666,7 +16806,7 @@ static void show_bt_lookout_screen(void)
     lookout_detection_total = 0;
 
     lookout_content = lv_obj_create(function_page);
-    lv_obj_set_size(lookout_content, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_set_size(lookout_content, lv_pct(100), disp_h() - 30 - 50);
     lv_obj_align(lookout_content, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(lookout_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(lookout_content, 0, 0);
@@ -16680,7 +16820,7 @@ static void show_bt_lookout_screen(void)
     lv_obj_align(lookout_status_label, LV_ALIGN_TOP_LEFT, 2, 0);
 
     lookout_list = lv_obj_create(lookout_content);
-    lv_obj_set_size(lookout_list, lv_pct(100), LCD_V_RES - 30 - 50 - 28);
+    lv_obj_set_size(lookout_list, lv_pct(100), disp_h() - 30 - 50 - 28);
     lv_obj_align(lookout_list, LV_ALIGN_TOP_MID, 0, 22);
     lv_obj_set_style_bg_color(lookout_list, ui_bg_color(), 0);
     lv_obj_set_style_border_color(lookout_list, ui_accent_color(), 0);
@@ -16825,7 +16965,7 @@ static void show_honeypair_screen(void)
     create_function_page_base("BLE HoneyPair");
 
     hp_content = lv_obj_create(function_page);
-    lv_obj_set_size(hp_content, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_set_size(hp_content, lv_pct(100), disp_h() - 30 - 50);
     lv_obj_align(hp_content, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(hp_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(hp_content, 0, 0);
@@ -16977,7 +17117,7 @@ static void show_blueduck_screen(void)
     create_function_page_base("BLE BlueDuck");
 
     bd_content = lv_obj_create(function_page);
-    lv_obj_set_size(bd_content, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_set_size(bd_content, lv_pct(100), disp_h() - 30 - 50);
     lv_obj_align(bd_content, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(bd_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(bd_content, 0, 0);
@@ -17233,7 +17373,7 @@ static void show_whisperpair_screen(void)
     memset(wp_selected_mac, 0, 6);
 
     wp_content = lv_obj_create(function_page);
-    lv_obj_set_size(wp_content, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_set_size(wp_content, lv_pct(100), disp_h() - 30 - 50);
     lv_obj_align(wp_content, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(wp_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(wp_content, 0, 0);
@@ -17577,7 +17717,7 @@ static void show_deauth_monitor_screen(void)
     
     // Create attack list (hidden initially)
     deauth_monitor_list = lv_list_create(function_page);
-    lv_obj_set_size(deauth_monitor_list, lv_pct(100), LCD_V_RES - 30 - 70);  // Leave space for title and exit button
+    lv_obj_set_size(deauth_monitor_list, lv_pct(100), disp_h() - 30 - 70);  // Leave space for title and exit button
     lv_obj_align(deauth_monitor_list, LV_ALIGN_TOP_MID, 0, 35);
     lv_obj_set_style_bg_color(deauth_monitor_list, ui_bg_color(), 0);
     lv_obj_set_style_border_width(deauth_monitor_list, 0, LV_PART_ITEMS);
