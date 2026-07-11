@@ -327,18 +327,6 @@ static void style_modal_overlay(lv_obj_t *overlay, lv_opa_t opacity) {
     lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
 }
 
-static void style_neutral_button(lv_obj_t *btn) {
-    if (!btn) return;
-    lv_obj_set_style_bg_color(btn,
-        dark_mode_enabled ? lv_color_hex(0x13263C) : lv_color_hex(0xD4DFEA), 0);
-    lv_obj_set_style_bg_color(btn,
-        dark_mode_enabled ? lv_color_hex(0x1E3550) : lv_color_hex(0xC3D1E1),
-        LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(btn, 1, 0);
-    lv_obj_set_style_border_color(btn, ui_border_color(), 0);
-    lv_obj_set_style_border_opa(btn, dark_mode_enabled ? LV_OPA_70 : LV_OPA_100, 0);
-    lv_obj_set_style_radius(btn, 8, 0);
-}
 
 static esp_lcd_panel_handle_t panel_handle;
 static esp_lcd_panel_io_handle_t lcd_io_handle;
@@ -369,8 +357,6 @@ static StaticTask_t gps_task_buffer;
 static StackType_t *gps_task_stack = NULL;
 
 // SD init task buffers
-static StaticTask_t sd_init_task_buffer;
-static StackType_t *sd_init_task_stack = NULL;
 
 static esp_err_t init_gps_uart(void);
 static bool parse_gps_nmea(const char *nmea_sentence);
@@ -380,7 +366,6 @@ static void screenshot_btn_event_cb(lv_event_t *e);
 // Battery voltage monitor forward declarations (DISABLED - using regular C5 chip)
 static esp_err_t init_max17048(void);
 static uint8_t read_max17048_percent(void);
-static float read_max17048_voltage(void);
 static void battery_monitor_task(void *arg);
 static esp_err_t save_snapshot_bmp(lv_img_dsc_t *shot, const char *filepath);
 static int find_next_screenshot_index(void);
@@ -784,7 +769,6 @@ static int wardrive_file_counter = 1;
 
 // Wardrive buffers (static to avoid stack overflow)
 static char wardrive_gps_buffer[GPS_BUF_SIZE];
-static wifi_ap_record_t wardrive_scan_results[MAX_AP_CNT];
 
 // Karma UI state
 static lv_obj_t *karma_log_ta = NULL;
@@ -1122,7 +1106,6 @@ static void show_main_tiles(void);
 static void show_wifi_scan_attack_screen(void);
 static void show_attack_tiles_screen(void);
 static void show_global_attacks_screen(void);
-static void show_sniff_karma_screen(void);
 static void show_wifi_monitor_screen(void);
 static void show_eviltwin_passwords_screen(void);
 static void show_portal_data_screen(void);
@@ -1142,6 +1125,9 @@ static void deauth_rescan_timer_stop(void);
 static void set_screenshot_buttons_disabled(bool disabled);
 static void screenshot_finish_ui_cb(void *user_data);
 static void screenshot_save_task(void *arg);
+
+// Forward decl — reset_function_page_children() (below) tears down WhisperPair.
+static void wp_teardown(void);
 
 // Reset all child pointers when function_page is deleted
 static void reset_function_page_children(void) {
@@ -1286,19 +1272,15 @@ static void create_function_page_base(const char *name);
 void show_function_page(const char *name);
 static void show_evil_twin_page(void);
 static void evil_twin_start_btn_cb(lv_event_t *e);
-static esp_err_t evil_twin_enable_log_capture(void);
 static void evil_twin_ui_event_callback(evil_twin_event_data_t *data);
 static void evil_twin_disable_log_capture(void);
 static void blackout_yes_btn_cb(lv_event_t *e);
 static void blackout_stop_btn_cb(lv_event_t *e);
-static esp_err_t blackout_enable_log_capture(void);
 static void blackout_disable_log_capture(void);
 static void snifferdog_yes_btn_cb(lv_event_t *e);
 static void snifferdog_stop_btn_cb(lv_event_t *e);
-static esp_err_t snifferdog_enable_log_capture(void);
 static void snifferdog_disable_log_capture(void);
 static void sniffer_yes_btn_cb(lv_event_t *e);
-static void sniffer_enough_btn_cb(lv_event_t *e);
 static esp_err_t sniffer_enable_log_capture(void);
 static void sniffer_disable_log_capture(void);
 static void sniffer_task(void *pvParameters);
@@ -1313,7 +1295,6 @@ static void sniffer_refresh_observe_view(void);
 static void sniffer_new_client_notify(void);
 static void sae_overflow_yes_btn_cb(lv_event_t *e);
 static void sae_overflow_stop_btn_cb(lv_event_t *e);
-static esp_err_t sae_overflow_enable_log_capture(void);
 static void sae_overflow_disable_log_capture(void);
 static void handshake_yes_btn_cb(lv_event_t *e);
 static void handshake_stop_btn_cb(lv_event_t *e);
@@ -1322,7 +1303,6 @@ static void handshake_disable_log_capture(void);
 static void handshake_attack_task(void *pvParameters);
 static void handshake_attack_task_selected(void);
 static void handshake_attack_task_sniffer(void);
-static void attack_network_with_burst(const wifi_ap_record_t *ap);
 static bool check_handshake_file_exists(const char *ssid);
 static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid);
 static void handshake_cleanup(void);
@@ -1351,7 +1331,6 @@ static void wardrive_task(void *pvParameters);
 static void show_karma_page(void);
 static void karma_start_btn_cb(lv_event_t *e);
 static void karma_stop_btn_cb(lv_event_t *e);
-static esp_err_t karma_enable_log_capture(void);
 static void karma_disable_log_capture(void);
 static void show_portal_page(void);
 static void portal_ssid_ta_event_cb(lv_event_t *e);
@@ -1364,7 +1343,6 @@ static void portal_ui_event_callback(evil_twin_event_data_t *data);
 static void karma_ui_event_callback(evil_twin_event_data_t *data);
 static void get_timestamp_string(char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
-static bool wait_for_gps_fix(int timeout_seconds);
 void load_whitelist_from_sd(void);
 bool is_bssid_whitelisted(const uint8_t *bssid);
 
@@ -1449,7 +1427,6 @@ static void wp_ui_refresh(lv_timer_t *t);
 static void wp_run_all(wp_mode_t mode);
 static void wp_probe_btn_cb(lv_event_t *e);
 static void wp_exploit_btn_cb(lv_event_t *e);
-static void wp_teardown(void);
 static void wp_result_cb(wp_result_t result, const char *detail, const uint8_t mac[6], wp_mode_t mode);
 
 // BLE peripheral mode switch (re-inits NimBLE if the registered service table
@@ -1621,26 +1598,6 @@ static int dual_vprintf(const char *fmt, va_list ap)
     return ret;
 }
 
-static esp_err_t evil_twin_enable_log_capture(void)
-{
-    if (!evil_twin_log_queue) {
-        evil_twin_log_queue = xQueueCreate(32, sizeof(evil_log_msg_t));
-        if (!evil_twin_log_queue) {
-            return ESP_ERR_NO_MEM;
-        }
-    } else {
-        xQueueReset(evil_twin_log_queue);
-    }
-
-    if (!evil_twin_log_capture_enabled) {
-        if (!blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
-            previous_vprintf = esp_log_set_vprintf(dual_vprintf);
-        }
-        evil_twin_log_capture_enabled = true;
-    }
-
-    return ESP_OK;
-}
 
 static void evil_twin_disable_log_capture(void)
 {
@@ -1697,26 +1654,6 @@ static void rogue_ap_add_status_message(const char *message, lv_color_t color) {
     }
 }
 
-static esp_err_t blackout_enable_log_capture(void)
-{
-    if (!blackout_log_queue) {
-        blackout_log_queue = xQueueCreate(32, sizeof(evil_log_msg_t));
-        if (!blackout_log_queue) {
-            return ESP_ERR_NO_MEM;
-        }
-    } else {
-        xQueueReset(blackout_log_queue);
-    }
-
-    if (!blackout_log_capture_enabled) {
-        if (!evil_twin_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
-            previous_vprintf = esp_log_set_vprintf(dual_vprintf);
-        }
-        blackout_log_capture_enabled = true;
-    }
-
-    return ESP_OK;
-}
 
 static void blackout_disable_log_capture(void)
 {
@@ -1733,26 +1670,6 @@ static void blackout_disable_log_capture(void)
     }
 }
 
-static esp_err_t snifferdog_enable_log_capture(void)
-{
-    if (!snifferdog_log_queue) {
-        snifferdog_log_queue = xQueueCreate(32, sizeof(evil_log_msg_t));
-        if (!snifferdog_log_queue) {
-            return ESP_ERR_NO_MEM;
-        }
-    } else {
-        xQueueReset(snifferdog_log_queue);
-    }
-
-    if (!snifferdog_log_capture_enabled) {
-        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
-            previous_vprintf = esp_log_set_vprintf(dual_vprintf);
-        }
-        snifferdog_log_capture_enabled = true;
-    }
-
-    return ESP_OK;
-}
 
 static void snifferdog_disable_log_capture(void)
 {
@@ -1805,26 +1722,6 @@ static void sniffer_disable_log_capture(void)
     }
 }
 
-static esp_err_t sae_overflow_enable_log_capture(void)
-{
-    if (!sae_overflow_log_queue) {
-        sae_overflow_log_queue = xQueueCreate(32, sizeof(evil_log_msg_t));
-        if (!sae_overflow_log_queue) {
-            return ESP_ERR_NO_MEM;
-        }
-    } else {
-        xQueueReset(sae_overflow_log_queue);
-    }
-
-    if (!sae_overflow_log_capture_enabled) {
-        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
-            previous_vprintf = esp_log_set_vprintf(dual_vprintf);
-        }
-        sae_overflow_log_capture_enabled = true;
-    }
-
-    return ESP_OK;
-}
 
 static void sae_overflow_disable_log_capture(void)
 {
@@ -1911,26 +1808,6 @@ static void wardrive_disable_log_capture(void)
     }
 }
 
-static esp_err_t karma_enable_log_capture(void)
-{
-    if (!karma_log_queue) {
-        karma_log_queue = xQueueCreate(32, sizeof(evil_log_msg_t));
-        if (!karma_log_queue) {
-            return ESP_ERR_NO_MEM;
-        }
-    } else {
-        xQueueReset(karma_log_queue);
-    }
-
-    if (!karma_log_capture_enabled) {
-        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !portal_log_capture_enabled) {
-            previous_vprintf = esp_log_set_vprintf(dual_vprintf);
-        }
-        karma_log_capture_enabled = true;
-    }
-
-    return ESP_OK;
-}
 
 static void karma_disable_log_capture(void)
 {
@@ -2160,7 +2037,6 @@ static inline void nvs_save_enqueue(uint8_t kind, int32_t a, int32_t b)
 static void nvs_settings_save_timeout(int32_t ms)                     { nvs_save_enqueue(0, ms, 0); }
 static void nvs_settings_save_brightness(uint8_t pct)                 { nvs_save_enqueue(1, pct, 0); }
 static void nvs_settings_save_scan_time(uint16_t min_ms, uint16_t max_ms) { nvs_save_enqueue(2, min_ms, max_ms); }
-static void nvs_settings_save_dark_mode(bool enabled)                 { nvs_save_enqueue(3, enabled ? 1 : 0, 0); }
 static void nvs_settings_save_max_power(bool enabled)                 { nvs_save_enqueue(4, enabled ? 1 : 0, 0); }
 
 // ============================================================================
@@ -2298,40 +2174,6 @@ static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode) {
     }
 }
 
-static bool wait_for_gps_fix(int timeout_seconds) {
-    int elapsed = 0;
-    current_gps.valid = false;
-    
-    ESP_LOGI(TAG, "Waiting for GPS fix (timeout: %d seconds)...", timeout_seconds);
-    
-    while (elapsed < timeout_seconds) {
-        if (!wardrive_active) {
-            ESP_LOGI(TAG, "GPS wait: Stop requested");
-            return false;
-        }
-        
-        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(1000));
-        if (len > 0) {
-            wardrive_gps_buffer[len] = '\0';
-            char* line = strtok(wardrive_gps_buffer, "\r\n");
-            while (line != NULL) {
-                if (parse_gps_nmea(line)) {
-                    if (current_gps.valid) {
-                        return true;
-                    }
-                }
-                line = strtok(NULL, "\r\n");
-            }
-        }
-        
-        elapsed++;
-        if (elapsed % 10 == 0) {
-            ESP_LOGI(TAG, "Still waiting for GPS fix... (%d/%d seconds)", elapsed, timeout_seconds);
-        }
-    }
-    
-    return false;
-}
 
 // Snifferdog channel hopping
 static void sniffer_dog_channel_hop(void) {
@@ -2561,60 +2403,11 @@ static void init_touch(void)
     }
 }
 
-static void log_sd_root_listing(void)
-{
-    DIR *dir = opendir("/sdcard");
-    if (!dir) {
-        ESP_LOGW(TAG, "opendir(/sdcard) failed");
-        return;
-    }
-    ESP_LOGI(TAG, "SD root listing:");
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        char path[256];
-        int safe_len = (int)sizeof(path) - 9; // 256 - 1 (NUL) - strlen("/sdcard/") = 247
-        if (safe_len < 0) safe_len = 0;
-        snprintf(path, sizeof(path), "/sdcard/%.*s", safe_len, entry->d_name);
-        struct stat st;
-        if (stat(path, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) {
-                ESP_LOGI(TAG, "  [DIR] %s", entry->d_name);
-            } else {
-                ESP_LOGI(TAG, "  %s (%ld bytes)", entry->d_name, (long)st.st_size);
-            }
-        } else {
-            ESP_LOGI(TAG, "  %s", entry->d_name);
-        }
-    }
-    closedir(dir);
-}
 
 // SD card lazy mount - call once before using /sdcard
 static bool sd_mounted_lazy = false;
-static SemaphoreHandle_t sd_mount_mutex = NULL;
-static TaskHandle_t sd_lazy_mount_task = NULL;
 
 // Background task to mount SD lazily
-static void sd_lazy_mount_task_fn(void *param)
-{
-    vTaskDelay(pdMS_TO_TICKS(2000));  // Wait 2s after startup
-    
-    ESP_LOGI(TAG, "[SD_LAZY] Background SD mount task starting...");
-    
-    // Try to mount SD without blocking
-    esp_err_t ret = wifi_wardrive_init_sd();
-    if (ret == ESP_OK) {
-        sd_mounted_lazy = true;
-        ESP_LOGI(TAG, "[SD_LAZY] SD card mounted successfully in background");
-        
-        // Load whitelist now that SD is mounted
-        load_whitelist_from_sd();
-    } else {
-        ESP_LOGW(TAG, "[SD_LAZY] SD mount failed: %s (system works without SD)", esp_err_to_name(ret));
-    }
-    
-    vTaskDelete(NULL);
-}
 
 static esp_err_t ensure_sd_mounted(void)
 {
@@ -2643,12 +2436,6 @@ static esp_err_t ensure_sd_mounted(void)
 }
 
 // SD card init task with larger stack to prevent stack overflow
-static void sd_init_task(void *param)
-{
-    // This task is now disabled - SD is mounted lazily in background
-    ESP_LOGI(TAG, "[SD_TASK] SD init task disabled (lazy mount)");
-    vTaskDelete(NULL);
-}
 
 // Load whitelist from SD card
 void load_whitelist_from_sd(void) {
@@ -3633,7 +3420,6 @@ static void display_refresh_task(void *pvParameters)
     ESP_LOGI(TAG, "[DISPLAY] refresh task started");
 
     uint32_t loop_counter = 0;
-    TickType_t last_log = xTaskGetTickCount();
 
     while (1) {
         loop_counter++;
@@ -5717,59 +5503,9 @@ static void update_sniffer_button_ui(void)
     }
 }
 
-static void sniffer_stop_only_btn_cb(lv_event_t *e)
-{
-    (void)e;
-    
-    if (sniffer_task_active || sniffer_task_handle != NULL) {
-        ESP_LOGI(TAG, "Stopping WiFi Sniffer...");
-        sniffer_task_active = false;
-        
-        // Wait for task to finish gracefully (up to 7 seconds - must be longer than
-        // wifi_sniffer_stop internal timeout of 5s to avoid stack overflow from force delete)
-        for (int i = 0; i < 70 && sniffer_task_handle != NULL; i++) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        
-        // Only cleanup stack if task finished on its own
-        if (sniffer_task_handle == NULL && sniffer_task_stack != NULL) {
-            heap_caps_free(sniffer_task_stack);
-            sniffer_task_stack = NULL;
-        }
-        
-        ESP_LOGI(TAG, "Sniffer stopped");
-    }
-}
 
-static void sniffer_nav_clients_cb(lv_event_t *e)
-{
-    (void)e;
-    sniffer_return_pending = true;  // Mark that we should return to sniffer
-    lv_event_t synthetic_event;
-    memset(&synthetic_event, 0, sizeof(synthetic_event));
-    synthetic_event.user_data = (void*)"Browse Clients";
-    attack_event_cb(&synthetic_event);
-}
 
-static void sniffer_nav_probes_cb(lv_event_t *e)
-{
-    (void)e;
-    sniffer_return_pending = true;  // Mark that we should return to sniffer
-    lv_event_t synthetic_event;
-    memset(&synthetic_event, 0, sizeof(synthetic_event));
-    synthetic_event.user_data = (void*)"Show Probes";
-    attack_event_cb(&synthetic_event);
-}
 
-static void sniffer_nav_karma_cb(lv_event_t *e)
-{
-    (void)e;
-    sniffer_return_pending = true;  // Mark that we should return to sniffer
-    lv_event_t synthetic_event;
-    memset(&synthetic_event, 0, sizeof(synthetic_event));
-    synthetic_event.user_data = (void*)"Karma";
-    attack_event_cb(&synthetic_event);
-}
 
 static void sniffer_quit_cb(lv_event_t *e)
 {
@@ -6674,40 +6410,6 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     }
 }
 
-static void sniffer_enough_btn_cb(lv_event_t *e)
-{
-    (void)e;
-    
-    // Stop sniffer task
-    if (sniffer_task_active || sniffer_task_handle != NULL) {
-        ESP_LOGI(TAG, "Stopping WiFi Sniffer...");
-        sniffer_task_active = false;
-        
-        // Wait for task to finish gracefully (up to 7 seconds)
-        for (int i = 0; i < 70 && sniffer_task_handle != NULL; i++) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        
-        // Only cleanup stack if task finished on its own
-        if (sniffer_task_handle == NULL && sniffer_task_stack != NULL) {
-            heap_caps_free(sniffer_task_stack);
-            sniffer_task_stack = NULL;
-        }
-        
-        ESP_LOGI(TAG, "Sniffer stopped");
-    }
-    sniffer_disable_log_capture();
-    sniffer_log_ta = NULL;
-    sniffer_stop_btn = NULL;
-    sniffer_start_btn = NULL;
-    sniffer_packets_label = NULL;
-    sniffer_aps_label = NULL;
-    sniffer_probes_label = NULL;
-    sniffer_ui_active = false;  // Clear sniffer UI active flag
-    scan_done_ui_flag = false;  // Clear any pending scan done flag
-    // Navigate back to menu
-    nav_to_menu_flag = true;
-}
 
 static void sae_overflow_yes_btn_cb(lv_event_t *e)
 {
@@ -7524,43 +7226,6 @@ static void handshake_cleanup(void) {
     if (hs_clients) memset(hs_clients, 0, HS_MAX_CLIENTS * sizeof(hs_client_entry_t));
 }
 
-static void attack_network_with_burst(const wifi_ap_record_t *ap) {
-    ESP_LOGI(TAG, "Burst attacking '%s' (Ch %d, RSSI: %d dBm)", 
-                ap->ssid, ap->primary, ap->rssi);
-    
-    // Start attack on this network
-    attack_handshake_start(ap, ATTACK_HANDSHAKE_METHOD_BROADCAST);
-    
-    // Send bursts with waits - 3 bursts total
-    for (int burst = 0; burst < 3 && handshake_attack_active && !g_operation_stop_requested; burst++) {
-        // Wait 1 second, then send next burst (first burst already sent by start)
-        if (burst > 0) {
-            attack_handshake_send_deauth_burst();
-        }
-        
-        // Wait 3 seconds for clients to reconnect after deauth
-        for (int i = 0; i < 30 && handshake_attack_active && !g_operation_stop_requested; i++) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            
-            // Check if handshake captured
-            if (attack_handshake_is_complete()) {
-                ESP_LOGI(TAG, " Handshake captured for '%s' after burst #%d!", 
-                           ap->ssid, burst + 1);
-                
-                // Wait 2s to capture any remaining frames
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                attack_handshake_stop();
-                return; // Success!
-            }
-        }
-        
-        ESP_LOGI(TAG, "Burst #%d complete, trying next...", burst + 1);
-    }
-    
-    // No handshake captured after 3 bursts
-    ESP_LOGI(TAG, "✗ No handshake for '%s' after 3 bursts", ap->ssid);
-    attack_handshake_stop();
-}
 
 static void handshake_attack_task_selected(void) {
     ESP_LOGI(TAG, "Handshake selected-mode task running (promisc + targeted deauth).");
@@ -12918,36 +12583,6 @@ static void show_global_attacks_screen(void)
 }
 
 // WiFi Sniff & Karma screen
-static void show_sniff_karma_screen(void)
-{
-    create_function_page_base("WiFi Sniff & Karma");
-    
-    lv_obj_t *tiles = lv_obj_create(function_page);
-    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
-    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
-    lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
-    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
-    
-    // Network Observer tile - Purple
-    lv_obj_t *sniffer_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Network\nObserver", COLOR_MATERIAL_PURPLE, NULL, NULL);
-    lv_obj_add_event_cb(sniffer_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Sniffer");
-    
-    // Browse Clients tile - Indigo (REMOVED - integrated into Sniffer)
-    // lv_obj_t *clients_tile = create_tile(tiles, LV_SYMBOL_LIST, "Browse\nClients", COLOR_MATERIAL_INDIGO, NULL, NULL);
-    // lv_obj_add_event_cb(clients_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Browse Clients");
-    
-    // Show Probes tile - Teal (REMOVED - integrated into Sniffer)
-    // lv_obj_t *probes_tile = create_tile(tiles, LV_SYMBOL_CALL, "Show\nProbes", COLOR_MATERIAL_TEAL, NULL, NULL);
-    // lv_obj_add_event_cb(probes_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Show Probes");
-    
-    // Karma tile - Pink
-    lv_obj_t *karma_tile = create_tile(tiles, LV_SYMBOL_SHUFFLE, "Karma", COLOR_MATERIAL_PINK, NULL, NULL);
-    lv_obj_add_event_cb(karma_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Karma");
-}
 
 // WiFi Monitor tile callback
 static void wifi_monitor_tile_event_cb(lv_event_t *e)
@@ -15183,14 +14818,6 @@ static uint8_t read_max17048_percent(void)
 }
 
 // Returns cell voltage in volts, or 0.0 if unavailable
-static float read_max17048_voltage(void)
-{
-    if (!max17048_found) return 0.0f;
-    uint16_t raw = 0;
-    if (max17048_read_reg(MAX17048_REG_VCELL, &raw) != ESP_OK) return 0.0f;
-    // 1.25mV per LSB, value in upper 12 bits
-    return (raw >> 4) * 0.00125f;
-}
 
 static void battery_monitor_task(void *arg)
 {
