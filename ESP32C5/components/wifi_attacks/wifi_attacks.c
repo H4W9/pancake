@@ -561,15 +561,11 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
     // Reset password verification flag
     last_password_wrong = false;
     connectAttemptCount = 0;
-
-    // Mirror the proven-working Rogue AP bring-up: disconnect STA, (re)create the
-    // AP netif, start APSTA, and set the AP config AFTER esp_wifi_start(). On this
-    // ESP32-C5 that ordering is what makes the beacon actually use the SSID.
-    esp_wifi_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(200));
-
+    
+    // Get or create AP netif (like ensure_ap_mode in original)
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (!ap_netif) {
+        // AP netif doesn't exist - need to stop WiFi, create it, and restart
         ESP_LOGI(TAG, "Creating AP netif...");
         esp_wifi_stop();
         ap_netif = esp_netif_create_default_wifi_ap();
@@ -584,29 +580,31 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
         apply_wifi_power_settings();
         vTaskDelay(pdMS_TO_TICKS(500));
     } else {
+        // AP netif exists - ensure we're in APSTA mode for raw frame transmission
         wifi_mode_t mode;
         esp_wifi_get_mode(&mode);
-        if (mode != WIFI_MODE_APSTA) {
+        if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
+            ESP_LOGI(TAG, "Switching WiFi to APSTA mode for Evil Twin");
             esp_wifi_set_mode(WIFI_MODE_APSTA);
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
-
+    
     // Stop DHCP server to configure custom IP
     esp_netif_dhcps_stop(ap_netif);
-
+    
     // Set static IP 172.0.0.1 for AP
     esp_netif_ip_info_t ip_info;
     ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
     ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
     ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
-
+    
     esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to set AP IP to 172.0.0.1: %s", esp_err_to_name(ret));
     }
-
-    // Configure AP with the cloned Evil Twin SSID AFTER start (matches Rogue AP).
+    
+    // Configure AP with Evil Twin SSID (with Zero Width Space)
     wifi_config_t ap_config = {
                 .ap = {
                     .ssid = "",
@@ -618,7 +616,7 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
                 }
     };
     size_t ssid_len = strlen(evilTwinSSID);
-
+    
     // Add Zero Width Space (UTF-8: 0xE2 0x80 0x8B) to prevent iPhone grouping
     if (ssid_len + 3 <= sizeof(ap_config.ap.ssid)) {
         memcpy(ap_config.ap.ssid, evilTwinSSID, ssid_len);
@@ -628,11 +626,10 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
         ap_config.ap.ssid_len = ssid_len + 3;
     } else {
         // SSID too long, just copy without Zero Width Space
-        if (ssid_len > sizeof(ap_config.ap.ssid)) ssid_len = sizeof(ap_config.ap.ssid);
-        memcpy(ap_config.ap.ssid, evilTwinSSID, ssid_len);
+        strncpy((char *)ap_config.ap.ssid, evilTwinSSID, sizeof(ap_config.ap.ssid));
         ap_config.ap.ssid_len = ssid_len;
     }
-
+    
     if (strlen(evilTwinPassword) > 0) {
         strcpy((char *)ap_config.ap.password, evilTwinPassword);
         ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
@@ -640,11 +637,9 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
         ap_config.ap.authmode = WIFI_AUTH_OPEN;
     }
 
-    esp_err_t cfg_ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-    if (cfg_ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_set_config(AP) failed: %s", esp_err_to_name(cfg_ret));
-    }
-
+    // Set AP config (mode is already APSTA from netif creation or init)
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    
     // Register event handler for password verification (WIFI_EVENT_STA_CONNECTED/DISCONNECTED)
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &evil_twin_event_handler, NULL);
     
@@ -1857,17 +1852,11 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
     
     // Enable Karma mode - no WiFi connection verification attempts
     karma_mode = true;
-
-    // Mirror the proven-working Rogue AP bring-up (same board + author): disconnect
-    // the STA, (re)create the AP netif, start APSTA, and set the AP config AFTER
-    // esp_wifi_start(). On this ESP32-C5 that ordering is what actually makes the
-    // beacon use the SSID — the Rogue AP path does exactly this and broadcasts its
-    // custom SSID correctly, so Portal now matches it (differing only in OPEN auth).
-    esp_wifi_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(200));
-
+    
+    // Get or create AP netif (like ensure_ap_mode in original)
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (!ap_netif) {
+        // AP netif doesn't exist - need to stop WiFi, create it, and restart
         ESP_LOGI(TAG, "Creating AP netif...");
         esp_wifi_stop();
         ap_netif = esp_netif_create_default_wifi_ap();
@@ -1882,30 +1871,31 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
         apply_wifi_power_settings();
         vTaskDelay(pdMS_TO_TICKS(500));
     } else {
+        // AP netif exists - ensure we're in APSTA mode
         wifi_mode_t mode;
         esp_wifi_get_mode(&mode);
-        if (mode != WIFI_MODE_APSTA) {
+        if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
+            ESP_LOGI(TAG, "Switching WiFi to APSTA mode for Portal");
             esp_wifi_set_mode(WIFI_MODE_APSTA);
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
-
+    
     // Stop DHCP server to configure custom IP
     esp_netif_dhcps_stop(ap_netif);
-
+    
     // Set static IP 172.0.0.1 for AP
     esp_netif_ip_info_t ip_info;
     ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
     ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
     ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
-
+    
     esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to set AP IP to 172.0.0.1: %s", esp_err_to_name(ret));
     }
-
-    // Configure AP with the portal SSID AFTER start (matches Rogue AP). OPEN auth,
-    // no Zero Width Space (this is not Evil Twin).
+    
+    // Configure AP with portal SSID (no Zero Width Space - this is not Evil Twin)
     wifi_config_t ap_config = {
         .ap = {
             .ssid = "",
@@ -1917,14 +1907,12 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
         }
     };
     size_t ssid_len = strlen(portal_ssid);
-    if (ssid_len > sizeof(ap_config.ap.ssid)) ssid_len = sizeof(ap_config.ap.ssid);
     memcpy(ap_config.ap.ssid, portal_ssid, ssid_len);
     ap_config.ap.ssid_len = ssid_len;
-    esp_err_t cfg_ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-    if (cfg_ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_set_config(AP) failed: %s", esp_err_to_name(cfg_ret));
-    }
-
+    
+    // Set AP config (mode is already APSTA from ensure or from Evil Twin's init)
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    
     // Start DHCP server
     ret = esp_netif_dhcps_start(ap_netif);
     if (ret != ESP_OK) {
