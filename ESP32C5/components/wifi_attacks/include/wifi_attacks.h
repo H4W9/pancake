@@ -140,6 +140,19 @@ esp_err_t wifi_attacks_stop_sae_overflow(void);
  */
 bool wifi_attacks_is_sae_overflow_active(void);
 
+/**
+ * @brief Start beacon spam — flood fake AP beacons for the given SSID list.
+ * @param ssids  array of NUL-terminated SSID strings
+ * @param count  number of SSIDs (clamped to 32)
+ */
+esp_err_t wifi_attacks_start_beacon_spam(const char **ssids, int count);
+
+/** @brief Stop beacon spam (waits for the TX task to exit). */
+esp_err_t wifi_attacks_stop_beacon_spam(void);
+
+/** @brief True while beacon spam is running. */
+bool wifi_attacks_is_beacon_spam_active(void);
+
 // ============================================================================
 // KARMA ATTACK
 // ============================================================================
