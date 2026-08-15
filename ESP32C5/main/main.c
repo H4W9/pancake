@@ -42,6 +42,8 @@
 #include "bt_lookout.h"
 #include "nmap_scan.h"
 #include "led_strip.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include <sys/unistd.h>
 #include <sys/reent.h>
 #include <dirent.h>
@@ -284,6 +286,14 @@ static lv_obj_t *brightness_overlay = NULL; // Software brightness overlay on lv
 static uint16_t scan_time_min_ms = 100;     // Active scan min time per channel (default 100)
 static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel (default 300)
 
+// NVS settings keys
+#define NVS_NAMESPACE       "settings"
+#define NVS_KEY_TIMEOUT     "scr_timeout"
+#define NVS_KEY_BRIGHTNESS  "scr_bright"
+#define NVS_KEY_SCAN_MIN    "scan_min"
+#define NVS_KEY_SCAN_MAX    "scan_max"
+#define NVS_KEY_DARK_MODE   "dark_mode"
+#define NVS_KEY_MAX_POWER   "max_power"
 
 // ============================================================================
 // Theme-aware style helpers
@@ -1976,112 +1986,108 @@ static void init_display(void)
 }
 
 // ============================================================================
-// Settings Helpers (persisted to SD card)
+// NVS Settings Helpers
 // ============================================================================
 
-// App settings persist to a small text file on the SD card (not NVS). esp_wifi
-// still uses its own separate `nvs` partition internally — that's unavoidable and
-// unrelated to these settings.
-#define SETTINGS_PATH "/sdcard/lab/settings.conf"
-
-static esp_err_t ensure_sd_mounted(void);   // defined later; used by settings I/O
-
-static void settings_load(void)
+static void nvs_settings_load(void)
 {
-    // Defaults first, so a missing card/file still yields a working config.
-    screen_timeout_ms     = 0;      // 0 = stays on
-    screen_brightness_pct = 80;
-    scan_time_min_ms      = 100;
-    scan_time_max_ms      = 300;
-    dark_mode_enabled     = true;
-    g_max_power_mode      = false;
-
-    if (ensure_sd_mounted() != ESP_OK) {
-        ESP_LOGW(TAG, "Settings: SD not mounted, using defaults");
-        wifi_scanner_set_scan_time(scan_time_min_ms, scan_time_max_ms);
-        return;
-    }
-
-    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-        FILE *f = fopen(SETTINGS_PATH, "r");
-        if (f) {
-            char line[64];
-            while (fgets(line, sizeof(line), f)) {
-                char *eq = strchr(line, '=');
-                if (!eq) continue;
-                *eq = '\0';
-                int v = atoi(eq + 1);
-                if      (!strcmp(line, "timeout"))    screen_timeout_ms     = v;
-                else if (!strcmp(line, "brightness")) screen_brightness_pct = (uint8_t)v;
-                else if (!strcmp(line, "scan_min"))   scan_time_min_ms      = (uint16_t)v;
-                else if (!strcmp(line, "scan_max"))   scan_time_max_ms      = (uint16_t)v;
-                else if (!strcmp(line, "dark"))       dark_mode_enabled     = (v != 0);
-                else if (!strcmp(line, "maxpower"))   g_max_power_mode      = (v != 0);
-            }
-            fclose(f);
-            ESP_LOGI(TAG, "Settings loaded from %s: timeout=%ldms bright=%u%% scan=%u-%u dark=%d maxpwr=%d",
-                     SETTINGS_PATH, (long)screen_timeout_ms, screen_brightness_pct,
-                     scan_time_min_ms, scan_time_max_ms, dark_mode_enabled, g_max_power_mode);
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err == ESP_OK) {
+        int32_t t = 0;
+        if (nvs_get_i32(h, NVS_KEY_TIMEOUT, &t) == ESP_OK) {
+            screen_timeout_ms = t;
         } else {
-            ESP_LOGI(TAG, "Settings file not found (%s); using defaults", SETTINGS_PATH);
+            screen_timeout_ms = 0; // stays on
         }
-        xSemaphoreGive(sd_spi_mutex);
+        uint8_t b = 80;
+        if (nvs_get_u8(h, NVS_KEY_BRIGHTNESS, &b) == ESP_OK) {
+            screen_brightness_pct = b;
+        } else {
+            screen_brightness_pct = 80;
+        }
+        uint16_t smin = 100, smax = 300;
+        if (nvs_get_u16(h, NVS_KEY_SCAN_MIN, &smin) == ESP_OK) {
+            scan_time_min_ms = smin;
+        }
+        if (nvs_get_u16(h, NVS_KEY_SCAN_MAX, &smax) == ESP_OK) {
+            scan_time_max_ms = smax;
+        }
+        uint8_t dm = 1;
+        if (nvs_get_u8(h, NVS_KEY_DARK_MODE, &dm) == ESP_OK) {
+            dark_mode_enabled = (dm != 0);
+        }
+        uint8_t mp = 0;
+        if (nvs_get_u8(h, NVS_KEY_MAX_POWER, &mp) == ESP_OK) {
+            g_max_power_mode = (mp != 0);
+        }
+        nvs_close(h);
+        ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d",
+                 (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms,
+                 dark_mode_enabled);
+    } else {
+        ESP_LOGW(TAG, "NVS settings not found (first boot), using defaults");
+        screen_timeout_ms = 0;
+        screen_brightness_pct = 80;
+        scan_time_min_ms = 100;
+        scan_time_max_ms = 300;
+        dark_mode_enabled = true;
     }
     wifi_scanner_set_scan_time(scan_time_min_ms, scan_time_max_ms);
 }
 
-// Rewrite the whole settings file from the current globals. Runs on the writer task.
-static void settings_write_sd(void)
-{
-    if (ensure_sd_mounted() != ESP_OK) return;
-    if (!sd_spi_mutex || xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) return;
-    mkdir("/sdcard/lab", 0777);   // ensure dir exists (EEXIST is fine)
-    FILE *f = fopen(SETTINGS_PATH, "w");
-    if (f) {
-        fprintf(f, "timeout=%ld\n",   (long)screen_timeout_ms);
-        fprintf(f, "brightness=%u\n", (unsigned)screen_brightness_pct);
-        fprintf(f, "scan_min=%u\n",   (unsigned)scan_time_min_ms);
-        fprintf(f, "scan_max=%u\n",   (unsigned)scan_time_max_ms);
-        fprintf(f, "dark=%d\n",       dark_mode_enabled ? 1 : 0);
-        fprintf(f, "maxpower=%d\n",   g_max_power_mode ? 1 : 0);
-        fclose(f);
-        ESP_LOGI(TAG, "Settings saved to %s", SETTINGS_PATH);
-    } else {
-        ESP_LOGW(TAG, "Settings: failed to open %s for write", SETTINGS_PATH);
-    }
-    xSemaphoreGive(sd_spi_mutex);
-}
+// These settings-save helpers are called from LVGL event callbacks, which run on
+// the display task's PSRAM stack. Internal-flash (NVS) writes disable the CPU
+// cache, making a PSRAM stack unreadable mid-write -> crash. So the helpers only
+// enqueue the change; nvs_writer_task (below, created with an INTERNAL-RAM stack)
+// performs the actual commit in a safe context.
+typedef struct {
+    uint8_t kind;   // 0=timeout 1=brightness 2=scan_time 3=dark_mode 4=max_power
+    int32_t a;
+    int32_t b;
+} nvs_save_req_t;
 
-// Saves are triggered from LVGL callbacks (display task). Rather than do blocking
-// SD I/O there, callbacks poke a queue; the writer task rewrites the whole file
-// from the current globals, coalescing a burst of changes into one write.
-static QueueHandle_t settings_save_queue = NULL;
+static QueueHandle_t nvs_save_queue = NULL;
 
-static void settings_writer_task(void *arg)
+static void nvs_writer_task(void *arg)
 {
     (void)arg;
-    uint8_t sig;
+    nvs_save_req_t req;
     for (;;) {
-        if (xQueueReceive(settings_save_queue, &sig, portMAX_DELAY) != pdTRUE) continue;
-        vTaskDelay(pdMS_TO_TICKS(150));                                  // debounce a burst
-        while (xQueueReceive(settings_save_queue, &sig, 0) == pdTRUE) { } // drain
-        settings_write_sd();
+        if (xQueueReceive(nvs_save_queue, &req, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        nvs_handle_t h;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+            continue;
+        }
+        switch (req.kind) {
+            case 0: nvs_set_i32(h, NVS_KEY_TIMEOUT, req.a); break;
+            case 1: nvs_set_u8(h, NVS_KEY_BRIGHTNESS, (uint8_t)req.a); break;
+            case 2: nvs_set_u16(h, NVS_KEY_SCAN_MIN, (uint16_t)req.a);
+                    nvs_set_u16(h, NVS_KEY_SCAN_MAX, (uint16_t)req.b); break;
+            case 3: nvs_set_u8(h, NVS_KEY_DARK_MODE, req.a ? 1 : 0); break;
+            case 4: nvs_set_u8(h, NVS_KEY_MAX_POWER, req.a ? 1 : 0); break;
+            default: nvs_close(h); continue;
+        }
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "NVS: committed setting kind=%u", req.kind);
     }
 }
 
-static inline void settings_save(void)
+static inline void nvs_save_enqueue(uint8_t kind, int32_t a, int32_t b)
 {
-    if (settings_save_queue) {
-        uint8_t sig = 1;
-        xQueueSend(settings_save_queue, &sig, 0);   // non-blocking
+    if (nvs_save_queue) {
+        nvs_save_req_t req = { kind, a, b };
+        xQueueSend(nvs_save_queue, &req, 0);   // non-blocking, safe from PSRAM stack
     }
 }
 
-// Named wrappers: store the value in its global, then trigger a file rewrite.
-static void settings_save_timeout(int32_t ms)                        { screen_timeout_ms = ms; settings_save(); }
-static void settings_save_brightness(uint8_t pct)                    { screen_brightness_pct = pct; settings_save(); }
-static void settings_save_scan_time(uint16_t min_ms, uint16_t max_ms) { scan_time_min_ms = min_ms; scan_time_max_ms = max_ms; settings_save(); }
-static void settings_save_max_power(bool enabled)                    { g_max_power_mode = enabled; settings_save(); }
+static void nvs_settings_save_timeout(int32_t ms)                     { nvs_save_enqueue(0, ms, 0); }
+static void nvs_settings_save_brightness(uint8_t pct)                 { nvs_save_enqueue(1, pct, 0); }
+static void nvs_settings_save_scan_time(uint16_t min_ms, uint16_t max_ms) { nvs_save_enqueue(2, min_ms, max_ms); }
+static void nvs_settings_save_max_power(bool enabled)                 { nvs_save_enqueue(4, enabled ? 1 : 0, 0); }
 
 // ============================================================================
 // Backlight / Brightness / Screen Dimming
@@ -3112,6 +3118,10 @@ void app_main(void)
         // wifi_cli_start_console();
     }
 
+    // Load screen settings (timeout, brightness) from NVS
+    // NVS is already initialized by wifi_cli_init()
+    nvs_settings_load();
+
     // Init scanner and register event handler
     wifi_scanner_init();
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
@@ -3165,10 +3175,6 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to create SD/SPI mutex!");
         return;
     }
-
-    // Load app settings from the SD card now that the SPI bus + mutex are ready
-    // (before the UI is built, so brightness/theme apply on first draw).
-    settings_load();
 
     // GATT Walker backend — shares the SD/SPI mutex for JSON result saving
     gw_init(sd_spi_mutex);
@@ -3420,15 +3426,16 @@ void app_main(void)
         ESP_LOGW(TAG, "Battery ADC init failed - voltage monitor disabled");
     }
 
-    // Deferred settings writer: LVGL callbacks (display task) poke this queue and the
-    // writer task does the actual SD file write off the UI path (see settings_save()).
-    settings_save_queue = xQueueCreate(8, sizeof(uint8_t));
-    if (settings_save_queue != NULL) {
-        if (xTaskCreate(settings_writer_task, "set_writer", 4096, NULL, 3, NULL) != pdPASS) {
-            ESP_LOGE(TAG, "Failed to create settings writer task; settings won't persist");
+    // Deferred-NVS writer: LVGL callbacks run on the display task's PSRAM stack and
+    // must not write internal flash, so settings saves are queued to this task,
+    // which uses a normal INTERNAL-RAM stack and can safely commit to NVS.
+    nvs_save_queue = xQueueCreate(8, sizeof(nvs_save_req_t));
+    if (nvs_save_queue != NULL) {
+        if (xTaskCreate(nvs_writer_task, "nvs_writer", 4096, NULL, 3, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create nvs_writer task; settings won't persist");
         }
     } else {
-        ESP_LOGE(TAG, "Failed to create settings_save_queue; settings won't persist");
+        ESP_LOGE(TAG, "Failed to create nvs_save_queue; settings won't persist");
     }
 
     // Launch the LVGL/display refresh loop as its own task with a PSRAM stack, at
@@ -12995,7 +13002,7 @@ static void scantime_popup_save_cb(lv_event_t *e)
 
     scan_time_min_ms = min_val;
     scan_time_max_ms = max_val;
-    settings_save_scan_time(min_val, max_val);
+    nvs_settings_save_scan_time(min_val, max_val);
     wifi_scanner_set_scan_time(min_val, max_val);
 
     lv_obj_del(scantime_popup);
@@ -13165,7 +13172,7 @@ static void timeout_popup_save_cb(lv_event_t *e)
 
     uint16_t sel = lv_dropdown_get_selected(timeout_dropdown);
     screen_timeout_ms = timeout_index_to_ms(sel);
-    settings_save_timeout(screen_timeout_ms);
+    nvs_settings_save_timeout(screen_timeout_ms);
 
     // Pause or resume idle timer
     if (screen_idle_timer) {
@@ -13310,7 +13317,7 @@ static void brightness_popup_save_cb(lv_event_t *e)
     (void)e;
     if (!brightness_slider || !brightness_popup) return;
     screen_brightness_pct = (uint8_t)lv_slider_get_value(brightness_slider);
-    settings_save_brightness(screen_brightness_pct);
+    nvs_settings_save_brightness(screen_brightness_pct);
     set_backlight_percent(screen_brightness_pct);
 
     lv_obj_del(brightness_popup);
@@ -13442,7 +13449,7 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_screen_brightness_popup();
     } else if (strcmp(tile_name, "Max Power") == 0) {
         g_max_power_mode = !g_max_power_mode;
-        settings_save_max_power(g_max_power_mode);
+        nvs_settings_save_max_power(g_max_power_mode);
         // Apply immediately if WiFi is running; otherwise it's applied on next
         // esp_wifi_start() (wifi_cli.c) and persists via NVS.
         if (current_radio_mode == RADIO_MODE_WIFI) {
