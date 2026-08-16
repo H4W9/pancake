@@ -3276,12 +3276,15 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(lcd_io_handle, &cbs, &disp_drv));
 
-    uint16_t black = 0x0000;
-    for (int i = 0; i < LCD_H_RES * 30; i++) {
-        ((uint16_t*)buf1)[i] = black;
-    }
-    for (int y = 0; y < LCD_V_RES; y += 30) {
-        int lines = (y + 30 <= LCD_V_RES) ? 30 : (LCD_V_RES - y);
+    // buf1 holds exactly LCD_H_RES*15 pixels (= buf_size bytes). The old code
+    // cleared/drew LCD_H_RES*30 pixels — a 2x buffer OVERFLOW past buf1 that
+    // corrupted adjacent heap. When PSRAM is marginal and LVGL's display/screen
+    // objects fall back to internal RAM near buf1, that corruption smashed them
+    // and later crashed in lv_obj_set_style_bg_color(lv_scr_act(), ...). Clear
+    // exactly buf_size and draw in 15-line chunks that fit the buffer.
+    memset((void *)buf1, 0, buf_size);
+    for (int y = 0; y < LCD_V_RES; y += 15) {
+        int lines = (y + 15 <= LCD_V_RES) ? 15 : (LCD_V_RES - y);
         esp_lcd_panel_draw_bitmap(panel_handle, 0, y, LCD_H_RES, y + lines, buf1);
     }
     
