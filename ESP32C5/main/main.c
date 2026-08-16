@@ -16811,17 +16811,17 @@ static void beacon_load_ssids(void)
     }
     if (beacon_ui_ssid_count == 0) {
         static const char *defaults[] = {
-            "Free WiFi", "FBI Surveillance Van", "Pretty Fly for a WiFi",
-            "Get Off My LAN", "Hidden Network", "Loading...",
-            "Definitely Not a Trap", "Mom Use This One", "The LAN Before Time",
-            "Drop It Like Its Hotspot", "Wu-Tang LAN", "Bill Wi the Science Fi",
-            "LAN Solo", "Winternet Is Coming", "It Hurts When IP",
-            "Silence of the LANs", "Abraham Linksys", "Martin Router King",
-            "The Promised LAN", "House LANnister", "Ping's Landing",
+            "Free WiFi", "FBI Surveillance Van", "Get Off My LAN",
+            "Hidden Network", "Loading...", "Definitely Not a Trap",
+            "Mom Use This One", "The LAN Before Time", "Drop It Like Its Hotspot",
+            "Wu-Tang LAN", "LAN Solo", "Winternet Is Coming",
+            "It Hurts When IP", "Silence of the LANs", "Abraham Linksys",
+            "Martin Router King", "The Promised LAN", "Ping's Landing",
             "Nacho WiFi", "Panic at the Cisco", "No More Mr WiFi",
-            "Router? I Hardly Know Her", "Skynet Global Defense", "Virus.exe",
-            "Area 51 Guest", "Two Girls One Router", "Password Is Password",
-            "TellMyWifiLoveHer", "NSA Surveillance Van 4",
+            "Skynet Global Defense", "Virus.exe", "Area 51 Guest",
+            "Password Is Password", "NSA Surveillance Van 4",
+            "Loading Please Wait", "Click Here for Virus",
+            "404 Network Unavailable", "Ye Olde Internet",
         };
         int n = (int)(sizeof(defaults) / sizeof(defaults[0]));
         for (int i = 0; i < n && beacon_ui_ssid_count < BEACON_MAX_UI_SSIDS; i++) {
