@@ -63,6 +63,16 @@ jobs:
           path: ESP32C5/binaries-esp32c5
           if-no-files-found: error
 
+      # ELF (+ linker map) for symbolizing panic backtraces with addr2line.
+      - name: Upload ELF + map (crash decoding)
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32c5-elf
+          path: |
+            ESP32C5/build/*.elf
+            ESP32C5/build/*.map
+          if-no-files-found: error
+
   package:
     name: Package Release Artifacts
     needs: [build]
