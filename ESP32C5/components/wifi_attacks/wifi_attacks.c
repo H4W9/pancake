@@ -413,20 +413,36 @@ static void beacon_spam_task(void *pv)
 {
     (void)pv;
     const uint8_t first_channel = 1, last_channel = 13;
-    const uint8_t bssid[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
     uint8_t frame[256];
 
-    ESP_LOGI(TAG, "Beacon spam started (%d SSIDs, ch %u-%u)",
+    // Give each SSID its own stable, random, locally-administered BSSID so the fake
+    // networks show up as MANY DISTINCT APs (Marauder-style) instead of collapsing
+    // into a single AP whose name keeps flickering. This is the main thing that
+    // makes the spam look real and fills up a scanner's list.
+    uint8_t ssid_bssids[MAX_BEACON_SSIDS][6];
+    for (int i = 0; i < beacon_ssid_count; i++) {
+        uint32_t r1 = esp_random(), r2 = esp_random();
+        ssid_bssids[i][0] = (uint8_t)((r1 & 0xFC) | 0x02);  // locally administered + unicast
+        ssid_bssids[i][1] = (uint8_t)(r1 >> 8);
+        ssid_bssids[i][2] = (uint8_t)(r1 >> 16);
+        ssid_bssids[i][3] = (uint8_t)(r1 >> 24);
+        ssid_bssids[i][4] = (uint8_t)(r2 & 0xFF);
+        ssid_bssids[i][5] = (uint8_t)(r2 >> 8);
+    }
+
+    ESP_LOGI(TAG, "Beacon spam started (%d SSIDs, ch %u-%u, unique BSSIDs)",
              beacon_ssid_count, first_channel, last_channel);
 
     while (beacon_spam_active) {
         for (uint8_t ch = first_channel; ch <= last_channel && beacon_spam_active; ch++) {
             esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(3));   // let the channel settle
             for (int i = 0; i < beacon_ssid_count && beacon_spam_active; i++) {
-                int n = build_beacon_frame(frame, sizeof(frame), beacon_ssids[i], bssid, ch);
+                int n = build_beacon_frame(frame, sizeof(frame), beacon_ssids[i], ssid_bssids[i], ch);
                 if (n > 0) send_beacon_frame(frame, n);
-                vTaskDelay(pdMS_TO_TICKS(10));
+                // Yield every few frames so we don't starve WiFi TX / trip the WDT,
+                // but far denser than the old 10ms-per-SSID pacing.
+                if ((i & 0x07) == 0x07) vTaskDelay(1);
             }
         }
     }

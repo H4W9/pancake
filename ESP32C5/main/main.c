@@ -812,6 +812,7 @@ static char portal_selected_html_name[64] = "";
 #define PENDING_ATTACK_ROGUE_AP     1
 #define PENDING_ATTACK_WPA_SEC      2
 #define PENDING_ATTACK_MITM         3
+#define PENDING_ATTACK_NMAP         4
 static int pending_attack_type = 0;
 static char wifi_connect_ssid[33] = "";
 static char wifi_connect_password[64] = "";
@@ -9914,7 +9915,8 @@ static void attack_tile_event_cb(lv_event_t *e)
     } else if (strcmp(attack_name, "ARP Poison") == 0 ||
                strcmp(attack_name, "MITM") == 0 ||
                strcmp(attack_name, "Rogue AP") == 0 ||
-               strcmp(attack_name, "WPA-SEC Upload") == 0) {
+               strcmp(attack_name, "WPA-SEC Upload") == 0 ||
+               strcmp(attack_name, "Nmap") == 0) {
         // These attacks require exactly one selected network
         int selected_indices[SCAN_RESULTS_MAX_DISPLAY];
         int selected_count = wifi_scanner_get_selected(selected_indices, SCAN_RESULTS_MAX_DISPLAY);
@@ -9965,6 +9967,8 @@ static void attack_tile_event_cb(lv_event_t *e)
                 pending_attack_type = PENDING_ATTACK_MITM;
             } else if (strcmp(attack_name, "Rogue AP") == 0) {
                 pending_attack_type = PENDING_ATTACK_ROGUE_AP;
+            } else if (strcmp(attack_name, "Nmap") == 0) {
+                pending_attack_type = PENDING_ATTACK_NMAP;
             } else {
                 pending_attack_type = PENDING_ATTACK_WPA_SEC;
             }
@@ -10359,6 +10363,9 @@ static void wifi_connect_next_btn_cb(lv_event_t *e)
             break;
         case PENDING_ATTACK_WPA_SEC:
             show_wpa_sec_upload_page();
+            break;
+        case PENDING_ATTACK_NMAP:
+            show_nmap_screen();
             break;
         default:
             break;
@@ -12554,7 +12561,9 @@ static void show_attack_tiles_screen(void)
     create_small_tile(attack_tiles, LV_SYMBOL_WIFI, "Rogue AP", COLOR_MATERIAL_INDIGO, attack_tile_event_cb, "Rogue AP");
     create_small_tile(attack_tiles, LV_SYMBOL_UPLOAD, "WPA-SEC", COLOR_MATERIAL_CYAN, attack_tile_event_cb, "WPA-SEC Upload");
     create_small_tile(attack_tiles, LV_SYMBOL_EYE_OPEN, "Observer", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "Sniffer");
-    
+    // Nmap: connect to the selected network (STA), then scan its LAN
+    create_small_tile(attack_tiles, LV_SYMBOL_LIST, "Nmap", COLOR_MATERIAL_INDIGO, attack_tile_event_cb, "Nmap");
+
     // Horizontal separator line above Selected Networks
     lv_obj_t *separator = lv_obj_create(function_page);
     lv_obj_set_size(separator, lv_pct(90), 2);
@@ -12652,10 +12661,6 @@ static void show_global_attacks_screen(void)
     // Wardrive tile - Teal
     lv_obj_t *wardrive_tile = create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, NULL, NULL);
     lv_obj_add_event_cb(wardrive_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Start Wardrive");
-
-    // Nmap tile - Teal: LAN host discovery + TCP port scan over the WiFi STA link
-    lv_obj_t *nmap_tile = create_tile(tiles, LV_SYMBOL_LIST, "Nmap", COLOR_MATERIAL_INDIGO, NULL, NULL);
-    lv_obj_add_event_cb(nmap_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Nmap");
 
     // Beacon Spam tile - Pink: flood fake AP beacons from an SSID list
     lv_obj_t *beacon_tile = create_tile(tiles, LV_SYMBOL_WIFI, "Beacon\nSpam", COLOR_MATERIAL_PINK, NULL, NULL);
@@ -14728,11 +14733,6 @@ void attack_event_cb(lv_event_t *e)
     // BLE WhisperPair
     if (strcmp(attack_name, "WhisperPair") == 0) {
         show_whisperpair_screen();
-        return;
-    }
-
-    if (strcmp(attack_name, "Nmap") == 0) {
-        show_nmap_screen();
         return;
     }
 
@@ -16814,7 +16814,14 @@ static void beacon_load_ssids(void)
             "Free WiFi", "FBI Surveillance Van", "Pretty Fly for a WiFi",
             "Get Off My LAN", "Hidden Network", "Loading...",
             "Definitely Not a Trap", "Mom Use This One", "The LAN Before Time",
-            "Drop It Like Its Hotspot",
+            "Drop It Like Its Hotspot", "Wu-Tang LAN", "Bill Wi the Science Fi",
+            "LAN Solo", "Winternet Is Coming", "It Hurts When IP",
+            "Silence of the LANs", "Abraham Linksys", "Martin Router King",
+            "The Promised LAN", "House LANnister", "Ping's Landing",
+            "Nacho WiFi", "Panic at the Cisco", "No More Mr WiFi",
+            "Router? I Hardly Know Her", "Skynet Global Defense", "Virus.exe",
+            "Area 51 Guest", "Two Girls One Router", "Password Is Password",
+            "TellMyWifiLoveHer", "NSA Surveillance Van 4",
         };
         int n = (int)(sizeof(defaults) / sizeof(defaults[0]));
         for (int i = 0; i < n && beacon_ui_ssid_count < BEACON_MAX_UI_SSIDS; i++) {
