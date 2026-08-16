@@ -40,6 +40,7 @@
 #include "sd_error_handler.h"
 #include "gatt_walker.h"
 #include "bt_lookout.h"
+#include "nmap_scan.h"
 #include "led_strip.h"
 #include <sys/unistd.h>
 #include <sys/reent.h>
@@ -1051,6 +1052,25 @@ static wp_mode_t   wp_queue_mode     = WP_MODE_PROBE;
 static uint32_t    wp_scan_end_ms    = 0;
 static volatile bool wp_screen_active = false;  // for the NeoPixel LED policy
 
+// Nmap scanner UI state
+static lv_obj_t *nmap_ip_ta        = NULL;   // target IP (blank = sweep subnet)
+static lv_obj_t *nmap_level_dd     = NULL;   // Quick / Medium / Heavy
+static lv_obj_t *nmap_results_ta   = NULL;   // scrolling results
+static lv_obj_t *nmap_status_label = NULL;
+static lv_obj_t *nmap_startstop_btn = NULL;
+static lv_obj_t *nmap_startstop_lbl = NULL;
+static lv_obj_t *nmap_keyboard     = NULL;
+static volatile bool nmap_screen_active = false;
+
+// Beacon Spam UI state
+static lv_obj_t *beacon_status_label   = NULL;
+static lv_obj_t *beacon_startstop_btn  = NULL;
+static lv_obj_t *beacon_startstop_lbl  = NULL;
+static volatile bool beacon_screen_active = false;
+#define BEACON_MAX_UI_SSIDS 32
+static char beacon_ui_ssids[BEACON_MAX_UI_SSIDS][33];
+static int  beacon_ui_ssid_count = 0;
+
 // Battery voltage monitor state (DISABLED - using regular C5 chip)
 static lv_obj_t *battery_label = NULL;  // Keep for UI layout
 static char last_voltage_str[32] = "-.--V";  // Persisted across screen changes
@@ -1249,6 +1269,26 @@ static void reset_function_page_children(void) {
     wp_screen_active = false;
     wp_fp_queue_idx = -1;
     wp_fp_queue_count = 0;
+    // Nmap: stop the scan on any nav away, clear widget pointers.
+    if (nmap_screen_active) {
+        nmap_scan_stop();
+    }
+    nmap_ip_ta = NULL;
+    nmap_level_dd = NULL;
+    nmap_results_ta = NULL;
+    nmap_status_label = NULL;
+    nmap_startstop_btn = NULL;
+    nmap_startstop_lbl = NULL;
+    nmap_keyboard = NULL;
+    nmap_screen_active = false;
+    // Beacon Spam: stop the flood on any nav away (it monopolises the radio).
+    if (beacon_screen_active && wifi_attacks_is_beacon_spam_active()) {
+        wifi_attacks_stop_beacon_spam();
+    }
+    beacon_status_label = NULL;
+    beacon_startstop_btn = NULL;
+    beacon_startstop_lbl = NULL;
+    beacon_screen_active = false;
     wifi_connect_ta = NULL;
     wifi_connect_keyboard = NULL;
     wifi_connect_status_label = NULL;
@@ -1419,6 +1459,16 @@ static void show_blueduck_screen(void);
 static void bd_startstop_cb(lv_event_t *e);
 static void bd_exit_cb(lv_event_t *e);
 static void bd_update_stats_ui(void);
+
+// Nmap scanner UI
+static void show_nmap_screen(void);
+static void nmap_startstop_cb(lv_event_t *e);
+static void nmap_ip_ta_event_cb(lv_event_t *e);
+static void nmap_kb_event_cb(lv_event_t *e);
+
+// Beacon Spam UI
+static void show_beacon_spam_screen(void);
+static void beacon_startstop_cb(lv_event_t *e);
 
 // BLE WhisperPair UI
 static void show_whisperpair_screen(void);
@@ -4428,6 +4478,28 @@ static void display_refresh_task(void *pvParameters)
 
             // BLE WhisperPair: UI is driven by its own 500ms lv_timer (wp_ui_refresh),
             // not from this loop — see show_whisperpair_screen().
+
+            // Nmap: drain result lines into the log, refresh status + button label.
+            if (nmap_screen_active) {
+                char line[80];
+                int drained = 0;
+                while (drained < 12 && nmap_scan_poll_line(line, sizeof(line))) {
+                    if (nmap_results_ta) {
+                        // Cap the log so it can't grow unbounded on big sweeps.
+                        if (strlen(lv_textarea_get_text(nmap_results_ta)) > 4000)
+                            lv_textarea_set_text(nmap_results_ta, "");
+                        lv_textarea_add_text(nmap_results_ta, line);
+                        lv_textarea_add_text(nmap_results_ta, "\n");
+                    }
+                    drained++;
+                }
+                if (nmap_status_label)
+                    lv_label_set_text(nmap_status_label,
+                                      nmap_scan_is_active() ? nmap_scan_status() : "Idle");
+                if (nmap_startstop_lbl)
+                    lv_label_set_text(nmap_startstop_lbl,
+                                      nmap_scan_is_active() ? "Stop" : "Start");
+            }
 
             // NeoPixel status LED for the new BLE features (throttled ~20 Hz).
             // Unconditional so the LED also clears after leaving a feature.
@@ -12580,6 +12652,14 @@ static void show_global_attacks_screen(void)
     // Wardrive tile - Teal
     lv_obj_t *wardrive_tile = create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, NULL, NULL);
     lv_obj_add_event_cb(wardrive_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Start Wardrive");
+
+    // Nmap tile - Teal: LAN host discovery + TCP port scan over the WiFi STA link
+    lv_obj_t *nmap_tile = create_tile(tiles, LV_SYMBOL_LIST, "Nmap", COLOR_MATERIAL_INDIGO, NULL, NULL);
+    lv_obj_add_event_cb(nmap_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Nmap");
+
+    // Beacon Spam tile - Pink: flood fake AP beacons from an SSID list
+    lv_obj_t *beacon_tile = create_tile(tiles, LV_SYMBOL_WIFI, "Beacon\nSpam", COLOR_MATERIAL_PINK, NULL, NULL);
+    lv_obj_add_event_cb(beacon_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Beacon Spam");
 }
 
 // WiFi Sniff & Karma screen
@@ -14651,6 +14731,16 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    if (strcmp(attack_name, "Nmap") == 0) {
+        show_nmap_screen();
+        return;
+    }
+
+    if (strcmp(attack_name, "Beacon Spam") == 0) {
+        show_beacon_spam_screen();
+        return;
+    }
+
     // Stub screens for not-yet-implemented features
     if (strcmp(attack_name, "Package Monitor") == 0 ||
         strcmp(attack_name, "Channel View") == 0) {
@@ -16206,7 +16296,8 @@ static void feature_led_update(void)
              wifi_attacks_is_blackout_active() || wifi_attacks_is_sae_overflow_active())
                                                         { r = 80; g = 0;  b = 0;  } // red — denial of service
     // ── Rogue AP / captive portal (orange) ───────────────────────────────
-    else if (wifi_attacks_is_karma_active() || wifi_attacks_is_portal_active())
+    else if (wifi_attacks_is_karma_active() || wifi_attacks_is_portal_active() ||
+             wifi_attacks_is_beacon_spam_active())
                                                         { r = 80; g = 30; b = 0;  } // orange — fake AP
     // ── Handshake capture (yellow) ───────────────────────────────────────
     else if (handshake_attack_active)                   { r = 70; g = 70; b = 0;  } // yellow — WPA capture
@@ -16690,6 +16781,257 @@ static void show_blueduck_screen(void)
 
     bd_screen_active = true;
     bd_update_stats_ui();
+    ui_locked = false;
+}
+
+// ============================================================================
+// Beacon Spam screen — flood fake AP beacons for a list of SSIDs. Backend lives
+// in wifi_attacks (raw 802.11 TX). SSIDs load from /sdcard/lab/beacon_ssids.txt
+// (one per line); a built-in list is used if that file is missing.
+// ============================================================================
+static void beacon_load_ssids(void)
+{
+    beacon_ui_ssid_count = 0;
+    if (ensure_sd_mounted() == ESP_OK && sd_spi_mutex &&
+        xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        FILE *f = fopen("/sdcard/lab/beacon_ssids.txt", "r");
+        if (f) {
+            char line[64];
+            while (fgets(line, sizeof(line), f) && beacon_ui_ssid_count < BEACON_MAX_UI_SSIDS) {
+                int len = (int)strlen(line);
+                while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+                if (len == 0) continue;
+                strncpy(beacon_ui_ssids[beacon_ui_ssid_count], line, 32);
+                beacon_ui_ssids[beacon_ui_ssid_count][32] = '\0';
+                beacon_ui_ssid_count++;
+            }
+            fclose(f);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (beacon_ui_ssid_count == 0) {
+        static const char *defaults[] = {
+            "Free WiFi", "FBI Surveillance Van", "Pretty Fly for a WiFi",
+            "Get Off My LAN", "Hidden Network", "Loading...",
+            "Definitely Not a Trap", "Mom Use This One", "The LAN Before Time",
+            "Drop It Like Its Hotspot",
+        };
+        int n = (int)(sizeof(defaults) / sizeof(defaults[0]));
+        for (int i = 0; i < n && beacon_ui_ssid_count < BEACON_MAX_UI_SSIDS; i++) {
+            strncpy(beacon_ui_ssids[beacon_ui_ssid_count], defaults[i], 32);
+            beacon_ui_ssids[beacon_ui_ssid_count][32] = '\0';
+            beacon_ui_ssid_count++;
+        }
+    }
+}
+
+static void beacon_startstop_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wifi_attacks_is_beacon_spam_active()) {
+        wifi_attacks_stop_beacon_spam();
+        if (beacon_startstop_lbl) lv_label_set_text(beacon_startstop_lbl, "Start");
+        if (beacon_status_label)  lv_label_set_text(beacon_status_label, "Stopped.");
+        return;
+    }
+    if (beacon_ui_ssid_count == 0) {
+        if (beacon_status_label) lv_label_set_text(beacon_status_label, "No SSIDs loaded.");
+        return;
+    }
+    const char *ptrs[BEACON_MAX_UI_SSIDS];
+    for (int i = 0; i < beacon_ui_ssid_count; i++) ptrs[i] = beacon_ui_ssids[i];
+    if (wifi_attacks_start_beacon_spam(ptrs, beacon_ui_ssid_count) == ESP_OK) {
+        if (beacon_startstop_lbl) lv_label_set_text(beacon_startstop_lbl, "Stop");
+        char s[48];
+        snprintf(s, sizeof(s), "Broadcasting %d SSID(s)...", beacon_ui_ssid_count);
+        if (beacon_status_label) lv_label_set_text(beacon_status_label, s);
+    } else if (beacon_status_label) {
+        lv_label_set_text(beacon_status_label, "Failed to start.");
+    }
+}
+
+static void show_beacon_spam_screen(void)
+{
+    ui_locked = true;
+    create_function_page_base("Beacon Spam");
+    beacon_load_ssids();
+
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 8, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *info = lv_label_create(content);
+    char buf[160];
+    snprintf(buf, sizeof(buf),
+             "%d SSIDs loaded.\n\nEdit /sdcard/lab/beacon_ssids.txt\n(one SSID per line) to customize,\nthen reopen this screen.",
+             beacon_ui_ssid_count);
+    lv_label_set_text(info, buf);
+    lv_obj_set_style_text_color(info, ui_text_color(), 0);
+    lv_obj_set_style_text_font(info, &lv_font_montserrat_14, 0);
+    lv_obj_align(info, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    beacon_status_label = lv_label_create(content);
+    lv_label_set_text(beacon_status_label,
+                      wifi_attacks_is_beacon_spam_active() ? "Broadcasting..." : "Idle");
+    lv_obj_set_style_text_color(beacon_status_label, ui_accent_color(), 0);
+    lv_obj_set_style_text_font(beacon_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_align(beacon_status_label, LV_ALIGN_BOTTOM_LEFT, 0, -4);
+
+    beacon_startstop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(beacon_startstop_btn, 130, 42);
+    lv_obj_align(beacon_startstop_btn, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(beacon_startstop_btn, COLOR_MATERIAL_PINK, LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(beacon_startstop_btn, 8, 0);
+    beacon_startstop_lbl = lv_label_create(beacon_startstop_btn);
+    lv_label_set_text(beacon_startstop_lbl,
+                      wifi_attacks_is_beacon_spam_active() ? "Stop" : "Start");
+    lv_obj_set_style_text_font(beacon_startstop_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(beacon_startstop_lbl, lv_color_white(), 0);
+    lv_obj_center(beacon_startstop_lbl);
+    lv_obj_add_event_cb(beacon_startstop_btn, beacon_startstop_cb, LV_EVENT_CLICKED, NULL);
+
+    beacon_screen_active = true;
+    ui_locked = false;
+}
+
+// ============================================================================
+// Nmap scanner screen — LAN host discovery + TCP port scan over the WiFi STA
+// connection. Backend: nmap_scan.c. Results stream in via nmap_scan_poll_line()
+// which the main loop drains (see the nmap block there).
+// ============================================================================
+static void nmap_kb_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if ((code == LV_EVENT_READY || code == LV_EVENT_CANCEL) && nmap_keyboard) {
+        lv_obj_add_flag(nmap_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void nmap_ip_ta_event_cb(lv_event_t *e)
+{
+    (void)e;
+    if (nmap_keyboard) {
+        lv_keyboard_set_textarea(nmap_keyboard, nmap_ip_ta);
+        lv_obj_clear_flag(nmap_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void nmap_startstop_cb(lv_event_t *e)
+{
+    (void)e;
+    if (nmap_scan_is_active()) {
+        nmap_scan_stop();
+        if (nmap_startstop_lbl) lv_label_set_text(nmap_startstop_lbl, "Start");
+        return;
+    }
+
+    // Requires an active WiFi STA connection.
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+        if (nmap_results_ta) lv_textarea_add_text(nmap_results_ta, "Not connected. Join WiFi (STA) first.\n");
+        return;
+    }
+
+    // Parse target: blank = sweep the whole subnet, else a single host.
+    uint32_t single_ip = 0;
+    const char *ip = nmap_ip_ta ? lv_textarea_get_text(nmap_ip_ta) : "";
+    if (ip && ip[0]) {
+        single_ip = esp_ip4addr_aton(ip);   // network order, 0 if invalid
+        if (single_ip == 0) {
+            if (nmap_results_ta) lv_textarea_add_text(nmap_results_ta, "Invalid IP; blank = sweep subnet.\n");
+            return;
+        }
+    }
+
+    nmap_level_t lvl = NMAP_QUICK;
+    if (nmap_level_dd) {
+        uint32_t sel = lv_dropdown_get_selected(nmap_level_dd);
+        lvl = (sel == 2) ? NMAP_HEAVY : (sel == 1) ? NMAP_MEDIUM : NMAP_QUICK;
+    }
+
+    if (nmap_keyboard) lv_obj_add_flag(nmap_keyboard, LV_OBJ_FLAG_HIDDEN);
+    if (nmap_results_ta) lv_textarea_set_text(nmap_results_ta, "");
+    if (nmap_scan_start(single_ip, lvl)) {
+        if (nmap_startstop_lbl) lv_label_set_text(nmap_startstop_lbl, "Stop");
+    } else if (nmap_results_ta) {
+        lv_textarea_add_text(nmap_results_ta, "Failed to start scan.\n");
+    }
+}
+
+static void show_nmap_screen(void)
+{
+    ui_locked = true;
+    create_function_page_base("Nmap Scanner");
+
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 46);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 6, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *tl = lv_label_create(content);
+    lv_label_set_text(tl, "Target IP (blank = sweep subnet):");
+    lv_obj_set_style_text_color(tl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(tl, &lv_font_montserrat_12, 0);
+    lv_obj_align(tl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    nmap_ip_ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(nmap_ip_ta, true);
+    lv_textarea_set_placeholder_text(nmap_ip_ta, "192.168.1.10");
+    lv_obj_set_width(nmap_ip_ta, lv_pct(58));
+    lv_obj_align(nmap_ip_ta, LV_ALIGN_TOP_LEFT, 0, 16);
+    lv_obj_set_style_text_font(nmap_ip_ta, &lv_font_montserrat_14, 0);
+    lv_obj_add_event_cb(nmap_ip_ta, nmap_ip_ta_event_cb, LV_EVENT_CLICKED, NULL);
+
+    nmap_level_dd = lv_dropdown_create(content);
+    lv_dropdown_set_options(nmap_level_dd, "Quick 20\nMedium 50\nHeavy 100");
+    lv_obj_set_width(nmap_level_dd, lv_pct(38));
+    lv_obj_align(nmap_level_dd, LV_ALIGN_TOP_RIGHT, 0, 16);
+
+    nmap_status_label = lv_label_create(content);
+    lv_label_set_text(nmap_status_label, "Idle");
+    lv_obj_set_style_text_color(nmap_status_label, ui_accent_color(), 0);
+    lv_obj_set_style_text_font(nmap_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_align(nmap_status_label, LV_ALIGN_TOP_LEFT, 0, 52);
+
+    nmap_results_ta = lv_textarea_create(content);
+    lv_obj_set_size(nmap_results_ta, lv_pct(100), LCD_V_RES - 30 - 46 - 70 - 8);
+    lv_obj_align(nmap_results_ta, LV_ALIGN_TOP_MID, 0, 70);
+    lv_textarea_set_text(nmap_results_ta, "");
+    lv_obj_set_style_text_font(nmap_results_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(nmap_results_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(nmap_results_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(nmap_results_ta, ui_accent_color(), 0);
+    lv_obj_set_style_border_width(nmap_results_ta, 1, 0);
+    lv_obj_clear_flag(nmap_results_ta, LV_OBJ_FLAG_CLICK_FOCUSABLE);  // read-only log
+
+    nmap_startstop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(nmap_startstop_btn, 120, 40);
+    lv_obj_align(nmap_startstop_btn, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(nmap_startstop_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(nmap_startstop_btn, 8, 0);
+    nmap_startstop_lbl = lv_label_create(nmap_startstop_btn);
+    lv_label_set_text(nmap_startstop_lbl, "Start");
+    lv_obj_set_style_text_font(nmap_startstop_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(nmap_startstop_lbl, lv_color_white(), 0);
+    lv_obj_center(nmap_startstop_lbl);
+    lv_obj_add_event_cb(nmap_startstop_btn, nmap_startstop_cb, LV_EVENT_CLICKED, NULL);
+
+    // Numeric keyboard (digits + '.') for IP entry, hidden until the field is tapped.
+    nmap_keyboard = lv_keyboard_create(function_page);
+    lv_keyboard_set_mode(nmap_keyboard, LV_KEYBOARD_MODE_NUMBER);
+    lv_obj_add_flag(nmap_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_keyboard_set_textarea(nmap_keyboard, nmap_ip_ta);
+    lv_obj_add_event_cb(nmap_keyboard, nmap_kb_event_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(nmap_keyboard, nmap_kb_event_cb, LV_EVENT_CANCEL, NULL);
+
+    nmap_screen_active = true;
     ui_locked = false;
 }
 
