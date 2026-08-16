@@ -3247,6 +3247,30 @@ void app_main(void)
     disp_drv.user_data = panel_handle;
     lv_disp_drv_register(&disp_drv);
 
+    // lv_disp_drv_register allocates the lv_disp_t + default screen through
+    // lvgl_malloc(), which pulls from PSRAM first. On this ESP32-C5 rev v1.0 the
+    // PSRAM/MSPI init can be marginal (see the "dummy cacheline" boot error), so
+    // that allocation can transiently fail — leaving no default display. The next
+    // lv_scr_act() would then dereference a NULL lv_disp_t at ->act_scr (offset
+    // 0x20) and panic. Retry a few times before giving up so a flaky PSRAM hiccup
+    // doesn't brick the boot.
+    for (int attempt = 0; lv_scr_act() == NULL && attempt < 5; attempt++) {
+        ESP_LOGE(TAG, "LVGL display register produced no active screen (PSRAM alloc?) "
+                      "- retry %d/5", attempt + 1);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        lv_disp_drv_register(&disp_drv);
+    }
+    if (lv_scr_act() == NULL) {
+        // The display allocation failed this boot (transient PSRAM/MSPI issue).
+        // A full restart re-runs PSRAM timing tuning and usually catches a good
+        // boot, which is better than continuing headless or hard-faulting in the
+        // lv_obj_set_style_bg_color(lv_scr_act(), ...) call just below.
+        ESP_LOGE(TAG, "LVGL has no active screen after retries - PSRAM alloc failed this "
+                      "boot; restarting to re-init PSRAM...");
+        vTaskDelay(pdMS_TO_TICKS(200));   // let the log flush over UART
+        esp_restart();
+    }
+
     const esp_lcd_panel_io_callbacks_t cbs = {
         .on_color_trans_done = on_color_trans_done,
     };
