@@ -10539,7 +10539,7 @@ static void show_wifi_connect_screen(void)
     
     wifi_connect_btn = lv_btn_create(function_page);
     lv_obj_set_size(wifi_connect_btn, 120, 40);
-    lv_obj_align(wifi_connect_btn, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+    lv_obj_align(wifi_connect_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_border_width(wifi_connect_btn, 0, 0);
     lv_obj_set_style_radius(wifi_connect_btn, 8, 0);
     lv_obj_t *conn_lbl = lv_label_create(wifi_connect_btn);
@@ -10554,7 +10554,7 @@ static void show_wifi_connect_screen(void)
 
     wifi_connect_next_btn = lv_btn_create(function_page);
     lv_obj_set_size(wifi_connect_next_btn, 120, 40);
-    lv_obj_align(wifi_connect_next_btn, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+    lv_obj_align(wifi_connect_next_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(wifi_connect_next_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(wifi_connect_next_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(wifi_connect_next_btn, 0, 0);
@@ -13915,6 +13915,9 @@ static void show_evil_twin_page(void)
 
     evil_twin_start_btn = lv_btn_create(evil_twin_content);
     lv_obj_set_size(evil_twin_start_btn, 150, 35);
+    // Pull out of the flex flow so it centers at the bottom without centering the labels above
+    lv_obj_add_flag(evil_twin_start_btn, LV_OBJ_FLAG_FLOATING);
+    lv_obj_align(evil_twin_start_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
     lv_obj_set_style_bg_color(evil_twin_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(evil_twin_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(evil_twin_start_btn, 0, 0);
