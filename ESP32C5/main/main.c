@@ -3480,9 +3480,12 @@ void app_main(void)
         return;
     }
 
-    // For 32-bit color depth, we need to reduce buffer size due to memory constraints
-    // 15 lines * 480 pixels * 4 bytes = 28.8 KB per buffer (vs 28.8 KB for 30 lines @ 16-bit)
-    const size_t buf_size = LCD_H_RES * 15 * sizeof(lv_color_t);
+    // Draw buffers come from DMA-capable internal RAM, which is scarce on the C5
+    // (WiFi/coex/BT + SD-SPI all compete for it). 10 lines keeps LVGL smooth while
+    // leaving more DMA headroom so runtime SD-SPI transactions (File Manager,
+    // wardrive, uploads) can still allocate their bounce buffers.
+    #define LVGL_DRAW_LINES 10
+    const size_t buf_size = LCD_H_RES * LVGL_DRAW_LINES * sizeof(lv_color_t);
     buf1 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, 0);
     buf2 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, 0);
     if (buf1 == NULL || buf2 == NULL) {
@@ -3491,7 +3494,7 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "Display buffers allocated: buf1=%p, buf2=%p (size: %zu bytes each)", buf1, buf2, buf_size);
 
-    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, LCD_H_RES * 15);
+    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, LCD_H_RES * LVGL_DRAW_LINES);
     static lv_disp_drv_t disp_drv;
     lv_disp_drv_init(&disp_drv);
     disp_drv.hor_res = LCD_H_RES;
@@ -3537,8 +3540,8 @@ void app_main(void)
     // and later crashed in lv_obj_set_style_bg_color(lv_scr_act(), ...). Clear
     // exactly buf_size and draw in 15-line chunks that fit the buffer.
     memset((void *)buf1, 0, buf_size);
-    for (int y = 0; y < LCD_V_RES; y += 15) {
-        int lines = (y + 15 <= LCD_V_RES) ? 15 : (LCD_V_RES - y);
+    for (int y = 0; y < LCD_V_RES; y += LVGL_DRAW_LINES) {
+        int lines = (y + LVGL_DRAW_LINES <= LCD_V_RES) ? LVGL_DRAW_LINES : (LCD_V_RES - y);
         esp_lcd_panel_draw_bitmap(panel_handle, 0, y, LCD_H_RES, y + lines, buf1);
     }
     
@@ -14096,7 +14099,7 @@ static void show_attack_tiles_screen(void)
     lv_obj_set_style_pad_all(attack_tiles, 5, 0);
     lv_obj_set_style_pad_gap(attack_tiles, 5, 0);
     lv_obj_set_flex_flow(attack_tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(attack_tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(attack_tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
     // Vertically scrollable: the attack list now wraps to 3 rows (11 tiles),
     // so allow scrolling to reach the last row instead of clipping it.
     lv_obj_set_scroll_dir(attack_tiles, LV_DIR_VER);
@@ -15140,7 +15143,7 @@ static void show_settings_screen(void)
     lv_obj_set_style_pad_all(tiles, 10, 0);
     lv_obj_set_style_pad_gap(tiles, 10, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
     
     // Compromised Data - Blue
     create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Compromised\nData", COLOR_TILE_BLUE, settings_tile_event_cb, "Compromised Data");
@@ -15193,7 +15196,7 @@ static void show_wifi_monitor_screen(void)
     lv_obj_set_style_pad_all(tiles, 10, 0);
     lv_obj_set_style_pad_gap(tiles, 10, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
     
     // Evil Twin Passwords - Blue
     create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Evil Twin\nPasswords", COLOR_TILE_BLUE, wifi_monitor_tile_event_cb, "Evil Twin Passwords");
@@ -15218,7 +15221,7 @@ static void show_bluetooth_screen(void)
     lv_obj_set_style_pad_all(tiles, 10, 0);
     lv_obj_set_style_pad_gap(tiles, 10, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
     
     // AirTag scan - stub - Apple-like gray
     lv_obj_t *airtag_tile = create_tile(tiles, LV_SYMBOL_GPS, "AirTag\nscan", lv_color_make(142, 142, 147), NULL, NULL);
@@ -19257,28 +19260,18 @@ static void fm_refresh(void)
                      (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
                     continue;
                 }
-                char full[FM_PATH_MAX];
-                snprintf(full, sizeof(full), "%s/%s", fm_cwd, ent->d_name);
-                struct stat st;
+                // Use the dirent type directly — a stat() per entry is a separate
+                // SD-SPI transaction, and a burst of them exhausts DMA-capable RAM.
                 bool isdir = (ent->d_type == DT_DIR);
-                long fsize = 0;
-                if (stat(full, &st) == 0) {
-                    isdir = S_ISDIR(st.st_mode);
-                    fsize = (long)st.st_size;
-                }
                 if ((pass == 0) != isdir) continue;   // pass 0 = dirs, pass 1 = files
 
                 int i = fm_entry_count;
-                strncpy(fm_entry_paths[i], full, sizeof(fm_entry_paths[0]) - 1);
-                fm_entry_paths[i][sizeof(fm_entry_paths[0]) - 1] = '\0';
+                snprintf(fm_entry_paths[i], sizeof(fm_entry_paths[0]), "%s/%s", fm_cwd, ent->d_name);
+
                 fm_entry_isdir[i] = isdir;
 
                 char label[256];
-                if (isdir) {
-                    snprintf(label, sizeof(label), "%.240s", ent->d_name);
-                } else {
-                    snprintf(label, sizeof(label), "%.200s  (%ld B)", ent->d_name, fsize);
-                }
+                snprintf(label, sizeof(label), "%.240s", ent->d_name);
                 lv_obj_t *btn = lv_list_add_btn(fm_list,
                                                 isdir ? LV_SYMBOL_DIRECTORY : LV_SYMBOL_FILE,
                                                 label);
