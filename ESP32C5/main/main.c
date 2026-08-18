@@ -1072,6 +1072,14 @@ static volatile bool beacon_screen_active = false;
 static char beacon_ui_ssids[BEACON_MAX_UI_SSIDS][33];
 static int  beacon_ui_ssid_count = 0;
 
+// Admin Portal UI state — WPA2 AP "JanOS-Admin" with a web file manager.
+static lv_obj_t *admin_pw_ta          = NULL;   // WPA2 password entry
+static lv_obj_t *admin_status_label   = NULL;
+static lv_obj_t *admin_startstop_btn  = NULL;
+static lv_obj_t *admin_startstop_lbl  = NULL;
+static lv_obj_t *admin_keyboard       = NULL;
+static volatile bool admin_screen_active = false;
+
 // Battery voltage monitor state (DISABLED - using regular C5 chip)
 static lv_obj_t *battery_label = NULL;  // Keep for UI layout
 static char last_voltage_str[32] = "-.--V";  // Persisted across screen changes
@@ -1290,6 +1298,16 @@ static void reset_function_page_children(void) {
     beacon_startstop_btn = NULL;
     beacon_startstop_lbl = NULL;
     beacon_screen_active = false;
+    // Admin Portal: tear down the AP/HTTP/DNS on any nav away so it can't linger.
+    if (admin_screen_active && wifi_attacks_is_admin_portal_active()) {
+        wifi_attacks_stop_admin_portal();
+    }
+    admin_pw_ta = NULL;
+    admin_status_label = NULL;
+    admin_startstop_btn = NULL;
+    admin_startstop_lbl = NULL;
+    admin_keyboard = NULL;
+    admin_screen_active = false;
     wifi_connect_ta = NULL;
     wifi_connect_keyboard = NULL;
     wifi_connect_status_label = NULL;
@@ -1466,6 +1484,12 @@ static void show_nmap_screen(void);
 static void nmap_startstop_cb(lv_event_t *e);
 static void nmap_ip_ta_event_cb(lv_event_t *e);
 static void nmap_kb_event_cb(lv_event_t *e);
+
+// Admin Portal UI
+static void show_admin_portal_screen(void);
+static void admin_startstop_cb(lv_event_t *e);
+static void admin_pw_ta_event_cb(lv_event_t *e);
+static void admin_kb_event_cb(lv_event_t *e);
 
 // Beacon Spam UI
 static void show_beacon_spam_screen(void);
@@ -8811,7 +8835,7 @@ static void show_karma_page(void)
     lv_obj_set_style_pad_all(karma_btn_row, 0, 0);
     lv_obj_set_style_pad_gap(karma_btn_row, 10, 0);
     lv_obj_set_flex_flow(karma_btn_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(karma_btn_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(karma_btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(karma_btn_row, LV_OBJ_FLAG_SCROLLABLE);
 
     // Start Karma button
@@ -9208,6 +9232,9 @@ static void show_portal_page(void)
     // Start Portal button
     portal_start_btn = lv_btn_create(portal_content);
     lv_obj_set_size(portal_start_btn, 140, 35);
+    // Pull out of the flex flow so it centers at the bottom without centering the labels above
+    lv_obj_add_flag(portal_start_btn, LV_OBJ_FLAG_FLOATING);
+    lv_obj_align(portal_start_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
     lv_obj_set_style_bg_color(portal_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(portal_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(portal_start_btn, 0, 0);
@@ -12692,6 +12719,10 @@ static void show_global_attacks_screen(void)
     // Beacon Spam tile - Pink: flood fake AP beacons from an SSID list
     lv_obj_t *beacon_tile = create_tile(tiles, LV_SYMBOL_WIFI, "Beacon\nSpam", COLOR_MATERIAL_PINK, NULL, NULL);
     lv_obj_add_event_cb(beacon_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Beacon Spam");
+
+    // Admin Portal tile - Teal: WPA2 AP + web file manager for /sdcard/lab
+    lv_obj_t *admin_tile = create_tile(tiles, LV_SYMBOL_SD_CARD, "Admin\nPortal", COLOR_MATERIAL_TEAL, NULL, NULL);
+    lv_obj_add_event_cb(admin_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Admin Portal");
 }
 
 // WiFi Sniff & Karma screen
@@ -14768,6 +14799,11 @@ void attack_event_cb(lv_event_t *e)
 
     if (strcmp(attack_name, "Beacon Spam") == 0) {
         show_beacon_spam_screen();
+        return;
+    }
+
+    if (strcmp(attack_name, "Admin Portal") == 0) {
+        show_admin_portal_screen();
         return;
     }
 
@@ -17069,6 +17105,121 @@ static void show_nmap_screen(void)
     lv_obj_add_event_cb(nmap_keyboard, nmap_kb_event_cb, LV_EVENT_CANCEL, NULL);
 
     nmap_screen_active = true;
+    ui_locked = false;
+}
+
+// ============================================================================
+// Admin Portal screen — WPA2 AP "JanOS-Admin" serving a web file manager for
+// /sdcard/lab. Backend lives in wifi_attacks (AP + HTTP + DNS). Enter a WPA2
+// password (8-63 chars), Start, then join the AP and browse http://172.0.0.1.
+// ============================================================================
+static void admin_kb_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if ((code == LV_EVENT_READY || code == LV_EVENT_CANCEL) && admin_keyboard) {
+        lv_obj_add_flag(admin_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void admin_pw_ta_event_cb(lv_event_t *e)
+{
+    (void)e;
+    if (admin_keyboard) {
+        lv_keyboard_set_textarea(admin_keyboard, admin_pw_ta);
+        lv_obj_clear_flag(admin_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void admin_startstop_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wifi_attacks_is_admin_portal_active()) {
+        wifi_attacks_stop_admin_portal();
+        if (admin_startstop_lbl) lv_label_set_text(admin_startstop_lbl, "Start");
+        if (admin_status_label)  lv_label_set_text(admin_status_label, "Stopped.");
+        return;
+    }
+    const char *pw = admin_pw_ta ? lv_textarea_get_text(admin_pw_ta) : "";
+    size_t pwlen = pw ? strlen(pw) : 0;
+    if (pwlen < 8 || pwlen > 63) {
+        if (admin_status_label) lv_label_set_text(admin_status_label, "Password must be 8-63 chars.");
+        return;
+    }
+    if (!ensure_wifi_mode()) {
+        if (admin_status_label) lv_label_set_text(admin_status_label, "WiFi init failed.");
+        return;
+    }
+    if (admin_keyboard) lv_obj_add_flag(admin_keyboard, LV_OBJ_FLAG_HIDDEN);
+    if (wifi_attacks_start_admin_portal(pw) == ESP_OK) {
+        if (admin_startstop_lbl) lv_label_set_text(admin_startstop_lbl, "Stop");
+        if (admin_status_label)
+            lv_label_set_text(admin_status_label,
+                              "Live: join 'JanOS-Admin'\nthen open http://172.0.0.1");
+    } else if (admin_status_label) {
+        lv_label_set_text(admin_status_label, "Failed (SD missing or busy).");
+    }
+}
+
+static void show_admin_portal_screen(void)
+{
+    ui_locked = true;
+    create_function_page_base("Admin Portal");
+
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 8, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *info = lv_label_create(content);
+    lv_label_set_text(info,
+                      "WPA2 AP 'JanOS-Admin' + web file\n"
+                      "manager for /sdcard/lab.\n"
+                      "Set a password (8-63 chars):");
+    lv_obj_set_style_text_color(info, ui_text_color(), 0);
+    lv_obj_set_style_text_font(info, &lv_font_montserrat_14, 0);
+    lv_obj_align(info, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    admin_pw_ta = lv_textarea_create(content);
+    lv_textarea_set_one_line(admin_pw_ta, true);
+    lv_textarea_set_password_mode(admin_pw_ta, true);
+    lv_textarea_set_placeholder_text(admin_pw_ta, "password");
+    lv_obj_set_width(admin_pw_ta, lv_pct(100));
+    lv_obj_align(admin_pw_ta, LV_ALIGN_TOP_LEFT, 0, 58);
+    lv_obj_set_style_text_font(admin_pw_ta, &lv_font_montserrat_14, 0);
+    lv_obj_add_event_cb(admin_pw_ta, admin_pw_ta_event_cb, LV_EVENT_CLICKED, NULL);
+
+    admin_status_label = lv_label_create(content);
+    lv_label_set_text(admin_status_label,
+                      wifi_attacks_is_admin_portal_active() ? "Live." : "Idle");
+    lv_obj_set_style_text_color(admin_status_label, ui_accent_color(), 0);
+    lv_obj_set_style_text_font(admin_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(admin_status_label, LV_ALIGN_TOP_LEFT, 0, 100);
+
+    admin_startstop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(admin_startstop_btn, 130, 42);
+    lv_obj_align(admin_startstop_btn, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(admin_startstop_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(admin_startstop_btn, 8, 0);
+    admin_startstop_lbl = lv_label_create(admin_startstop_btn);
+    lv_label_set_text(admin_startstop_lbl,
+                      wifi_attacks_is_admin_portal_active() ? "Stop" : "Start");
+    lv_obj_set_style_text_font(admin_startstop_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(admin_startstop_lbl, lv_color_white(), 0);
+    lv_obj_center(admin_startstop_lbl);
+    lv_obj_add_event_cb(admin_startstop_btn, admin_startstop_cb, LV_EVENT_CLICKED, NULL);
+
+    // Full text keyboard for the WPA2 password, hidden until the field is tapped.
+    admin_keyboard = lv_keyboard_create(function_page);
+    lv_keyboard_set_mode(admin_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_obj_add_flag(admin_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_keyboard_set_textarea(admin_keyboard, admin_pw_ta);
+    lv_obj_add_event_cb(admin_keyboard, admin_kb_event_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(admin_keyboard, admin_kb_event_cb, LV_EVENT_CANCEL, NULL);
+
+    admin_screen_active = true;
     ui_locked = false;
 }
 

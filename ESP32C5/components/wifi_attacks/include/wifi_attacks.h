@@ -154,6 +154,23 @@ esp_err_t wifi_attacks_stop_beacon_spam(void);
 bool wifi_attacks_is_beacon_spam_active(void);
 
 // ============================================================================
+// ADMIN PORTAL
+// ============================================================================
+
+/**
+ * @brief Start the admin portal — WPA2 AP "JanOS-Admin" serving a web file
+ *        manager for /sdcard/lab (tree, upload/download, rename/delete, edit).
+ * @param password WPA2 password (8-63 chars). Required.
+ */
+esp_err_t wifi_attacks_start_admin_portal(const char *password);
+
+/** @brief Stop the admin portal (HTTP + DNS + AP). */
+esp_err_t wifi_attacks_stop_admin_portal(void);
+
+/** @brief True while the admin portal is running. */
+bool wifi_attacks_is_admin_portal_active(void);
+
+// ============================================================================
 // KARMA ATTACK
 // ============================================================================
 
