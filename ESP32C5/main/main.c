@@ -1074,6 +1074,8 @@ static int  beacon_ui_ssid_count = 0;
 
 // Admin Portal UI state — WPA2 AP "JanOS-Admin" with a web file manager.
 static lv_obj_t *admin_pw_ta          = NULL;   // WPA2 password entry
+static lv_obj_t *admin_pw_eye_btn     = NULL;   // show/hide toggle
+static lv_obj_t *admin_pw_eye_lbl     = NULL;
 static lv_obj_t *admin_status_label   = NULL;
 static lv_obj_t *admin_startstop_btn  = NULL;
 static lv_obj_t *admin_startstop_lbl  = NULL;
@@ -1303,6 +1305,8 @@ static void reset_function_page_children(void) {
         wifi_attacks_stop_admin_portal();
     }
     admin_pw_ta = NULL;
+    admin_pw_eye_btn = NULL;
+    admin_pw_eye_lbl = NULL;
     admin_status_label = NULL;
     admin_startstop_btn = NULL;
     admin_startstop_lbl = NULL;
@@ -1489,6 +1493,7 @@ static void nmap_kb_event_cb(lv_event_t *e);
 static void show_admin_portal_screen(void);
 static void admin_startstop_cb(lv_event_t *e);
 static void admin_pw_ta_event_cb(lv_event_t *e);
+static void admin_pw_toggle_cb(lv_event_t *e);
 static void admin_kb_event_cb(lv_event_t *e);
 
 // Beacon Spam UI
@@ -17130,6 +17135,18 @@ static void admin_pw_ta_event_cb(lv_event_t *e)
     }
 }
 
+// Show/hide the WPA2 password characters.
+static void admin_pw_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!admin_pw_ta) return;
+    bool hidden = lv_textarea_get_password_mode(admin_pw_ta);
+    lv_textarea_set_password_mode(admin_pw_ta, !hidden);
+    // After the flip: was-hidden -> now visible (open eye); was-visible -> now masked (closed eye)
+    if (admin_pw_eye_lbl)
+        lv_label_set_text(admin_pw_eye_lbl, hidden ? LV_SYMBOL_EYE_OPEN : LV_SYMBOL_EYE_CLOSE);
+}
+
 static void admin_startstop_cb(lv_event_t *e)
 {
     (void)e;
@@ -17186,10 +17203,24 @@ static void show_admin_portal_screen(void)
     lv_textarea_set_one_line(admin_pw_ta, true);
     lv_textarea_set_password_mode(admin_pw_ta, true);
     lv_textarea_set_placeholder_text(admin_pw_ta, "password");
-    lv_obj_set_width(admin_pw_ta, lv_pct(100));
+    lv_obj_set_width(admin_pw_ta, lv_pct(82));
     lv_obj_align(admin_pw_ta, LV_ALIGN_TOP_LEFT, 0, 58);
     lv_obj_set_style_text_font(admin_pw_ta, &lv_font_montserrat_14, 0);
     lv_obj_add_event_cb(admin_pw_ta, admin_pw_ta_event_cb, LV_EVENT_CLICKED, NULL);
+
+    // Show/hide (eye) toggle to the right of the password field. Field starts
+    // masked, so the closed-eye icon shows first.
+    admin_pw_eye_btn = lv_btn_create(content);
+    lv_obj_set_size(admin_pw_eye_btn, 46, 38);
+    lv_obj_align_to(admin_pw_eye_btn, admin_pw_ta, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
+    lv_obj_set_style_bg_color(admin_pw_eye_btn, ui_accent_color(), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(admin_pw_eye_btn, 8, 0);
+    admin_pw_eye_lbl = lv_label_create(admin_pw_eye_btn);
+    lv_label_set_text(admin_pw_eye_lbl, LV_SYMBOL_EYE_CLOSE);
+    lv_obj_set_style_text_font(admin_pw_eye_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(admin_pw_eye_lbl, lv_color_white(), 0);
+    lv_obj_center(admin_pw_eye_lbl);
+    lv_obj_add_event_cb(admin_pw_eye_btn, admin_pw_toggle_cb, LV_EVENT_CLICKED, NULL);
 
     admin_status_label = lv_label_create(content);
     lv_label_set_text(admin_status_label,
