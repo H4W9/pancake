@@ -10858,11 +10858,30 @@ static void main_tile_event_cb(lv_event_t *e)
 }
 
 // Attack tile event callback - after selecting networks
+// True for offensive attacks that Red Team mode gates (mirrors the reference).
+static bool attack_is_offensive(const char *name)
+{
+    static const char *offensive[] = {
+        "Blackout", "Handshakes", "Handshaker", "Portal", "Snifferdog",
+        "Beacon Spam", "Deauth", "Evil Twin", "SAE Overflow",
+        "ARP Poison", "MITM", "Rogue AP",
+    };
+    for (size_t i = 0; i < sizeof(offensive) / sizeof(offensive[0]); i++)
+        if (strcmp(name, offensive[i]) == 0) return true;
+    return false;
+}
+
 static void attack_tile_event_cb(lv_event_t *e)
 {
     const char *attack_name = (const char *)lv_event_get_user_data(e);
     if (!attack_name) return;
-    
+
+    // Red Team gate: refuse offensive attacks when the mode is off.
+    if (!g_redteam_mode && attack_is_offensive(attack_name)) {
+        ESP_LOGW(TAG, "%s blocked — Red Team mode is off", attack_name);
+        return;
+    }
+
     // Route to existing attack handlers
     if (strcmp(attack_name, "Deauth") == 0) {
         // Redirect to "Deauther" handler in attack_event_cb with a synthetic event
@@ -14217,7 +14236,8 @@ static void show_global_attacks_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
 
-    // Offensive tiles (Blackout / Handshaker / Portal / Beacon) — Red Team only.
+    // Offensive tiles — Red Team only (mirrors the reference: Blackout,
+    // Handshaker, Portal, SnifferDog and Beacon Spam are all gated).
     if (g_redteam_mode) {
         // Blackout tile - Red (dangerous)
         lv_obj_t *blackout_tile = create_tile(tiles, LV_SYMBOL_POWER, "Blackout", COLOR_MATERIAL_RED, NULL, NULL);
@@ -14230,21 +14250,19 @@ static void show_global_attacks_screen(void)
         // Portal tile - Orange
         lv_obj_t *portal_tile = create_tile(tiles, LV_SYMBOL_WIFI, "Portal", COLOR_MATERIAL_ORANGE, NULL, NULL);
         lv_obj_add_event_cb(portal_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Portal");
-    }
 
-    // Snifferdog tile - Purple (deauth-detection / recon)
-    lv_obj_t *snifferdog_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Sniffer dog", COLOR_MATERIAL_PURPLE, NULL, NULL);
-    lv_obj_add_event_cb(snifferdog_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Snifferdog");
+        // Snifferdog tile - Purple (deauth flood — offensive)
+        lv_obj_t *snifferdog_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Sniffer dog", COLOR_MATERIAL_PURPLE, NULL, NULL);
+        lv_obj_add_event_cb(snifferdog_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Snifferdog");
 
-    // Wardrive tile - Teal (recon)
-    lv_obj_t *wardrive_tile = create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, NULL, NULL);
-    lv_obj_add_event_cb(wardrive_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Start Wardrive");
-
-    // Beacon Spam tile - Pink: flood fake AP beacons (offensive, Red Team only)
-    if (g_redteam_mode) {
+        // Beacon Spam tile - Pink: flood fake AP beacons
         lv_obj_t *beacon_tile = create_tile(tiles, LV_SYMBOL_WIFI, "Beacon\nSpam", COLOR_MATERIAL_PINK, NULL, NULL);
         lv_obj_add_event_cb(beacon_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Beacon Spam");
     }
+
+    // Wardrive tile - Teal (recon) — always available.
+    lv_obj_t *wardrive_tile = create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, NULL, NULL);
+    lv_obj_add_event_cb(wardrive_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Start Wardrive");
 }
 
 // WiFi Sniff & Karma screen
@@ -15714,6 +15732,12 @@ void attack_event_cb(lv_event_t *e)
 {
     const char *attack_name = (const char *)lv_event_get_user_data(e);
     if (!attack_name) return;
+
+    // Red Team gate: refuse offensive attacks when the mode is off.
+    if (!g_redteam_mode && attack_is_offensive(attack_name)) {
+        ESP_LOGW(TAG, "%s blocked — Red Team mode is off", attack_name);
+        return;
+    }
 
     if (strcmp(attack_name, "Scan") == 0) {
         // Ensure WiFi mode is active (switch from BLE if needed)
