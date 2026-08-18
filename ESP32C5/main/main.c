@@ -1205,7 +1205,7 @@ static volatile bool admin_screen_active = false;
 static lv_obj_t *fm_list       = NULL;
 static lv_obj_t *fm_path_label = NULL;
 static char fm_cwd[128] = FM_ROOT;       // kept < FM_PATH_MAX-256 so path joins can't overflow
-static char fm_entry_paths[FM_MAX_ENTRIES][FM_PATH_MAX];
+static char (*fm_entry_paths)[FM_PATH_MAX] = NULL;   // lazily allocated in PSRAM (keeps BSS small)
 static bool fm_entry_isdir[FM_MAX_ENTRIES];
 static int  fm_entry_count = 0;
 static char fm_pending_path[FM_PATH_MAX] = "";   // file targeted by the action popup
@@ -13558,7 +13558,7 @@ static void show_wpa_sec_upload_page(void)
 
 // SD file picker state for choosing a WiGLE key file
 #define WIGLE_PICK_MAX 32
-static char wigle_pick_paths[WIGLE_PICK_MAX][300];
+static char (*wigle_pick_paths)[300] = NULL;   // lazily allocated in PSRAM
 static int  wigle_pick_count = 0;
 
 // Parse "apiName:apiToken" from the first non-empty line of a file into
@@ -14014,6 +14014,11 @@ static void wigle_keyfile_pick_cb(lv_event_t *e)
 // Scan a directory for *.txt candidates and add them to the picker list.
 static void wigle_scan_dir_for_keys(lv_obj_t *list, const char *dirpath)
 {
+    if (!wigle_pick_paths) {
+        wigle_pick_paths = heap_caps_malloc((size_t)WIGLE_PICK_MAX * 300, MALLOC_CAP_SPIRAM);
+        if (!wigle_pick_paths) wigle_pick_paths = malloc((size_t)WIGLE_PICK_MAX * 300);
+    }
+    if (!wigle_pick_paths) return;
     if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
         DIR *d = opendir(dirpath);
         if (d) {
@@ -18161,7 +18166,7 @@ typedef struct {
     bool    following;       // max_dist_m has crossed the alert threshold
 } antisurv_dev_t;
 
-static antisurv_dev_t antisurv_devs[ANTISURV_MAX];
+static antisurv_dev_t *antisurv_devs = NULL;   // lazily allocated in PSRAM
 static int  antisurv_count = 0;
 
 static int antisurv_find(const uint8_t *addr)
@@ -18189,7 +18194,7 @@ static void antisurv_scan_task(void *pvParameters)
 static void antisurv_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
-    if (!antisurv_active) return;
+    if (!antisurv_active || !antisurv_devs) return;
 
     int64_t now = esp_timer_get_time();
 
@@ -18302,7 +18307,18 @@ static void show_antisurv_screen(void)
 
     create_function_page_base("Anti-Surveillance");
     antisurv_count = 0;
-    memset(antisurv_devs, 0, sizeof(antisurv_devs));
+    if (!antisurv_devs) {
+        antisurv_devs = heap_caps_malloc((size_t)ANTISURV_MAX * sizeof(antisurv_dev_t), MALLOC_CAP_SPIRAM);
+        if (!antisurv_devs) antisurv_devs = malloc((size_t)ANTISURV_MAX * sizeof(antisurv_dev_t));
+    }
+    if (!antisurv_devs) {
+        lv_obj_t *err = lv_label_create(function_page);
+        lv_label_set_text(err, "Out of memory");
+        lv_obj_center(err);
+        ui_locked = false;
+        return;
+    }
+    memset(antisurv_devs, 0, (size_t)ANTISURV_MAX * sizeof(antisurv_dev_t));
 
     antisurv_content = lv_obj_create(function_page);
     lv_obj_set_size(antisurv_content, lv_pct(100), LCD_V_RES - 30 - 50);
@@ -19212,7 +19228,7 @@ static void fm_up_cb(lv_event_t *e)
 // Rebuild the entry list for fm_cwd (directories first, then files).
 static void fm_refresh(void)
 {
-    if (!fm_list || !lv_obj_is_valid(fm_list)) return;
+    if (!fm_list || !lv_obj_is_valid(fm_list) || !fm_entry_paths) return;
     lv_obj_clean(fm_list);
     fm_entry_count = 0;
 
@@ -19286,6 +19302,19 @@ static void show_file_manager_screen(void)
     create_function_page_base("File Manager");
     fm_popup = NULL;
     strcpy(fm_cwd, FM_ROOT);
+
+    // Path table lives in PSRAM (allocated once) to keep internal RAM free.
+    if (!fm_entry_paths) {
+        fm_entry_paths = heap_caps_malloc((size_t)FM_MAX_ENTRIES * FM_PATH_MAX, MALLOC_CAP_SPIRAM);
+        if (!fm_entry_paths) fm_entry_paths = malloc((size_t)FM_MAX_ENTRIES * FM_PATH_MAX);
+    }
+    if (!fm_entry_paths) {
+        lv_obj_t *err = lv_label_create(function_page);
+        lv_label_set_text(err, "Out of memory");
+        lv_obj_center(err);
+        ui_locked = false;
+        return;
+    }
 
     // Ensure SD is mounted before browsing.
     ensure_sd_mounted();
