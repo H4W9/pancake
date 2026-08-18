@@ -1156,14 +1156,15 @@ static volatile bool admin_screen_active = false;
 
 // File Manager UI state — on-device SD browser rooted at /sdcard.
 #define FM_ROOT "/sdcard"
-#define FM_MAX_ENTRIES 96
+#define FM_MAX_ENTRIES 64
+#define FM_PATH_MAX 384        // >= sizeof(fm_cwd) + 1 + NAME_MAX(255) + 1 to avoid format-truncation
 static lv_obj_t *fm_list       = NULL;
 static lv_obj_t *fm_path_label = NULL;
-static char fm_cwd[192] = FM_ROOT;
-static char fm_entry_paths[FM_MAX_ENTRIES][224];
+static char fm_cwd[128] = FM_ROOT;       // kept < FM_PATH_MAX-256 so path joins can't overflow
+static char fm_entry_paths[FM_MAX_ENTRIES][FM_PATH_MAX];
 static bool fm_entry_isdir[FM_MAX_ENTRIES];
 static int  fm_entry_count = 0;
-static char fm_pending_path[224] = "";   // file targeted by the action popup
+static char fm_pending_path[FM_PATH_MAX] = "";   // file targeted by the action popup
 
 // Battery voltage monitor state (DISABLED - using regular C5 chip)
 static lv_obj_t *battery_label = NULL;  // Keep for UI layout
@@ -13044,7 +13045,7 @@ static void show_wpa_sec_upload_page(void)
 
 // SD file picker state for choosing a WiGLE key file
 #define WIGLE_PICK_MAX 32
-static char wigle_pick_paths[WIGLE_PICK_MAX][160];
+static char wigle_pick_paths[WIGLE_PICK_MAX][300];
 static int  wigle_pick_count = 0;
 
 // Parse "apiName:apiToken" from the first non-empty line of a file into
@@ -18328,6 +18329,8 @@ static void fm_entry_cb(lv_event_t *e)
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= fm_entry_count) return;
     if (fm_entry_isdir[idx]) {
+        // Only descend if the path fits fm_cwd (very deep trees are not navigable).
+        if (strlen(fm_entry_paths[idx]) >= sizeof(fm_cwd)) return;
         strncpy(fm_cwd, fm_entry_paths[idx], sizeof(fm_cwd) - 1);
         fm_cwd[sizeof(fm_cwd) - 1] = '\0';
         fm_refresh();
@@ -18382,7 +18385,7 @@ static void fm_refresh(void)
                      (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
                     continue;
                 }
-                char full[224];
+                char full[FM_PATH_MAX];
                 snprintf(full, sizeof(full), "%s/%s", fm_cwd, ent->d_name);
                 struct stat st;
                 bool isdir = (ent->d_type == DT_DIR);
@@ -18400,9 +18403,9 @@ static void fm_refresh(void)
 
                 char label[256];
                 if (isdir) {
-                    snprintf(label, sizeof(label), "%s", ent->d_name);
+                    snprintf(label, sizeof(label), "%.240s", ent->d_name);
                 } else {
-                    snprintf(label, sizeof(label), "%s  (%ld B)", ent->d_name, fsize);
+                    snprintf(label, sizeof(label), "%.200s  (%ld B)", ent->d_name, fsize);
                 }
                 lv_obj_t *btn = lv_list_add_btn(fm_list,
                                                 isdir ? LV_SYMBOL_DIRECTORY : LV_SYMBOL_FILE,
