@@ -222,6 +222,15 @@ static int bt_device_count = 0;
 
 static bool dark_mode_enabled = true;
 
+// Feature settings persisted in NVS (see nvs_settings_load / nvs_save_enqueue).
+static bool     g_redteam_mode      = true;   // true = offensive attacks visible
+static bool     wd_scan_5ghz        = true;   // include 5 GHz channels in wardrive
+static uint8_t  wd_rssi_relog_delta = 0;      // re-log AP on RSSI change >= this dBm (0 = off)
+static bool     wd_require_gps       = true;  // wait for a GPS fix before logging
+static uint8_t  wd_mem_cap_mb        = 4;     // max PSRAM (MB) the wardrive buffer may grow to
+static uint16_t antisurv_sens_m      = 100;   // anti-surv "following" alert distance (m)
+static bool     wd_home_upload       = false; // auto-upload on home network (default OFF)
+
 static inline lv_color_t ui_bg_color(void) {
     return dark_mode_enabled ? COLOR_DARK_BG : COLOR_LIGHT_BG;
 }
@@ -304,6 +313,13 @@ static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel 
 #define NVS_KEY_SCAN_MAX    "scan_max"
 #define NVS_KEY_DARK_MODE   "dark_mode"
 #define NVS_KEY_MAX_POWER   "max_power"
+#define NVS_KEY_REDTEAM     "redteam"
+#define NVS_KEY_WD_5GHZ     "wd_5ghz"
+#define NVS_KEY_WD_RSSIDLT  "wd_rssidelta"
+#define NVS_KEY_WD_REQGPS   "wd_reqgps"
+#define NVS_KEY_WD_MEMCAP   "wd_memcap"
+#define NVS_KEY_ANTISURV_M  "antisurv_m"
+#define NVS_KEY_WD_HOMEUP   "wd_homeup"
 
 // ============================================================================
 // Theme-aware style helpers
@@ -749,6 +765,7 @@ typedef struct {
     bool     last_logged_valid; // last_logged_lat/lon hold a real written position
     double   last_logged_lat;   // GPS position of the most recent row written (trilateration)
     double   last_logged_lon;
+    int8_t   last_logged_rssi;  // RSSI at the last written row (RSSI-change re-log)
 } wdp_network_t;
 
 // Wardrive KML trace (drive path + Wi-Fi/BLE POIs), written alongside the .log.
@@ -796,6 +813,16 @@ static wdp_trace_ctx_t   wdp_trace;
 static QueueHandle_t     wdp_poi_queue = NULL;
 static volatile uint32_t wdp_poi_dropped = 0;
 static char              wardrive_trace_path[80] = "";
+
+// Wardrive home-network auto-upload (opt-in via Wardrive Settings; list in
+// /sdcard/lab/home.txt, one "SSID" or "SSID<TAB>password" per line).
+#define WARDRIVE_HOME_MAX 8
+typedef struct { char ssid[33]; char password[64]; } wardrive_home_t;
+static wardrive_home_t wardrive_home[WARDRIVE_HOME_MAX];
+static int  wardrive_home_count = 0;
+static volatile int  wardrive_home_hit = -1;   // index of a home SSID seen (-1 = none)
+static volatile bool wardrive_home_prompted = false;
+static lv_obj_t *wardrive_home_overlay = NULL;
 
 static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
 static int wdp_ducb_channel_count = 0;
@@ -1083,6 +1110,16 @@ static volatile bool lookout_screen_active = false;   // cleared by reset_functi
 static TaskHandle_t lookout_scan_task_handle = NULL;
 static int lookout_detection_total = 0;
 
+// Anti-Surveillance UI state (widgets/timer here so reset_function_page_children
+// can tear it down on any nav away; the tracker array lives with its code).
+static lv_obj_t *antisurv_content = NULL;
+static lv_obj_t *antisurv_list = NULL;
+static lv_obj_t *antisurv_status_label = NULL;
+static lv_obj_t *antisurv_exit_btn = NULL;
+static volatile bool antisurv_active = false;
+static TaskHandle_t antisurv_scan_task_handle = NULL;
+static lv_timer_t *antisurv_timer = NULL;
+
 // BLE HoneyPair UI state
 static lv_obj_t *hp_content = NULL;
 static lv_obj_t *hp_persona_dd = NULL;
@@ -1233,6 +1270,8 @@ static void attack_tile_event_cb(lv_event_t *e);
 static void update_sniffer_button_ui(void);
 static void show_settings_screen(void);
 static void settings_tile_event_cb(lv_event_t *e);
+static void show_wardrive_settings_screen(void);
+static void wardrive_settings_row_cb(lv_event_t *e);
 static void home_btn_event_cb(lv_event_t *e);
 static void wifi_scan_next_btn_cb(lv_event_t *e);
 static void deauth_quit_event_cb(lv_event_t *e);
@@ -1285,6 +1324,9 @@ static void reset_function_page_children(void) {
     handshake_status_list = NULL;
     wardrive_log_ta = NULL;
     wardrive_stop_btn = NULL;
+    wardrive_home_overlay = NULL;   // overlay lived on lv_scr_act; cleared on nav
+    wardrive_home_hit = -1;
+    wardrive_home_prompted = false;
     karma_log_ta = NULL;
     karma_stop_btn = NULL;
     karma_content = NULL;
@@ -1326,6 +1368,13 @@ static void reset_function_page_children(void) {
     lookout_status_label = NULL;
     lookout_exit_btn = NULL;
     lookout_screen_active = false;
+    // Anti-Surveillance: stop scan + delete its timer on any nav away.
+    antisurv_active = false;
+    if (antisurv_timer) { lv_timer_del(antisurv_timer); antisurv_timer = NULL; }
+    antisurv_content = NULL;
+    antisurv_list = NULL;
+    antisurv_status_label = NULL;
+    antisurv_exit_btn = NULL;
     // BLE HoneyPair: stop advertising on any nav away (title back button included)
     if (hp_screen_active) {
         honeypair_stop();
@@ -1496,6 +1545,11 @@ static void wdp_trace_add_point(const char *path, wdp_trace_ctx_t *c,
                                 double lat, double lon, double alt, double *dist_accum);
 static bool wdp_trace_write_poi(const char *path, wdp_trace_ctx_t *c, const wdp_poi_msg_t *p);
 static void wardrive_trace_finalize_file(const char *path);
+static void wardrive_load_home(void);
+static void wardrive_show_home_prompt(int idx);
+static void wardrive_stop_for_home_upload(void);
+static void wardrive_home_yes_cb(lv_event_t *e);
+static void wardrive_home_no_cb(lv_event_t *e);
 static void show_karma_page(void);
 static void karma_start_btn_cb(lv_event_t *e);
 static void karma_stop_btn_cb(lv_event_t *e);
@@ -1578,6 +1632,12 @@ static void show_bt_lookout_screen(void);
 static void lookout_exit_cb(lv_event_t *e);
 static void lookout_led_set(uint8_t r, uint8_t g, uint8_t b);
 static void lookout_scan_task(void *pvParameters);
+
+// Anti-Surveillance UI (BLE "is something following me?")
+static void show_antisurv_screen(void);
+static void antisurv_exit_cb(lv_event_t *e);
+static void antisurv_scan_task(void *pvParameters);
+static void antisurv_timer_cb(lv_timer_t *timer);
 
 // NeoPixel (GPIO27) status LED policy for the new BLE features. Single writer,
 // called only from the LVGL/main task to keep RMT access single-threaded.
@@ -2171,6 +2231,15 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_MAX_POWER, &mp) == ESP_OK) {
             g_max_power_mode = (mp != 0);
         }
+        uint8_t u8v;
+        uint16_t u16v;
+        if (nvs_get_u8(h, NVS_KEY_REDTEAM, &u8v) == ESP_OK)   g_redteam_mode = (u8v != 0);
+        if (nvs_get_u8(h, NVS_KEY_WD_5GHZ, &u8v) == ESP_OK)   wd_scan_5ghz = (u8v != 0);
+        if (nvs_get_u8(h, NVS_KEY_WD_RSSIDLT, &u8v) == ESP_OK) wd_rssi_relog_delta = u8v;
+        if (nvs_get_u8(h, NVS_KEY_WD_REQGPS, &u8v) == ESP_OK)  wd_require_gps = (u8v != 0);
+        if (nvs_get_u8(h, NVS_KEY_WD_MEMCAP, &u8v) == ESP_OK && u8v > 0) wd_mem_cap_mb = u8v;
+        if (nvs_get_u16(h, NVS_KEY_ANTISURV_M, &u16v) == ESP_OK && u16v > 0) antisurv_sens_m = u16v;
+        if (nvs_get_u8(h, NVS_KEY_WD_HOMEUP, &u8v) == ESP_OK)  wd_home_upload = (u8v != 0);
         nvs_close(h);
         ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d",
                  (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms,
@@ -2218,6 +2287,13 @@ static void nvs_writer_task(void *arg)
                     nvs_set_u16(h, NVS_KEY_SCAN_MAX, (uint16_t)req.b); break;
             case 3: nvs_set_u8(h, NVS_KEY_DARK_MODE, req.a ? 1 : 0); break;
             case 4: nvs_set_u8(h, NVS_KEY_MAX_POWER, req.a ? 1 : 0); break;
+            case 5: nvs_set_u8(h, NVS_KEY_REDTEAM, req.a ? 1 : 0); break;
+            case 6: nvs_set_u8(h, NVS_KEY_WD_5GHZ, req.a ? 1 : 0); break;
+            case 7: nvs_set_u8(h, NVS_KEY_WD_RSSIDLT, (uint8_t)req.a); break;
+            case 8: nvs_set_u8(h, NVS_KEY_WD_REQGPS, req.a ? 1 : 0); break;
+            case 9: nvs_set_u8(h, NVS_KEY_WD_MEMCAP, (uint8_t)req.a); break;
+            case 10: nvs_set_u16(h, NVS_KEY_ANTISURV_M, (uint16_t)req.a); break;
+            case 11: nvs_set_u8(h, NVS_KEY_WD_HOMEUP, req.a ? 1 : 0); break;
             default: nvs_close(h); continue;
         }
         nvs_commit(h);
@@ -2238,6 +2314,13 @@ static void nvs_settings_save_timeout(int32_t ms)                     { nvs_save
 static void nvs_settings_save_brightness(uint8_t pct)                 { nvs_save_enqueue(1, pct, 0); }
 static void nvs_settings_save_scan_time(uint16_t min_ms, uint16_t max_ms) { nvs_save_enqueue(2, min_ms, max_ms); }
 static void nvs_settings_save_max_power(bool enabled)                 { nvs_save_enqueue(4, enabled ? 1 : 0, 0); }
+static void nvs_settings_save_redteam(bool enabled)                  { nvs_save_enqueue(5, enabled ? 1 : 0, 0); }
+static void nvs_settings_save_wd_5ghz(bool enabled)                  { nvs_save_enqueue(6, enabled ? 1 : 0, 0); }
+static void nvs_settings_save_wd_rssidelta(uint8_t d)                { nvs_save_enqueue(7, d, 0); }
+static void nvs_settings_save_wd_reqgps(bool enabled)               { nvs_save_enqueue(8, enabled ? 1 : 0, 0); }
+static void nvs_settings_save_wd_memcap(uint8_t mb)                  { nvs_save_enqueue(9, mb, 0); }
+static void nvs_settings_save_antisurv_m(uint16_t m)                { nvs_save_enqueue(10, m, 0); }
+static void nvs_settings_save_home_upload(bool enabled)             { nvs_save_enqueue(11, enabled ? 1 : 0, 0); }
 
 // ============================================================================
 // Backlight / Brightness / Screen Dimming
@@ -6912,21 +6995,24 @@ static void wdp_ducb_init(void) {
         wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
         wdp_ducb_channel_count++;
     }
-    for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_non_dfs[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_NON_DFS;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
-    }
-    for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_dfs[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_DFS;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
+    // 5 GHz channels only when enabled in Wardrive Settings (Bands).
+    if (wd_scan_5ghz) {
+        for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++) {
+            wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_non_dfs[i];
+            wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_NON_DFS;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+            wdp_ducb_channel_count++;
+        }
+        for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++) {
+            wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_dfs[i];
+            wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_DFS;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+            wdp_ducb_channel_count++;
+        }
     }
 }
 
@@ -7408,19 +7494,33 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         offset += 2 + tag_len;
     }
 
+    // Home-network auto-upload: flag the first home SSID we hear (task prompts).
+    if (wd_home_upload && wardrive_home_hit < 0 && ssid[0]) {
+        for (int i = 0; i < wardrive_home_count; i++) {
+            if (strcmp(ssid, wardrive_home[i].ssid) == 0) { wardrive_home_hit = i; break; }
+        }
+    }
+
     int existing = wdp_find_bssid(ap_bssid);
     if (existing >= 0) {
         wdp_network_t *net = &wdp_seen_networks[existing];
         if (pkt->rx_ctrl.rssi > net->rssi) {
             net->rssi = (int8_t)pkt->rx_ctrl.rssi;
         }
-        // Trilateration: if we've driven >25 m from where this AP was last logged,
-        // queue a fresh row at the new GPS position. Multiple observations of the
-        // same BSSID at different points let WiGLE triangulate its true location.
-        if (current_gps.valid && net->last_logged_valid && net->written_to_file) {
-            double moved = gps_distance_meters(net->last_logged_lat, net->last_logged_lon,
+        // Re-log an already-written AP when either:
+        //  - we've driven >=25 m from where it was last logged (trilateration), or
+        //  - its RSSI changed by >= the configured delta (extra observation points).
+        // Multiple rows for one BSSID at different points/strengths help WiGLE locate it.
+        if (net->last_logged_valid && net->written_to_file) {
+            bool moved = false;
+            if (current_gps.valid) {
+                double d = gps_distance_meters(net->last_logged_lat, net->last_logged_lon,
                                                current_gps.latitude, current_gps.longitude);
-            if (moved >= WDP_RELOG_DISTANCE_M) {
+                moved = (d >= WDP_RELOG_DISTANCE_M);
+            }
+            bool rssi_changed = (wd_rssi_relog_delta > 0) &&
+                                (abs((int)pkt->rx_ctrl.rssi - (int)net->last_logged_rssi) >= wd_rssi_relog_delta);
+            if ((moved || rssi_changed) && current_gps.valid) {
                 net->latitude = current_gps.latitude;
                 net->longitude = current_gps.longitude;
                 net->rssi = (int8_t)pkt->rx_ctrl.rssi;
@@ -7449,6 +7549,7 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     wdp_seen_networks[idx].last_logged_valid = false;
     wdp_seen_networks[idx].last_logged_lat = 0.0;
     wdp_seen_networks[idx].last_logged_lon = 0.0;
+    wdp_seen_networks[idx].last_logged_rssi = (int8_t)pkt->rx_ctrl.rssi;
     wdp_seen_count++;
     wdp_dwell_new_networks++;
 
@@ -7475,6 +7576,11 @@ static bool wdp_grow_network_buffer(void) {
     size_t new_size = (size_t)new_capacity * sizeof(wdp_network_t);
     size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
 
+    // Honour the Wardrive Settings memory cap (MB).
+    if (new_size > (size_t)wd_mem_cap_mb * 1024 * 1024) {
+        ESP_LOGI(TAG, "Wardrive buffer hit memory cap (%u MB)", (unsigned)wd_mem_cap_mb);
+        return false;
+    }
     if (free_psram < new_size + WDP_PSRAM_RESERVE_BYTES) {
         ESP_LOGI(TAG, "Cannot grow wardrive buffer: only %u bytes free PSRAM", (unsigned)free_psram);
         return false;
@@ -8555,8 +8661,8 @@ static void wardrive_promisc_task(void *pvParameters) {
     wdp_needs_grow = false;
     if (wdp_seen_networks) memset(wdp_seen_networks, 0, (size_t)wdp_seen_capacity * sizeof(wdp_network_t));
 
-    ESP_LOGI(TAG, "Waiting for GPS fix...");
-    while (wardrive_active && !current_gps.valid) {
+    ESP_LOGI(TAG, "Waiting for GPS fix... (require_gps=%d)", wd_require_gps);
+    while (wardrive_active && wd_require_gps && !current_gps.valid) {
         int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             wardrive_gps_buffer[len] = '\0';
@@ -8604,6 +8710,12 @@ static void wardrive_promisc_task(void *pvParameters) {
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
     wdp_ducb_init();
+
+    // Home-network auto-upload list (opt-in). Reset detection state each run.
+    wardrive_home_count = 0;
+    wardrive_home_hit = -1;
+    wardrive_home_prompted = false;
+    if (wd_home_upload) wardrive_load_home();
 
     // Wardrive KML trace: drive-path track + Wi-Fi POIs alongside the .log. The
     // promiscuous callback hands POI snapshots over wdp_poi_queue; the task owns
@@ -8670,7 +8782,7 @@ static void wardrive_promisc_task(void *pvParameters) {
         } else {
             gps_fix_lost_count = 0;
         }
-        if (gps_fix_lost_count >= WDP_GPS_FIX_LOST_THRESHOLD) {
+        if (wd_require_gps && gps_fix_lost_count >= WDP_GPS_FIX_LOST_THRESHOLD) {
             ESP_LOGI(TAG, "[WDP] GPS fix lost for %d cycles, pausing promisc...", gps_fix_lost_count);
             esp_wifi_set_promiscuous(false);
             while (wardrive_active && !current_gps.valid) {
@@ -8739,10 +8851,11 @@ static void wardrive_promisc_task(void *pvParameters) {
                     mac_str, escaped_ssid, auth, timestamp,
                     net->channel, net->rssi, net->latitude, net->longitude);
             net->written_to_file = true;
-            // Remember where this row was logged so trilateration can measure the
-            // next re-log distance from here.
+            // Remember where/how strong this row was logged so the next re-log
+            // distance and RSSI delta are measured from here.
             net->last_logged_lat = net->latitude;
             net->last_logged_lon = net->longitude;
+            net->last_logged_rssi = net->rssi;
             net->last_logged_valid = true;
             networks_since_flush++;
             if (networks_since_flush >= WDP_FILE_FLUSH_INTERVAL) {
@@ -8798,6 +8911,12 @@ static void wardrive_promisc_task(void *pvParameters) {
 static void wd_ui_timer_cb(lv_timer_t *timer) {
     (void)timer;
     if (!wardrive_ui_active) return;
+
+    // Home-network auto-upload: prompt once when a home SSID comes into range.
+    if (wd_home_upload && wardrive_home_hit >= 0 && !wardrive_home_prompted && !wardrive_home_overlay) {
+        wardrive_home_prompted = true;
+        wardrive_show_home_prompt(wardrive_home_hit);
+    }
 
     if (wd_ui_channel_label) {
         char wd_ch_buf[16];
@@ -9056,6 +9175,153 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
     wdp_current_channel = 0;
 
     nav_to_menu_flag = true;
+}
+
+// Load home networks from /sdcard/lab/home.txt into wardrive_home[].
+static void wardrive_load_home(void)
+{
+    wardrive_home_count = 0;
+    wardrive_home_hit = -1;
+    wardrive_home_prompted = false;
+    if (!(sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE)) return;
+    FILE *f = fopen("/sdcard/lab/home.txt", "r");
+    if (f) {
+        char line[128];
+        while (fgets(line, sizeof(line), f) && wardrive_home_count < WARDRIVE_HOME_MAX) {
+            int len = (int)strlen(line);
+            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+            if (len == 0 || line[0] == '#') continue;
+            char *tab = strchr(line, '\t');
+            char *pwd = NULL;
+            if (tab) { *tab = '\0'; pwd = tab + 1; }
+            wardrive_home_t *h = &wardrive_home[wardrive_home_count];
+            strncpy(h->ssid, line, sizeof(h->ssid) - 1);
+            h->ssid[sizeof(h->ssid) - 1] = '\0';
+            h->password[0] = '\0';
+            if (pwd) {
+                strncpy(h->password, pwd, sizeof(h->password) - 1);
+                h->password[sizeof(h->password) - 1] = '\0';
+            }
+            wardrive_home_count++;
+        }
+        fclose(f);
+    }
+    xSemaphoreGive(sd_spi_mutex);
+    ESP_LOGI(TAG, "Wardrive home networks loaded: %d", wardrive_home_count);
+}
+
+// Stop the wardrive task + UI without navigating away (used before home upload).
+static void wardrive_stop_for_home_upload(void)
+{
+    if (wardrive_active || wardrive_task_handle != NULL) {
+        wardrive_active = false;
+        for (int i = 0; i < 40 && wardrive_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (wardrive_task_handle != NULL) {
+            vTaskDelete(wardrive_task_handle);
+            wardrive_task_handle = NULL;
+            if (wardrive_task_stack != NULL) {
+                heap_caps_free(wardrive_task_stack);
+                wardrive_task_stack = NULL;
+            }
+        }
+    }
+    esp_wifi_set_promiscuous(false);
+    wardrive_disable_log_capture();
+    wardrive_log_ta = NULL;
+    wardrive_stop_btn = NULL;
+    wardrive_ui_active = false;
+    scan_done_ui_flag = false;
+    if (wd_ui_timer) { lv_timer_del(wd_ui_timer); wd_ui_timer = NULL; }
+    wd_ui_gps_label = NULL;
+    wd_ui_counter_label = NULL;
+    wd_ui_channel_label = NULL;
+    wd_ui_table = NULL;
+    wdp_current_channel = 0;
+}
+
+static void wardrive_home_no_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wardrive_home_overlay) { lv_obj_del(wardrive_home_overlay); wardrive_home_overlay = NULL; }
+    wardrive_home_hit = -1;   // keep prompted=true so we don't nag again this session
+}
+
+static void wardrive_home_yes_cb(lv_event_t *e)
+{
+    (void)e;
+    int idx = wardrive_home_hit;
+    if (wardrive_home_overlay) { lv_obj_del(wardrive_home_overlay); wardrive_home_overlay = NULL; }
+    if (idx < 0 || idx >= wardrive_home_count) return;
+
+    // Stash the connect target before tearing the wardrive down.
+    strncpy(wifi_connect_ssid, wardrive_home[idx].ssid, sizeof(wifi_connect_ssid) - 1);
+    wifi_connect_ssid[sizeof(wifi_connect_ssid) - 1] = '\0';
+    strncpy(wifi_connect_password, wardrive_home[idx].password, sizeof(wifi_connect_password) - 1);
+    wifi_connect_password[sizeof(wifi_connect_password) - 1] = '\0';
+
+    wardrive_stop_for_home_upload();
+
+    // Reuse the connect-first workflow: connect to the home network, then the
+    // WiGLE upload page runs automatically (PENDING_ATTACK_WIGLE).
+    pending_attack_type = PENDING_ATTACK_WIGLE;
+    show_wifi_connect_screen();
+}
+
+// Confirm overlay shown when a home network comes into range during wardrive.
+static void wardrive_show_home_prompt(int idx)
+{
+    if (idx < 0 || idx >= wardrive_home_count) return;
+    if (wardrive_home_overlay || !function_page) return;
+
+    wardrive_home_overlay = lv_obj_create(function_page);
+    lv_obj_set_size(wardrive_home_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(wardrive_home_overlay, 0, 0);
+    lv_obj_set_style_bg_color(wardrive_home_overlay, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(wardrive_home_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(wardrive_home_overlay, 0, 0);
+    lv_obj_clear_flag(wardrive_home_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *dialog = lv_obj_create(wardrive_home_overlay);
+    lv_obj_set_size(dialog, 300, 170);
+    lv_obj_center(dialog);
+    lv_obj_set_style_bg_color(dialog, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_border_width(dialog, 2, 0);
+    lv_obj_set_style_radius(dialog, 10, 0);
+    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *msg = lv_label_create(dialog);
+    char buf[120];
+    snprintf(buf, sizeof(buf), "Home network seen:\n\"%.32s\"\n\nStop wardrive and\nupload to WiGLE?", wardrive_home[idx].ssid);
+    lv_label_set_text(msg, buf);
+    lv_obj_set_style_text_color(msg, ui_text_color(), 0);
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 8);
+
+    lv_obj_t *no_btn = lv_btn_create(dialog);
+    lv_obj_set_size(no_btn, 110, 38);
+    lv_obj_align(no_btn, LV_ALIGN_BOTTOM_LEFT, 6, -6);
+    lv_obj_set_style_bg_color(no_btn, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_radius(no_btn, 8, 0);
+    lv_obj_t *no_lbl = lv_label_create(no_btn);
+    lv_label_set_text(no_lbl, "No");
+    lv_obj_set_style_text_color(no_lbl, ui_text_color(), 0);
+    lv_obj_center(no_lbl);
+    lv_obj_add_event_cb(no_btn, wardrive_home_no_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *yes_btn = lv_btn_create(dialog);
+    lv_obj_set_size(yes_btn, 110, 38);
+    lv_obj_align(yes_btn, LV_ALIGN_BOTTOM_RIGHT, -6, -6);
+    lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(yes_btn, 8, 0);
+    lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+    lv_label_set_text(yes_lbl, "Upload");
+    lv_obj_set_style_text_color(yes_lbl, lv_color_white(), 0);
+    lv_obj_center(yes_lbl);
+    lv_obj_add_event_cb(yes_btn, wardrive_home_yes_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // Back To Observer callback from Karma screen
@@ -13567,7 +13833,7 @@ static void show_wigle_upload_page(void)
 // Attack tiles screen - shown after selecting networks
 static void show_attack_tiles_screen(void)
 {
-    create_function_page_base("Select Attack");
+    create_function_page_base(g_redteam_mode ? "Select Attack" : "Select Test");
     
     // Create small tiles container (4+5 layout) with compact spacing
     lv_obj_t *attack_tiles = lv_obj_create(function_page);
@@ -13584,15 +13850,17 @@ static void show_attack_tiles_screen(void)
     lv_obj_set_scroll_dir(attack_tiles, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(attack_tiles, LV_SCROLLBAR_MODE_AUTO);
     
-    // Row 1: Deauth, Evil Twin, SAE, Handshake
-    create_small_tile(attack_tiles, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, attack_tile_event_cb, "Deauth");
-    create_small_tile(attack_tiles, LV_SYMBOL_WARNING, "Evil Twin", COLOR_MATERIAL_ORANGE, attack_tile_event_cb, "Evil Twin");
-    create_small_tile(attack_tiles, LV_SYMBOL_POWER, "SAE", COLOR_MATERIAL_PINK, attack_tile_event_cb, "SAE Overflow");
-    create_small_tile(attack_tiles, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, attack_tile_event_cb, "Handshaker");
-    // Row 2: ARP Poison, MITM, Rogue AP, WPA-SEC Upload, Observer
-    create_small_tile(attack_tiles, LV_SYMBOL_SHUFFLE, "ARP Poison", COLOR_MATERIAL_TEAL, attack_tile_event_cb, "ARP Poison");
-    create_small_tile(attack_tiles, LV_SYMBOL_LOOP, "MITM", lv_color_make(121, 85, 72), attack_tile_event_cb, "MITM");
-    create_small_tile(attack_tiles, LV_SYMBOL_WIFI, "Rogue AP", COLOR_MATERIAL_INDIGO, attack_tile_event_cb, "Rogue AP");
+    // Offensive attacks — only shown when Red Team mode is ON.
+    if (g_redteam_mode) {
+        create_small_tile(attack_tiles, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, attack_tile_event_cb, "Deauth");
+        create_small_tile(attack_tiles, LV_SYMBOL_WARNING, "Evil Twin", COLOR_MATERIAL_ORANGE, attack_tile_event_cb, "Evil Twin");
+        create_small_tile(attack_tiles, LV_SYMBOL_POWER, "SAE", COLOR_MATERIAL_PINK, attack_tile_event_cb, "SAE Overflow");
+        create_small_tile(attack_tiles, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, attack_tile_event_cb, "Handshaker");
+        create_small_tile(attack_tiles, LV_SYMBOL_SHUFFLE, "ARP Poison", COLOR_MATERIAL_TEAL, attack_tile_event_cb, "ARP Poison");
+        create_small_tile(attack_tiles, LV_SYMBOL_LOOP, "MITM", lv_color_make(121, 85, 72), attack_tile_event_cb, "MITM");
+        create_small_tile(attack_tiles, LV_SYMBOL_WIFI, "Rogue AP", COLOR_MATERIAL_INDIGO, attack_tile_event_cb, "Rogue AP");
+    }
+    // Recon / upload tiles — always available.
     create_small_tile(attack_tiles, LV_SYMBOL_UPLOAD, "WPA-SEC", COLOR_MATERIAL_CYAN, attack_tile_event_cb, "WPA-SEC Upload");
     // WiGLE: connect to the selected network (STA), then upload wardrive CSVs
     create_small_tile(attack_tiles, LV_SYMBOL_GPS, "WiGLE", COLOR_MATERIAL_GREEN, attack_tile_event_cb, "WiGLE Upload");
@@ -13698,9 +13966,11 @@ static void show_global_attacks_screen(void)
     lv_obj_t *wardrive_tile = create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, NULL, NULL);
     lv_obj_add_event_cb(wardrive_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Start Wardrive");
 
-    // Beacon Spam tile - Pink: flood fake AP beacons from an SSID list
-    lv_obj_t *beacon_tile = create_tile(tiles, LV_SYMBOL_WIFI, "Beacon\nSpam", COLOR_MATERIAL_PINK, NULL, NULL);
-    lv_obj_add_event_cb(beacon_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Beacon Spam");
+    // Beacon Spam tile - Pink: flood fake AP beacons (offensive, Red Team only)
+    if (g_redteam_mode) {
+        lv_obj_t *beacon_tile = create_tile(tiles, LV_SYMBOL_WIFI, "Beacon\nSpam", COLOR_MATERIAL_PINK, NULL, NULL);
+        lv_obj_add_event_cb(beacon_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Beacon Spam");
+    }
 }
 
 // WiFi Sniff & Karma screen
@@ -14478,10 +14748,14 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_admin_portal_screen();
     } else if (strcmp(tile_name, "File Manager") == 0) {
         show_file_manager_screen();
+    } else if (strcmp(tile_name, "Wardrive") == 0) {
+        show_wardrive_settings_screen();
     } else if (strcmp(tile_name, "Scan Time") == 0) {
         show_scan_time_popup();
     } else if (strcmp(tile_name, "RedTeam mode") == 0) {
-        show_settings_screen();
+        g_redteam_mode = !g_redteam_mode;
+        nvs_settings_save_redteam(g_redteam_mode);
+        show_settings_screen();   // re-render so the tile reflects the new state
     } else if (strcmp(tile_name, "Download Mode") == 0) {
         show_download_mode_screen();
     } else if (strcmp(tile_name, "Screen Timeout") == 0) {
@@ -14498,6 +14772,103 @@ static void settings_tile_event_cb(lv_event_t *e)
         }
         show_settings_screen();   // re-render so the tile reflects the new state
     }
+}
+
+// ============================================================================
+// Wardrive Settings — NVS-backed tunables for the WDP wardrive engine.
+// ============================================================================
+static void wd_settings_add_row(lv_obj_t *parent, int id, const char *name, const char *value)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_width(btn, lv_pct(96));
+    lv_obj_set_height(btn, 46);
+    lv_obj_set_style_bg_color(btn, ui_panel_color(), 0);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_set_style_pad_hor(btn, 12, 0);
+    lv_obj_add_event_cb(btn, wardrive_settings_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)id);
+
+    lv_obj_t *nl = lv_label_create(btn);
+    lv_label_set_text(nl, name);
+    lv_obj_set_style_text_color(nl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(nl, &lv_font_montserrat_14, 0);
+    lv_obj_align(nl, LV_ALIGN_LEFT_MID, 0, 0);
+
+    lv_obj_t *vl = lv_label_create(btn);
+    lv_label_set_text(vl, value);
+    lv_obj_set_style_text_color(vl, ui_accent_color(), 0);
+    lv_obj_set_style_text_font(vl, &lv_font_montserrat_16, 0);
+    lv_obj_align(vl, LV_ALIGN_RIGHT_MID, 0, 0);
+}
+
+static void wardrive_settings_row_cb(lv_event_t *e)
+{
+    int id = (int)(intptr_t)lv_event_get_user_data(e);
+    switch (id) {
+        case 0:
+            wd_scan_5ghz = !wd_scan_5ghz;
+            nvs_settings_save_wd_5ghz(wd_scan_5ghz);
+            break;
+        case 1: {
+            static const uint8_t steps[] = {0, 3, 5, 10, 15, 20};
+            int n = (int)(sizeof(steps) / sizeof(steps[0])), cur = 0;
+            for (int i = 0; i < n; i++) if (steps[i] == wd_rssi_relog_delta) cur = i;
+            wd_rssi_relog_delta = steps[(cur + 1) % n];
+            nvs_settings_save_wd_rssidelta(wd_rssi_relog_delta);
+            break;
+        }
+        case 2:
+            wd_require_gps = !wd_require_gps;
+            nvs_settings_save_wd_reqgps(wd_require_gps);
+            break;
+        case 3: {
+            uint8_t v = (uint8_t)(wd_mem_cap_mb + 2);
+            if (v > 8) v = 2;
+            wd_mem_cap_mb = v;
+            nvs_settings_save_wd_memcap(v);
+            break;
+        }
+        case 4: {
+            static const uint16_t steps[] = {50, 100, 150, 200, 300};
+            int n = (int)(sizeof(steps) / sizeof(steps[0])), cur = 0;
+            for (int i = 0; i < n; i++) if (steps[i] == antisurv_sens_m) cur = i;
+            antisurv_sens_m = steps[(cur + 1) % n];
+            nvs_settings_save_antisurv_m(antisurv_sens_m);
+            break;
+        }
+        case 5:
+            wd_home_upload = !wd_home_upload;
+            nvs_settings_save_home_upload(wd_home_upload);
+            break;
+        default: break;
+    }
+    show_wardrive_settings_screen();   // re-render with the new value
+}
+
+static void show_wardrive_settings_screen(void)
+{
+    create_function_page_base("Wardrive Settings");
+
+    lv_obj_t *list = lv_obj_create(function_page);
+    lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(list, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 8, 0);
+    lv_obj_set_style_pad_row(list, 6, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    char buf[24];
+    wd_settings_add_row(list, 0, "5 GHz band", wd_scan_5ghz ? "ON" : "OFF");
+    if (wd_rssi_relog_delta == 0) snprintf(buf, sizeof(buf), "OFF");
+    else                          snprintf(buf, sizeof(buf), "%u dBm", wd_rssi_relog_delta);
+    wd_settings_add_row(list, 1, "RSSI re-log delta", buf);
+    wd_settings_add_row(list, 2, "Require GPS fix", wd_require_gps ? "ON" : "OFF");
+    snprintf(buf, sizeof(buf), "%u MB", wd_mem_cap_mb);
+    wd_settings_add_row(list, 3, "Memory cap", buf);
+    snprintf(buf, sizeof(buf), "%u m", antisurv_sens_m);
+    wd_settings_add_row(list, 4, "Anti-surv distance", buf);
+    wd_settings_add_row(list, 5, "Home auto-upload", wd_home_upload ? "ON" : "OFF");
 }
 
 // Settings screen - shows submenu with Compromised Data, Scan Time, RedTeam mode, Download Mode
@@ -14524,11 +14895,18 @@ static void show_settings_screen(void)
     // File Manager - Cyan: on-device SD card browser
     create_tile(tiles, LV_SYMBOL_DIRECTORY, "File\nManager", COLOR_MATERIAL_CYAN, settings_tile_event_cb, "File Manager");
 
+    // Wardrive settings - Green: WDP engine tunables
+    create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "Wardrive");
+
     // Scan Time - Purple
     create_tile(tiles, LV_SYMBOL_LOOP, "Scan\nTime", COLOR_MATERIAL_PURPLE, settings_tile_event_cb, "Scan Time");
     
     // RedTeam mode - Amber/Orange
-    // create_tile(tiles, LV_SYMBOL_WARNING, "RedTeam\nMode", COLOR_MATERIAL_AMBER, settings_tile_event_cb, "RedTeam mode");
+    // Red Team mode - Amber: gates offensive attacks (ON = attacks visible)
+    create_tile(tiles, LV_SYMBOL_WARNING,
+                g_redteam_mode ? "RedTeam\nON" : "RedTeam\nOFF",
+                g_redteam_mode ? COLOR_MATERIAL_AMBER : lv_color_make(120, 120, 120),
+                settings_tile_event_cb, "RedTeam mode");
     
     // Download Mode - Red
     create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Download\nMode", COLOR_MATERIAL_RED, settings_tile_event_cb, "Download Mode");
@@ -14601,6 +14979,10 @@ static void show_bluetooth_screen(void)
     // BT Lookout - Orange: watchlist monitor with LED alerts on target detection
     lv_obj_t *lookout_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nLookout", lv_color_make(255, 149, 0), NULL, NULL);
     lv_obj_add_event_cb(lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Lookout");
+
+    // Anti-Surveillance - Red: detect a BLE device that follows you (needs GPS)
+    lv_obj_t *antisurv_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Anti\nSurv", COLOR_MATERIAL_RED, NULL, NULL);
+    lv_obj_add_event_cb(antisurv_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Anti-Surv");
 
     // BLE HoneyPair - Pink: advertise spoofed BLE personas and log pairing attempts
     lv_obj_t *honeypair_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Honey\nPair", lv_color_make(255, 45, 130), NULL, NULL);
@@ -15762,6 +16144,11 @@ void attack_event_cb(lv_event_t *e)
     }
 
     // BT Lookout
+    if (strcmp(attack_name, "Anti-Surv") == 0) {
+        show_antisurv_screen();
+        return;
+    }
+
     if (strcmp(attack_name, "BT Lookout") == 0) {
         show_bt_lookout_screen();
         return;
@@ -17502,6 +17889,224 @@ static void show_bt_lookout_screen(void)
         lv_label_set_text(lookout_status_label, "Failed to start scan!");
     }
 
+    ui_locked = false;
+}
+
+// ============================================================================
+// Anti-Surveillance — continuously scan BLE and flag any device that stays in
+// range while you move away from where you first saw it. BLE only sees ~10-30 m,
+// so if you've driven past the anti-surv distance from a device's origin and it
+// is still advertising, it is moving with you. Needs a GPS fix. Threshold =
+// Wardrive Settings "Anti-surv distance".
+// ============================================================================
+#define ANTISURV_MAX 96
+typedef struct {
+    uint8_t addr[6];
+    char    name[32];
+    bool    has_origin;
+    double  origin_lat, origin_lon;
+    double  max_dist_m;      // furthest we've moved from origin while it stayed visible
+    int64_t last_seen_us;
+    bool    following;       // max_dist_m has crossed the alert threshold
+} antisurv_dev_t;
+
+static antisurv_dev_t antisurv_devs[ANTISURV_MAX];
+static int  antisurv_count = 0;
+
+static int antisurv_find(const uint8_t *addr)
+{
+    for (int i = 0; i < antisurv_count; i++)
+        if (memcmp(antisurv_devs[i].addr, addr, 6) == 0) return i;
+    return -1;
+}
+
+static void antisurv_scan_task(void *pvParameters)
+{
+    (void)pvParameters;
+    bt_reset_counters();
+    bt_start_scan();                 // BLE_HS_FOREVER — runs until cancelled
+    while (antisurv_active) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    bt_stop_scan();
+    antisurv_scan_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// LVGL-thread timer: fold the latest BLE sightings into the tracker, recompute
+// how far each device has trailed us, and rebuild the "followers" list.
+static void antisurv_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!antisurv_active) return;
+
+    int64_t now = esp_timer_get_time();
+
+    // Merge current sightings into the tracker.
+    for (int i = 0; i < bt_device_count && i < BT_MAX_DEVICES; i++) {
+        bt_device_info_t *d = &bt_devices[i];
+        int idx = antisurv_find(d->addr);
+        if (idx < 0) {
+            if (antisurv_count >= ANTISURV_MAX) continue;
+            idx = antisurv_count++;
+            memcpy(antisurv_devs[idx].addr, d->addr, 6);
+            strncpy(antisurv_devs[idx].name, d->name, sizeof(antisurv_devs[idx].name) - 1);
+            antisurv_devs[idx].name[sizeof(antisurv_devs[idx].name) - 1] = '\0';
+            antisurv_devs[idx].has_origin = false;
+            antisurv_devs[idx].max_dist_m = 0.0;
+            antisurv_devs[idx].following = false;
+        }
+        antisurv_dev_t *a = &antisurv_devs[idx];
+        a->last_seen_us = now;
+        if (!a->name[0] && d->name[0]) {
+            strncpy(a->name, d->name, sizeof(a->name) - 1);
+            a->name[sizeof(a->name) - 1] = '\0';
+        }
+        if (current_gps.valid) {
+            if (!a->has_origin) {
+                a->origin_lat = current_gps.latitude;
+                a->origin_lon = current_gps.longitude;
+                a->has_origin = true;
+            } else {
+                double dist = gps_distance_meters(a->origin_lat, a->origin_lon,
+                                                  current_gps.latitude, current_gps.longitude);
+                if (dist > a->max_dist_m) a->max_dist_m = dist;
+                if (a->max_dist_m >= antisurv_sens_m) a->following = true;
+            }
+        }
+    }
+
+    // A device counts as "following" only while still recently seen (<20 s).
+    int followers = 0;
+    for (int i = 0; i < antisurv_count; i++)
+        if (antisurv_devs[i].following && (now - antisurv_devs[i].last_seen_us) < 20000000LL)
+            followers++;
+
+    if (antisurv_status_label) {
+        char s[80];
+        if (!current_gps.valid)
+            snprintf(s, sizeof(s), "Waiting for GPS...  tracking %d", antisurv_count);
+        else
+            snprintf(s, sizeof(s), "Tracking %d  |  following: %d  (>%um)",
+                     antisurv_count, followers, antisurv_sens_m);
+        lv_label_set_text(antisurv_status_label, s);
+    }
+
+    // Red LED while something is trailing us, off otherwise.
+    lookout_led_set(followers > 0 ? 255 : 0, 0, 0);
+
+    // Rebuild the followers list.
+    if (antisurv_list && lv_obj_is_valid(antisurv_list)) {
+        lv_obj_clean(antisurv_list);
+        if (followers == 0) {
+            lv_obj_t *hint = lv_label_create(antisurv_list);
+            lv_label_set_text(hint, current_gps.valid ? "No followers detected." : "Move with a GPS fix to detect followers.");
+            lv_obj_set_width(hint, lv_pct(100));
+            lv_obj_set_style_text_color(hint, lv_color_make(150, 150, 150), 0);
+            lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+        } else {
+            for (int i = 0; i < antisurv_count; i++) {
+                antisurv_dev_t *a = &antisurv_devs[i];
+                if (!a->following || (now - a->last_seen_us) >= 20000000LL) continue;
+                char macs[18];
+                bt_format_addr(a->addr, macs);
+                char row[96];
+                snprintf(row, sizeof(row), "%.20s  %s  ~%dm",
+                         a->name[0] ? a->name : "(no name)", macs, (int)a->max_dist_m);
+                lv_obj_t *lbl = lv_label_create(antisurv_list);
+                lv_label_set_text(lbl, row);
+                lv_obj_set_width(lbl, lv_pct(100));
+                lv_obj_set_style_text_color(lbl, COLOR_MATERIAL_RED, 0);
+                lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+            }
+        }
+    }
+}
+
+static void antisurv_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    antisurv_active = false;
+    for (int i = 0; i < 20 && antisurv_scan_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (antisurv_timer) { lv_timer_del(antisurv_timer); antisurv_timer = NULL; }
+    lookout_led_set(0, 0, 0);
+    antisurv_content = NULL;
+    antisurv_list = NULL;
+    antisurv_status_label = NULL;
+    antisurv_exit_btn = NULL;
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    nav_to_menu_flag = true;
+}
+
+static void show_antisurv_screen(void)
+{
+    ui_locked = true;
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    create_function_page_base("Anti-Surveillance");
+    antisurv_count = 0;
+    memset(antisurv_devs, 0, sizeof(antisurv_devs));
+
+    antisurv_content = lv_obj_create(function_page);
+    lv_obj_set_size(antisurv_content, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(antisurv_content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(antisurv_content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(antisurv_content, 0, 0);
+    lv_obj_set_style_pad_all(antisurv_content, 5, 0);
+    lv_obj_clear_flag(antisurv_content, LV_OBJ_FLAG_SCROLLABLE);
+
+    antisurv_status_label = lv_label_create(antisurv_content);
+    lv_label_set_text(antisurv_status_label, "Starting BLE scan...");
+    lv_obj_set_style_text_color(antisurv_status_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(antisurv_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(antisurv_status_label, LV_ALIGN_TOP_LEFT, 2, 0);
+
+    antisurv_list = lv_obj_create(antisurv_content);
+    lv_obj_set_size(antisurv_list, lv_pct(100), LCD_V_RES - 30 - 50 - 28);
+    lv_obj_align(antisurv_list, LV_ALIGN_TOP_MID, 0, 22);
+    lv_obj_set_style_bg_color(antisurv_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(antisurv_list, ui_accent_color(), 0);
+    lv_obj_set_style_border_width(antisurv_list, 1, 0);
+    lv_obj_set_flex_flow(antisurv_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(antisurv_list, 4, 0);
+    lv_obj_set_style_pad_gap(antisurv_list, 3, 0);
+    lv_obj_set_scrollbar_mode(antisurv_list, LV_SCROLLBAR_MODE_AUTO);
+
+    antisurv_exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(antisurv_exit_btn, 120, 40);
+    lv_obj_align(antisurv_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_set_style_bg_color(antisurv_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(antisurv_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(antisurv_exit_btn, 0, 0);
+    lv_obj_set_style_radius(antisurv_exit_btn, 10, 0);
+    lv_obj_t *exit_lbl = lv_label_create(antisurv_exit_btn);
+    lv_label_set_text(exit_lbl, LV_SYMBOL_CLOSE " Exit");
+    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(exit_lbl, ui_text_color(), 0);
+    lv_obj_center(exit_lbl);
+    lv_obj_add_event_cb(antisurv_exit_btn, antisurv_exit_cb, LV_EVENT_CLICKED, NULL);
+
+    if (!ensure_ble_mode()) {
+        lv_label_set_text(antisurv_status_label, "BLE init failed!");
+        ui_locked = false;
+        return;
+    }
+
+    antisurv_active = true;
+    antisurv_timer = lv_timer_create(antisurv_timer_cb, 1000, NULL);
+    BaseType_t task_ret = xTaskCreate(antisurv_scan_task, "antisurv_scan", 4096, NULL, 5,
+                                      &antisurv_scan_task_handle);
+    if (task_ret != pdPASS) {
+        antisurv_active = false;
+        if (antisurv_timer) { lv_timer_del(antisurv_timer); antisurv_timer = NULL; }
+        lv_label_set_text(antisurv_status_label, "Failed to start scan!");
+    }
     ui_locked = false;
 }
 
