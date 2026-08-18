@@ -9410,6 +9410,16 @@ static void home_mgmt_add_save_cb(lv_event_t *e)
     home_mgmt_refresh();
 }
 
+// Dropdown selection -> fill the SSID field (index 0 is the "Select..." hint).
+static void home_add_dd_cb(lv_event_t *e)
+{
+    lv_obj_t *dd = lv_event_get_target(e);
+    if (lv_dropdown_get_selected(dd) == 0) return;
+    char ssid[64];
+    lv_dropdown_get_selected_str(dd, ssid, sizeof(ssid));
+    if (home_add_ssid_ta) lv_textarea_set_text(home_add_ssid_ta, ssid);
+}
+
 static void home_mgmt_add_open_cb(lv_event_t *e)
 {
     (void)e;
@@ -9428,25 +9438,46 @@ static void home_mgmt_add_open_cb(lv_event_t *e)
     lv_label_set_text(tl, "Add home network");
     lv_obj_set_style_text_color(tl, ui_text_color(), 0);
     lv_obj_set_style_text_font(tl, &lv_font_montserrat_16, 0);
-    lv_obj_align(tl, LV_ALIGN_TOP_MID, 0, 8);
+    lv_obj_align(tl, LV_ALIGN_TOP_MID, 0, 6);
 
+    // SSID field first so the dropdown callback can fill it.
     home_add_ssid_ta = lv_textarea_create(home_add_overlay);
     lv_textarea_set_one_line(home_add_ssid_ta, true);
-    lv_textarea_set_placeholder_text(home_add_ssid_ta, "SSID");
-    lv_obj_set_width(home_add_ssid_ta, lv_pct(90));
-    lv_obj_align(home_add_ssid_ta, LV_ALIGN_TOP_MID, 0, 36);
+    lv_textarea_set_placeholder_text(home_add_ssid_ta, "SSID (or pick above)");
+    lv_obj_set_width(home_add_ssid_ta, lv_pct(92));
+    lv_obj_align(home_add_ssid_ta, LV_ALIGN_TOP_MID, 0, 82);
     lv_obj_add_event_cb(home_add_ssid_ta, home_mgmt_ta_event_cb, LV_EVENT_CLICKED, NULL);
+
+    // Dropdown of scanned networks (created after the SSID field so it draws on
+    // top of it when its list opens). Pick one to fill the SSID, or type below.
+    lv_obj_t *dd = lv_dropdown_create(home_add_overlay);
+    lv_obj_set_width(dd, lv_pct(92));
+    lv_obj_align(dd, LV_ALIGN_TOP_MID, 0, 36);
+    {
+        char opts[640];
+        int off = snprintf(opts, sizeof(opts), "Select network...");
+        const wifi_ap_record_t *recs = wifi_scanner_get_results_ptr();
+        const uint16_t *cntp = wifi_scanner_get_count_ptr();
+        uint16_t cnt = cntp ? *cntp : 0;
+        for (int i = 0; i < cnt && off < (int)sizeof(opts) - 40; i++) {
+            if (recs[i].ssid[0] == '\0') continue;   // skip hidden
+            off += snprintf(opts + off, sizeof(opts) - off, "\n%.32s", (const char *)recs[i].ssid);
+        }
+        lv_dropdown_set_options(dd, opts);
+    }
+    lv_obj_add_event_cb(dd, home_add_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     home_add_pw_ta = lv_textarea_create(home_add_overlay);
     lv_textarea_set_one_line(home_add_pw_ta, true);
+    lv_textarea_set_password_mode(home_add_pw_ta, true);
     lv_textarea_set_placeholder_text(home_add_pw_ta, "password (optional)");
-    lv_obj_set_width(home_add_pw_ta, lv_pct(90));
-    lv_obj_align(home_add_pw_ta, LV_ALIGN_TOP_MID, 0, 74);
+    lv_obj_set_width(home_add_pw_ta, lv_pct(92));
+    lv_obj_align(home_add_pw_ta, LV_ALIGN_TOP_MID, 0, 132);
     lv_obj_add_event_cb(home_add_pw_ta, home_mgmt_ta_event_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *cancel = lv_btn_create(home_add_overlay);
-    lv_obj_set_size(cancel, 100, 38);
-    lv_obj_align(cancel, LV_ALIGN_TOP_LEFT, 20, 116);
+    lv_obj_set_size(cancel, 110, 40);
+    lv_obj_align(cancel, LV_ALIGN_TOP_LEFT, 22, 184);
     lv_obj_set_style_bg_color(cancel, lv_color_make(80, 80, 80), 0);
     lv_obj_set_style_radius(cancel, 8, 0);
     lv_obj_t *cl = lv_label_create(cancel);
@@ -9456,8 +9487,8 @@ static void home_mgmt_add_open_cb(lv_event_t *e)
     lv_obj_add_event_cb(cancel, home_mgmt_add_cancel_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *save = lv_btn_create(home_add_overlay);
-    lv_obj_set_size(save, 100, 38);
-    lv_obj_align(save, LV_ALIGN_TOP_RIGHT, -20, 116);
+    lv_obj_set_size(save, 110, 40);
+    lv_obj_align(save, LV_ALIGN_TOP_RIGHT, -22, 184);
     lv_obj_set_style_bg_color(save, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_radius(save, 8, 0);
     lv_obj_t *sl = lv_label_create(save);
