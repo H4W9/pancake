@@ -230,6 +230,7 @@ static bool     wd_require_gps       = true;  // wait for a GPS fix before loggi
 static uint8_t  wd_mem_cap_mb        = 4;     // max PSRAM (MB) the wardrive buffer may grow to
 static uint16_t antisurv_sens_m      = 100;   // anti-surv "following" alert distance (m)
 static bool     wd_home_upload       = false; // auto-upload on home network (default OFF)
+static lv_obj_t *wd_rssi_val_label   = NULL;  // Wardrive Settings slider value label
 
 static inline lv_color_t ui_bg_color(void) {
     return dark_mode_enabled ? COLOR_DARK_BG : COLOR_LIGHT_BG;
@@ -1198,17 +1199,7 @@ static lv_obj_t *admin_startstop_lbl  = NULL;
 static lv_obj_t *admin_keyboard       = NULL;
 static volatile bool admin_screen_active = false;
 
-// File Manager UI state — on-device SD browser rooted at /sdcard.
-#define FM_ROOT "/sdcard"
-#define FM_MAX_ENTRIES 64
-#define FM_PATH_MAX 384        // >= sizeof(fm_cwd) + 1 + NAME_MAX(255) + 1 to avoid format-truncation
-static lv_obj_t *fm_list       = NULL;
-static lv_obj_t *fm_path_label = NULL;
-static char fm_cwd[128] = FM_ROOT;       // kept < FM_PATH_MAX-256 so path joins can't overflow
-static char (*fm_entry_paths)[FM_PATH_MAX] = NULL;   // lazily allocated in PSRAM (keeps BSS small)
-static bool fm_entry_isdir[FM_MAX_ENTRIES];
-static int  fm_entry_count = 0;
-static char fm_pending_path[FM_PATH_MAX] = "";   // file targeted by the action popup
+// (File Manager removed — file management is handled by the web Admin Portal.)
 
 // Battery voltage monitor state (DISABLED - using regular C5 chip)
 static lv_obj_t *battery_label = NULL;  // Keep for UI layout
@@ -1278,7 +1269,6 @@ static void update_sniffer_button_ui(void);
 static void show_settings_screen(void);
 static void settings_tile_event_cb(lv_event_t *e);
 static void show_wardrive_settings_screen(void);
-static void wardrive_settings_row_cb(lv_event_t *e);
 static void home_btn_event_cb(lv_event_t *e);
 static void wifi_scan_next_btn_cb(lv_event_t *e);
 static void deauth_quit_event_cb(lv_event_t *e);
@@ -1458,9 +1448,7 @@ static void reset_function_page_children(void) {
     admin_startstop_lbl = NULL;
     admin_keyboard = NULL;
     admin_screen_active = false;
-    // File Manager: widgets are children of function_page, cleared on nav away.
-    fm_list = NULL;
-    fm_path_label = NULL;
+    wd_rssi_val_label = NULL;   // Wardrive Settings slider value label
     wifi_connect_ta = NULL;
     wifi_connect_keyboard = NULL;
     wifi_connect_status_label = NULL;
@@ -1690,13 +1678,6 @@ static void admin_startstop_cb(lv_event_t *e);
 static void admin_pw_ta_event_cb(lv_event_t *e);
 static void admin_pw_toggle_cb(lv_event_t *e);
 static void admin_kb_event_cb(lv_event_t *e);
-
-// File Manager UI (on-device SD browser)
-static void show_file_manager_screen(void);
-static void fm_refresh(void);
-static void fm_entry_cb(lv_event_t *e);
-static void fm_up_cb(lv_event_t *e);
-static void fm_delete_cb(lv_event_t *e);
 
 // Beacon Spam UI
 static void show_beacon_spam_screen(void);
@@ -3482,8 +3463,8 @@ void app_main(void)
 
     // Draw buffers come from DMA-capable internal RAM, which is scarce on the C5
     // (WiFi/coex/BT + SD-SPI all compete for it). 10 lines keeps LVGL smooth while
-    // leaving more DMA headroom so runtime SD-SPI transactions (File Manager,
-    // wardrive, uploads) can still allocate their bounce buffers.
+    // leaving more DMA headroom so runtime SD-SPI transactions (wardrive logging,
+    // WiGLE/WPA-SEC uploads) can still allocate their bounce buffers.
     #define LVGL_DRAW_LINES 10
     const size_t buf_size = LCD_H_RES * LVGL_DRAW_LINES * sizeof(lv_color_t);
     buf1 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, 0);
@@ -11009,8 +10990,12 @@ static void show_main_tiles(void)
     lv_obj_set_flex_align(tiles_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(tiles_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    create_tile(tiles_container, LV_SYMBOL_WIFI, "WiFi Scan\n& Attack", UI_ACCENT_BLUE, main_tile_event_cb, "WiFi Scan & Attack");
-    create_tile(tiles_container, LV_SYMBOL_WARNING, "Global WiFi\nAttacks", UI_ACCENT_RED, main_tile_event_cb, "Global WiFi Attacks");
+    create_tile(tiles_container, LV_SYMBOL_WIFI,
+                g_redteam_mode ? "WiFi Scan\n& Attack" : "WiFi Scan\n& Test",
+                UI_ACCENT_BLUE, main_tile_event_cb, "WiFi Scan & Attack");
+    create_tile(tiles_container, LV_SYMBOL_WARNING,
+                g_redteam_mode ? "Global WiFi\nAttacks" : "Global WiFi\nTests",
+                UI_ACCENT_RED, main_tile_event_cb, "Global WiFi Attacks");
     create_tile(tiles_container, LV_SYMBOL_EYE_OPEN, "Network Observer\n& Karma", UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
     create_tile(tiles_container, LV_SYMBOL_SETTINGS, "Settings", UI_ACCENT_GREEN, main_tile_event_cb, "Settings");
     create_tile(tiles_container, LV_SYMBOL_GPS, "Deauth\nMonitor", UI_ACCENT_AMBER, main_tile_event_cb, "Deauth Monitor");
@@ -11036,8 +11021,8 @@ static void show_wifi_scan_attack_screen(void)
         return;
     }
     
-    create_function_page_base("WiFi Scan & Attack");
-    
+    create_function_page_base(g_redteam_mode ? "WiFi Scan & Attack" : "WiFi Scan & Test");
+
     // Create centered scanning container with icon and text
     lv_obj_t *scan_container = lv_obj_create(function_page);
     lv_obj_set_size(scan_container, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
@@ -14189,8 +14174,8 @@ static void show_attack_tiles_screen(void)
 // Global WiFi Attacks screen
 static void show_global_attacks_screen(void)
 {
-    create_function_page_base("Global WiFi Attacks");
-    
+    create_function_page_base(g_redteam_mode ? "Global WiFi Attacks" : "Global WiFi Tests");
+
     lv_obj_t *tiles = lv_obj_create(function_page);
     lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
@@ -14200,24 +14185,27 @@ static void show_global_attacks_screen(void)
     lv_obj_set_style_pad_gap(tiles, 10, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
-    
-    // Blackout tile - Red (dangerous)
-    lv_obj_t *blackout_tile = create_tile(tiles, LV_SYMBOL_POWER, "Blackout", COLOR_MATERIAL_RED, NULL, NULL);
-    lv_obj_add_event_cb(blackout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Blackout");
-    
-    // Handshaker tile - Amber
-    lv_obj_t *handshaker_tile = create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Handshaker", COLOR_MATERIAL_AMBER, NULL, NULL);
-    lv_obj_add_event_cb(handshaker_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Handshakes");
-    
-    // Portal tile - Orange
-    lv_obj_t *portal_tile = create_tile(tiles, LV_SYMBOL_WIFI, "Portal", COLOR_MATERIAL_ORANGE, NULL, NULL);
-    lv_obj_add_event_cb(portal_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Portal");
-    
-    // Snifferdog tile - Purple
+
+    // Offensive tiles (Blackout / Handshaker / Portal / Beacon) — Red Team only.
+    if (g_redteam_mode) {
+        // Blackout tile - Red (dangerous)
+        lv_obj_t *blackout_tile = create_tile(tiles, LV_SYMBOL_POWER, "Blackout", COLOR_MATERIAL_RED, NULL, NULL);
+        lv_obj_add_event_cb(blackout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Blackout");
+
+        // Handshaker tile - Amber
+        lv_obj_t *handshaker_tile = create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Handshaker", COLOR_MATERIAL_AMBER, NULL, NULL);
+        lv_obj_add_event_cb(handshaker_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Handshakes");
+
+        // Portal tile - Orange
+        lv_obj_t *portal_tile = create_tile(tiles, LV_SYMBOL_WIFI, "Portal", COLOR_MATERIAL_ORANGE, NULL, NULL);
+        lv_obj_add_event_cb(portal_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Portal");
+    }
+
+    // Snifferdog tile - Purple (deauth-detection / recon)
     lv_obj_t *snifferdog_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Sniffer dog", COLOR_MATERIAL_PURPLE, NULL, NULL);
     lv_obj_add_event_cb(snifferdog_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Snifferdog");
-    
-    // Wardrive tile - Teal
+
+    // Wardrive tile - Teal (recon)
     lv_obj_t *wardrive_tile = create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, NULL, NULL);
     lv_obj_add_event_cb(wardrive_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Start Wardrive");
 
@@ -15001,8 +14989,6 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_wifi_monitor_screen();
     } else if (strcmp(tile_name, "Admin Portal") == 0) {
         show_admin_portal_screen();
-    } else if (strcmp(tile_name, "File Manager") == 0) {
-        show_file_manager_screen();
     } else if (strcmp(tile_name, "Wardrive") == 0) {
         show_wardrive_settings_screen();
     } else if (strcmp(tile_name, "Scan Time") == 0) {
@@ -15030,104 +15016,183 @@ static void settings_tile_event_cb(lv_event_t *e)
 }
 
 // ============================================================================
-// Wardrive Settings — NVS-backed tunables for the WDP wardrive engine.
+// Wardrive Settings — NVS-backed tunables for the WDP wardrive engine. Styled
+// after the M5Monster example: a scrollable form with band checkboxes, an RSSI
+// re-log slider, memory/anti-surv dropdowns, toggles, and a manage button.
 // ============================================================================
-static void wd_settings_add_row(lv_obj_t *parent, int id, const char *name, const char *value)
+
+// Cyan section header, like the example repo.
+static lv_obj_t *wd_section_label(lv_obj_t *parent, const char *text)
 {
-    lv_obj_t *btn = lv_btn_create(parent);
-    lv_obj_set_width(btn, lv_pct(96));
-    lv_obj_set_height(btn, 46);
-    lv_obj_set_style_bg_color(btn, ui_panel_color(), 0);
-    lv_obj_set_style_radius(btn, 8, 0);
-    lv_obj_set_style_pad_hor(btn, 12, 0);
-    lv_obj_add_event_cb(btn, wardrive_settings_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)id);
-
-    lv_obj_t *nl = lv_label_create(btn);
-    lv_label_set_text(nl, name);
-    lv_obj_set_style_text_color(nl, ui_text_color(), 0);
-    lv_obj_set_style_text_font(nl, &lv_font_montserrat_14, 0);
-    lv_obj_align(nl, LV_ALIGN_LEFT_MID, 0, 0);
-
-    lv_obj_t *vl = lv_label_create(btn);
-    lv_label_set_text(vl, value);
-    lv_obj_set_style_text_color(vl, ui_accent_color(), 0);
-    lv_obj_set_style_text_font(vl, &lv_font_montserrat_16, 0);
-    lv_obj_align(vl, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_t *l = lv_label_create(parent);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_color(l, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+    return l;
 }
 
-static void wardrive_settings_row_cb(lv_event_t *e)
+// A transparent, borderless flex row filling the form width.
+static lv_obj_t *wd_flow_row(lv_obj_t *parent, lv_flex_align_t main_align)
 {
-    int id = (int)(intptr_t)lv_event_get_user_data(e);
-    switch (id) {
-        case 0:
-            wd_scan_5ghz = !wd_scan_5ghz;
-            nvs_settings_save_wd_5ghz(wd_scan_5ghz);
-            break;
-        case 1: {
-            static const uint8_t steps[] = {0, 3, 5, 10, 15, 20};
-            int n = (int)(sizeof(steps) / sizeof(steps[0])), cur = 0;
-            for (int i = 0; i < n; i++) if (steps[i] == wd_rssi_relog_delta) cur = i;
-            wd_rssi_relog_delta = steps[(cur + 1) % n];
-            nvs_settings_save_wd_rssidelta(wd_rssi_relog_delta);
-            break;
-        }
-        case 2:
-            wd_require_gps = !wd_require_gps;
-            nvs_settings_save_wd_reqgps(wd_require_gps);
-            break;
-        case 3: {
-            uint8_t v = (uint8_t)(wd_mem_cap_mb + 2);
-            if (v > 8) v = 2;
-            wd_mem_cap_mb = v;
-            nvs_settings_save_wd_memcap(v);
-            break;
-        }
-        case 4: {
-            static const uint16_t steps[] = {50, 100, 150, 200, 300};
-            int n = (int)(sizeof(steps) / sizeof(steps[0])), cur = 0;
-            for (int i = 0; i < n; i++) if (steps[i] == antisurv_sens_m) cur = i;
-            antisurv_sens_m = steps[(cur + 1) % n];
-            nvs_settings_save_antisurv_m(antisurv_sens_m);
-            break;
-        }
-        case 5:
-            wd_home_upload = !wd_home_upload;
-            nvs_settings_save_home_upload(wd_home_upload);
-            break;
-        case 6:
-            show_home_mgmt_screen();   // navigate to the home-network manager
-            return;
-        default: break;
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_style_pad_column(row, 16, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, main_align, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    return row;
+}
+
+static void wd_5ghz_cb(lv_event_t *e)
+{
+    wd_scan_5ghz = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    nvs_settings_save_wd_5ghz(wd_scan_5ghz);
+}
+static void wd_reqgps_cb(lv_event_t *e)
+{
+    wd_require_gps = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    nvs_settings_save_wd_reqgps(wd_require_gps);
+}
+static void wd_home_cb(lv_event_t *e)
+{
+    wd_home_upload = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    nvs_settings_save_home_upload(wd_home_upload);
+}
+static void wd_rssi_slider_cb(lv_event_t *e)
+{
+    wd_rssi_relog_delta = (uint8_t)lv_slider_get_value(lv_event_get_target(e));
+    nvs_settings_save_wd_rssidelta(wd_rssi_relog_delta);
+    if (wd_rssi_val_label) {
+        char b[16];
+        if (wd_rssi_relog_delta == 0) snprintf(b, sizeof(b), "off");
+        else                          snprintf(b, sizeof(b), "%u dBm", wd_rssi_relog_delta);
+        lv_label_set_text(wd_rssi_val_label, b);
     }
-    show_wardrive_settings_screen();   // re-render with the new value
+}
+static void wd_memcap_dd_cb(lv_event_t *e)
+{
+    static const uint8_t caps[] = {2, 4, 6, 8};
+    uint32_t sel = lv_dropdown_get_selected(lv_event_get_target(e));
+    if (sel < 4) { wd_mem_cap_mb = caps[sel]; nvs_settings_save_wd_memcap(wd_mem_cap_mb); }
+}
+static void wd_antisurv_dd_cb(lv_event_t *e)
+{
+    static const uint16_t dist[] = {200, 100, 50};   // low / med / high sensitivity
+    uint32_t sel = lv_dropdown_get_selected(lv_event_get_target(e));
+    if (sel < 3) { antisurv_sens_m = dist[sel]; nvs_settings_save_antisurv_m(antisurv_sens_m); }
+}
+static void wd_managehome_cb(lv_event_t *e)
+{
+    (void)e;
+    show_home_mgmt_screen();
 }
 
 static void show_wardrive_settings_screen(void)
 {
     create_function_page_base("Wardrive Settings");
+    wd_rssi_val_label = NULL;
 
-    lv_obj_t *list = lv_obj_create(function_page);
-    lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30);
-    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(list, ui_bg_color(), 0);
-    lv_obj_set_style_border_width(list, 0, 0);
-    lv_obj_set_style_pad_all(list, 8, 0);
-    lv_obj_set_style_pad_row(list, 6, 0);
-    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *form = lv_obj_create(function_page);
+    lv_obj_set_size(form, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(form, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(form, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(form, 0, 0);
+    lv_obj_set_style_pad_all(form, 10, 0);
+    lv_obj_set_style_pad_row(form, 8, 0);
+    lv_obj_set_flex_flow(form, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(form, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_scrollbar_mode(form, LV_SCROLLBAR_MODE_AUTO);
 
-    char buf[24];
-    wd_settings_add_row(list, 0, "5 GHz band", wd_scan_5ghz ? "ON" : "OFF");
-    if (wd_rssi_relog_delta == 0) snprintf(buf, sizeof(buf), "OFF");
-    else                          snprintf(buf, sizeof(buf), "%u dBm", wd_rssi_relog_delta);
-    wd_settings_add_row(list, 1, "RSSI re-log delta", buf);
-    wd_settings_add_row(list, 2, "Require GPS fix", wd_require_gps ? "ON" : "OFF");
-    snprintf(buf, sizeof(buf), "%u MB", wd_mem_cap_mb);
-    wd_settings_add_row(list, 3, "Memory cap", buf);
-    snprintf(buf, sizeof(buf), "%u m", antisurv_sens_m);
-    wd_settings_add_row(list, 4, "Anti-surv distance", buf);
-    wd_settings_add_row(list, 5, "Home auto-upload", wd_home_upload ? "ON" : "OFF");
-    wd_settings_add_row(list, 6, "Manage home networks", LV_SYMBOL_RIGHT);
+    // ---- Bands ----
+    wd_section_label(form, "Bands");
+    lv_obj_t *band_row = wd_flow_row(form, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_column(band_row, 24, 0);
+    lv_obj_t *cb24 = lv_checkbox_create(band_row);
+    lv_checkbox_set_text(cb24, "2.4 GHz");
+    lv_obj_set_style_text_color(cb24, ui_text_color(), 0);
+    lv_obj_add_state(cb24, LV_STATE_CHECKED | LV_STATE_DISABLED);   // always scanned
+    lv_obj_t *cb5 = lv_checkbox_create(band_row);
+    lv_checkbox_set_text(cb5, "5 GHz");
+    lv_obj_set_style_text_color(cb5, ui_text_color(), 0);
+    if (wd_scan_5ghz) lv_obj_add_state(cb5, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(cb5, wd_5ghz_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // ---- WiFi RSSI re-log delta ----
+    lv_obj_t *rssi_hdr = wd_flow_row(form, LV_FLEX_ALIGN_SPACE_BETWEEN);
+    wd_section_label(rssi_hdr, "WiFi RSSI re-log delta");
+    wd_rssi_val_label = lv_label_create(rssi_hdr);
+    {
+        char b[16];
+        if (wd_rssi_relog_delta == 0) snprintf(b, sizeof(b), "off");
+        else                          snprintf(b, sizeof(b), "%u dBm", wd_rssi_relog_delta);
+        lv_label_set_text(wd_rssi_val_label, b);
+    }
+    lv_obj_set_style_text_color(wd_rssi_val_label, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_t *rssi_slider = lv_slider_create(form);
+    lv_slider_set_range(rssi_slider, 0, 50);
+    lv_slider_set_value(rssi_slider, wd_rssi_relog_delta, LV_ANIM_OFF);
+    lv_obj_set_width(rssi_slider, lv_pct(100));
+    lv_obj_add_event_cb(rssi_slider, wd_rssi_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // ---- Memory cap + Anti-surv sensitivity (side by side) ----
+    lv_obj_t *dd_row = wd_flow_row(form, LV_FLEX_ALIGN_START);
+    lv_obj_t *memcap_col = lv_obj_create(dd_row);
+    lv_obj_set_size(memcap_col, lv_pct(48), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(memcap_col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(memcap_col, 0, 0);
+    lv_obj_set_style_pad_all(memcap_col, 0, 0);
+    lv_obj_set_style_pad_row(memcap_col, 4, 0);
+    lv_obj_set_flex_flow(memcap_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(memcap_col, LV_OBJ_FLAG_SCROLLABLE);
+    wd_section_label(memcap_col, "Memory cap");
+    lv_obj_t *memcap_dd = lv_dropdown_create(memcap_col);
+    lv_dropdown_set_options(memcap_dd, "2 MB\n4 MB\n6 MB\n8 MB");
+    lv_dropdown_set_selected(memcap_dd, (wd_mem_cap_mb <= 2) ? 0 : (wd_mem_cap_mb / 2) - 1);
+    lv_obj_set_width(memcap_dd, lv_pct(100));
+    lv_obj_add_event_cb(memcap_dd, wd_memcap_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *antisurv_col = lv_obj_create(dd_row);
+    lv_obj_set_size(antisurv_col, lv_pct(48), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(antisurv_col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(antisurv_col, 0, 0);
+    lv_obj_set_style_pad_all(antisurv_col, 0, 0);
+    lv_obj_set_style_pad_row(antisurv_col, 4, 0);
+    lv_obj_set_flex_flow(antisurv_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(antisurv_col, LV_OBJ_FLAG_SCROLLABLE);
+    wd_section_label(antisurv_col, "Anti-surv sens.");
+    lv_obj_t *antisurv_dd = lv_dropdown_create(antisurv_col);
+    lv_dropdown_set_options(antisurv_dd, "low\nmed\nhigh");
+    lv_dropdown_set_selected(antisurv_dd, (antisurv_sens_m >= 200) ? 0 : (antisurv_sens_m >= 100 ? 1 : 2));
+    lv_obj_set_width(antisurv_dd, lv_pct(100));
+    lv_obj_add_event_cb(antisurv_dd, wd_antisurv_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // ---- Require GPS fix ----
+    lv_obj_t *gps_cb = lv_checkbox_create(form);
+    lv_checkbox_set_text(gps_cb, "Require GPS fix");
+    lv_obj_set_style_text_color(gps_cb, ui_text_color(), 0);
+    if (wd_require_gps) lv_obj_add_state(gps_cb, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(gps_cb, wd_reqgps_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // ---- Auto-upload (home networks) ----
+    wd_section_label(form, "Auto-upload (home networks)");
+    lv_obj_t *home_cb = lv_checkbox_create(form);
+    lv_checkbox_set_text(home_cb, "Auto upload on home network");
+    lv_obj_set_style_text_color(home_cb, ui_text_color(), 0);
+    if (wd_home_upload) lv_obj_add_state(home_cb, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(home_cb, wd_home_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *mh_btn = lv_btn_create(form);
+    lv_obj_set_size(mh_btn, lv_pct(100), 44);
+    lv_obj_set_style_bg_color(mh_btn, lv_color_hex(0x455A64), 0);
+    lv_obj_set_style_radius(mh_btn, 8, 0);
+    lv_obj_add_event_cb(mh_btn, wd_managehome_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *mh_lbl = lv_label_create(mh_btn);
+    lv_label_set_text(mh_lbl, LV_SYMBOL_LIST " Manage home networks...");
+    lv_obj_set_style_text_color(mh_lbl, lv_color_white(), 0);
+    lv_obj_center(mh_lbl);
 }
 
 // Settings screen - shows submenu with Compromised Data, Scan Time, RedTeam mode, Download Mode
@@ -15151,11 +15216,8 @@ static void show_settings_screen(void)
     // Admin Portal - Teal: WPA2 AP + web file manager for /sdcard/lab
     create_tile(tiles, LV_SYMBOL_SD_CARD, "Admin\nPortal", COLOR_MATERIAL_TEAL, settings_tile_event_cb, "Admin Portal");
 
-    // File Manager - Cyan: on-device SD card browser
-    create_tile(tiles, LV_SYMBOL_DIRECTORY, "File\nManager", COLOR_MATERIAL_CYAN, settings_tile_event_cb, "File Manager");
-
     // Wardrive settings - Green: WDP engine tunables
-    create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "Wardrive");
+    create_tile(tiles, LV_SYMBOL_GPS, "Wardrive\nSettings", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "Wardrive");
 
     // Scan Time - Purple
     create_tile(tiles, LV_SYMBOL_LOOP, "Scan\nTime", COLOR_MATERIAL_PURPLE, settings_tile_event_cb, "Scan Time");
@@ -19104,231 +19166,6 @@ static void show_admin_portal_screen(void)
     lv_obj_add_event_cb(admin_keyboard, admin_kb_event_cb, LV_EVENT_CANCEL, NULL);
 
     admin_screen_active = true;
-    ui_locked = false;
-}
-
-// ============================================================================
-// File Manager — on-device SD browser rooted at /sdcard. Tap a folder to enter,
-// ".." to go up, a file to open a Delete/Cancel action popup. Full editing
-// (rename/upload/download/text edit) lives in the web Admin Portal.
-// ============================================================================
-static lv_obj_t *fm_popup = NULL;
-
-static void fm_popup_close(void)
-{
-    if (fm_popup) {
-        lv_obj_del(fm_popup);
-        fm_popup = NULL;
-    }
-}
-
-static void fm_cancel_cb(lv_event_t *e)
-{
-    (void)e;
-    fm_popup_close();
-}
-
-static void fm_delete_cb(lv_event_t *e)
-{
-    (void)e;
-    if (fm_pending_path[0]) {
-        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
-            struct stat st;
-            if (stat(fm_pending_path, &st) == 0) {
-                if (S_ISDIR(st.st_mode)) rmdir(fm_pending_path);   // only if empty
-                else remove(fm_pending_path);
-            }
-            xSemaphoreGive(sd_spi_mutex);
-        }
-        fm_pending_path[0] = '\0';
-    }
-    fm_popup_close();
-    fm_refresh();
-}
-
-// Action popup for a tapped file: show name + Delete / Cancel.
-static void fm_show_file_actions(const char *fullpath)
-{
-    strncpy(fm_pending_path, fullpath, sizeof(fm_pending_path) - 1);
-    fm_pending_path[sizeof(fm_pending_path) - 1] = '\0';
-
-    fm_popup_close();
-    fm_popup = lv_obj_create(function_page);
-    lv_obj_set_size(fm_popup, lv_pct(88), 150);
-    lv_obj_center(fm_popup);
-    lv_obj_set_style_bg_color(fm_popup, ui_panel_color(), 0);
-    lv_obj_set_style_border_color(fm_popup, ui_accent_color(), 0);
-    lv_obj_set_style_border_width(fm_popup, 2, 0);
-    lv_obj_set_style_radius(fm_popup, 10, 0);
-    lv_obj_clear_flag(fm_popup, LV_OBJ_FLAG_SCROLLABLE);
-
-    const char *base = strrchr(fullpath, '/');
-    base = base ? base + 1 : fullpath;
-    char msg[160];
-    snprintf(msg, sizeof(msg), "%.140s", base);
-    lv_obj_t *name = lv_label_create(fm_popup);
-    lv_label_set_text(name, msg);
-    lv_label_set_long_mode(name, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(name, lv_pct(96));
-    lv_obj_set_style_text_color(name, ui_text_color(), 0);
-    lv_obj_set_style_text_font(name, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 6);
-
-    lv_obj_t *del_btn = lv_btn_create(fm_popup);
-    lv_obj_set_size(del_btn, 110, 40);
-    lv_obj_align(del_btn, LV_ALIGN_BOTTOM_LEFT, 4, -6);
-    lv_obj_set_style_bg_color(del_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_radius(del_btn, 8, 0);
-    lv_obj_t *dl = lv_label_create(del_btn);
-    lv_label_set_text(dl, LV_SYMBOL_TRASH " Delete");
-    lv_obj_set_style_text_color(dl, lv_color_white(), 0);
-    lv_obj_center(dl);
-    lv_obj_add_event_cb(del_btn, fm_delete_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *cancel_btn = lv_btn_create(fm_popup);
-    lv_obj_set_size(cancel_btn, 110, 40);
-    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_RIGHT, -4, -6);
-    lv_obj_set_style_bg_color(cancel_btn, ui_accent_color(), LV_STATE_DEFAULT);
-    lv_obj_set_style_radius(cancel_btn, 8, 0);
-    lv_obj_t *cl = lv_label_create(cancel_btn);
-    lv_label_set_text(cl, "Cancel");
-    lv_obj_set_style_text_color(cl, lv_color_white(), 0);
-    lv_obj_center(cl);
-    lv_obj_add_event_cb(cancel_btn, fm_cancel_cb, LV_EVENT_CLICKED, NULL);
-}
-
-// List-item tap: enter a directory, go up, or show the file action popup.
-static void fm_entry_cb(lv_event_t *e)
-{
-    int idx = (int)(intptr_t)lv_event_get_user_data(e);
-    if (idx < 0 || idx >= fm_entry_count) return;
-    if (fm_entry_isdir[idx]) {
-        // Only descend if the path fits fm_cwd (very deep trees are not navigable).
-        if (strlen(fm_entry_paths[idx]) >= sizeof(fm_cwd)) return;
-        strncpy(fm_cwd, fm_entry_paths[idx], sizeof(fm_cwd) - 1);
-        fm_cwd[sizeof(fm_cwd) - 1] = '\0';
-        fm_refresh();
-    } else {
-        fm_show_file_actions(fm_entry_paths[idx]);
-    }
-}
-
-static void fm_up_cb(lv_event_t *e)
-{
-    (void)e;
-    if (strcmp(fm_cwd, FM_ROOT) == 0) return;   // already at root
-    char *slash = strrchr(fm_cwd, '/');
-    if (slash && slash != fm_cwd) {
-        *slash = '\0';
-    }
-    if (strlen(fm_cwd) < strlen(FM_ROOT)) {
-        strcpy(fm_cwd, FM_ROOT);
-    }
-    fm_refresh();
-}
-
-// Rebuild the entry list for fm_cwd (directories first, then files).
-static void fm_refresh(void)
-{
-    if (!fm_list || !lv_obj_is_valid(fm_list) || !fm_entry_paths) return;
-    lv_obj_clean(fm_list);
-    fm_entry_count = 0;
-
-    if (fm_path_label && lv_obj_is_valid(fm_path_label)) {
-        lv_label_set_text(fm_path_label, fm_cwd);
-    }
-
-    // ".. (up)" entry unless at root
-    if (strcmp(fm_cwd, FM_ROOT) != 0) {
-        lv_obj_t *up = lv_list_add_btn(fm_list, LV_SYMBOL_LEFT, ".. (up)");
-        lv_obj_set_style_text_font(up, &lv_font_montserrat_14, 0);
-        lv_obj_add_event_cb(up, fm_up_cb, LV_EVENT_CLICKED, NULL);
-    }
-
-    // Two passes: directories first, then files.
-    for (int pass = 0; pass < 2; pass++) {
-        if (!(sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE)) {
-            break;
-        }
-        DIR *dir = opendir(fm_cwd);
-        if (dir) {
-            struct dirent *ent;
-            while ((ent = readdir(dir)) != NULL && fm_entry_count < FM_MAX_ENTRIES) {
-                if (ent->d_name[0] == '.' &&
-                    (ent->d_name[1] == '\0' ||
-                     (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
-                    continue;
-                }
-                // Use the dirent type directly — a stat() per entry is a separate
-                // SD-SPI transaction, and a burst of them exhausts DMA-capable RAM.
-                bool isdir = (ent->d_type == DT_DIR);
-                if ((pass == 0) != isdir) continue;   // pass 0 = dirs, pass 1 = files
-
-                int i = fm_entry_count;
-                snprintf(fm_entry_paths[i], sizeof(fm_entry_paths[0]), "%s/%s", fm_cwd, ent->d_name);
-
-                fm_entry_isdir[i] = isdir;
-
-                char label[256];
-                snprintf(label, sizeof(label), "%.240s", ent->d_name);
-                lv_obj_t *btn = lv_list_add_btn(fm_list,
-                                                isdir ? LV_SYMBOL_DIRECTORY : LV_SYMBOL_FILE,
-                                                label);
-                lv_obj_set_style_text_font(btn, &lv_font_montserrat_12, 0);
-                lv_obj_add_event_cb(btn, fm_entry_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-                fm_entry_count++;
-            }
-            closedir(dir);
-        }
-        xSemaphoreGive(sd_spi_mutex);
-    }
-
-    if (fm_entry_count == 0 && strcmp(fm_cwd, FM_ROOT) == 0) {
-        lv_list_add_text(fm_list, "SD card empty or not mounted.");
-    }
-}
-
-static void show_file_manager_screen(void)
-{
-    ui_locked = true;
-    create_function_page_base("File Manager");
-    fm_popup = NULL;
-    strcpy(fm_cwd, FM_ROOT);
-
-    // Path table lives in PSRAM (allocated once) to keep internal RAM free.
-    if (!fm_entry_paths) {
-        fm_entry_paths = heap_caps_malloc((size_t)FM_MAX_ENTRIES * FM_PATH_MAX, MALLOC_CAP_SPIRAM);
-        if (!fm_entry_paths) fm_entry_paths = malloc((size_t)FM_MAX_ENTRIES * FM_PATH_MAX);
-    }
-    if (!fm_entry_paths) {
-        lv_obj_t *err = lv_label_create(function_page);
-        lv_label_set_text(err, "Out of memory");
-        lv_obj_center(err);
-        ui_locked = false;
-        return;
-    }
-
-    // Ensure SD is mounted before browsing.
-    ensure_sd_mounted();
-
-    fm_path_label = lv_label_create(function_page);
-    lv_label_set_text(fm_path_label, fm_cwd);
-    lv_label_set_long_mode(fm_path_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_width(fm_path_label, lv_pct(70));
-    lv_obj_set_style_text_color(fm_path_label, ui_accent_color(), 0);
-    lv_obj_set_style_text_font(fm_path_label, &lv_font_montserrat_12, 0);
-    lv_obj_align(fm_path_label, LV_ALIGN_TOP_LEFT, 6, 36);
-
-    fm_list = lv_list_create(function_page);
-    lv_obj_set_size(fm_list, lv_pct(98), LCD_V_RES - 30 - 30);
-    lv_obj_align(fm_list, LV_ALIGN_TOP_MID, 0, 54);
-    lv_obj_set_style_bg_color(fm_list, ui_bg_color(), 0);
-    lv_obj_set_style_border_color(fm_list, ui_accent_color(), 0);
-    lv_obj_set_style_border_width(fm_list, 1, 0);
-    lv_obj_set_style_pad_all(fm_list, 2, 0);
-
-    fm_refresh();
     ui_locked = false;
 }
 

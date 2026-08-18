@@ -120,6 +120,15 @@ static esp_err_t init_wifi(void) {
 }
 
 static esp_err_t init_led(void) {
+    // The RMT-backed LED strip is independent of WiFi, so it only needs creating
+    // once. wifi_cli_init() runs on every WiFi (re)init — e.g. each BLE->WiFi mode
+    // switch after exiting a BLE scan. Re-creating the strip each time leaked an
+    // RMT TX channel; after a few switches "no free tx channels" aborted the app.
+    // Reuse the existing handle instead.
+    if (g_led_strip != NULL) {
+        return ESP_OK;
+    }
+
     led_strip_config_t strip_cfg = {
         .strip_gpio_num = NEOPIXEL_GPIO,
         .max_leds = LED_COUNT,
@@ -127,16 +136,22 @@ static esp_err_t init_led(void) {
         .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
         .flags.invert_out = false,
     };
-    
+
     led_strip_rmt_config_t rmt_cfg = {
         .clk_src = LED_STRIP_RMT_CLK_SRC_DEFAULT,
         .resolution_hz = RMT_RES_HZ,
         .flags.with_dma = false,
     };
-    
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &g_led_strip));
+
+    // Non-fatal: a transient RMT/allocation failure must not abort the whole system.
+    esp_err_t err = led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &g_led_strip);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "LED strip init failed: %s", esp_err_to_name(err));
+        g_led_strip = NULL;
+        return err;
+    }
     ESP_LOGI(TAG, "LED strip initialized");
-    
+
     return ESP_OK;
 }
 
