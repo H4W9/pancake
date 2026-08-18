@@ -824,6 +824,13 @@ static volatile int  wardrive_home_hit = -1;   // index of a home SSID seen (-1 
 static volatile bool wardrive_home_prompted = false;
 static lv_obj_t *wardrive_home_overlay = NULL;
 
+// Home Networks manager (Settings -> Wardrive -> Manage home networks)
+static lv_obj_t *home_mgmt_list      = NULL;
+static lv_obj_t *home_add_overlay    = NULL;
+static lv_obj_t *home_add_ssid_ta    = NULL;
+static lv_obj_t *home_add_pw_ta      = NULL;
+static lv_obj_t *home_add_keyboard   = NULL;
+
 static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
 static int wdp_ducb_channel_count = 0;
 static double wdp_ducb_discounted_total = 0.0;
@@ -1327,6 +1334,12 @@ static void reset_function_page_children(void) {
     wardrive_home_overlay = NULL;   // overlay lived on lv_scr_act; cleared on nav
     wardrive_home_hit = -1;
     wardrive_home_prompted = false;
+    // Home Networks manager widgets (children of function_page, cleared on nav)
+    home_mgmt_list = NULL;
+    home_add_overlay = NULL;
+    home_add_ssid_ta = NULL;
+    home_add_pw_ta = NULL;
+    home_add_keyboard = NULL;
     karma_log_ta = NULL;
     karma_stop_btn = NULL;
     karma_content = NULL;
@@ -1546,10 +1559,19 @@ static void wdp_trace_add_point(const char *path, wdp_trace_ctx_t *c,
 static bool wdp_trace_write_poi(const char *path, wdp_trace_ctx_t *c, const wdp_poi_msg_t *p);
 static void wardrive_trace_finalize_file(const char *path);
 static void wardrive_load_home(void);
+static void wardrive_save_home(void);
 static void wardrive_show_home_prompt(int idx);
 static void wardrive_stop_for_home_upload(void);
 static void wardrive_home_yes_cb(lv_event_t *e);
 static void wardrive_home_no_cb(lv_event_t *e);
+static void show_home_mgmt_screen(void);
+static void home_mgmt_refresh(void);
+static void home_mgmt_delete_cb(lv_event_t *e);
+static void home_mgmt_add_open_cb(lv_event_t *e);
+static void home_mgmt_add_save_cb(lv_event_t *e);
+static void home_mgmt_add_cancel_cb(lv_event_t *e);
+static void home_mgmt_ta_event_cb(lv_event_t *e);
+static void home_mgmt_kb_event_cb(lv_event_t *e);
 static void show_karma_page(void);
 static void karma_start_btn_cb(lv_event_t *e);
 static void karma_stop_btn_cb(lv_event_t *e);
@@ -9324,6 +9346,231 @@ static void wardrive_show_home_prompt(int idx)
     lv_obj_add_event_cb(yes_btn, wardrive_home_yes_cb, LV_EVENT_CLICKED, NULL);
 }
 
+// Write wardrive_home[] back to /sdcard/lab/home.txt (SSID<TAB>password per line).
+static void wardrive_save_home(void)
+{
+    if (!(sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE)) return;
+    struct stat st;
+    if (stat("/sdcard/lab", &st) != 0) mkdir("/sdcard/lab", 0777);
+    FILE *f = fopen("/sdcard/lab/home.txt", "w");
+    if (f) {
+        fprintf(f, "# Home networks for wardrive auto-upload. One per line:\n");
+        fprintf(f, "#   SSID    or    SSID<TAB>password\n");
+        for (int i = 0; i < wardrive_home_count; i++) {
+            if (wardrive_home[i].password[0])
+                fprintf(f, "%s\t%s\n", wardrive_home[i].ssid, wardrive_home[i].password);
+            else
+                fprintf(f, "%s\n", wardrive_home[i].ssid);
+        }
+        fclose(f);
+    }
+    xSemaphoreGive(sd_spi_mutex);
+}
+
+static void home_mgmt_kb_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if ((code == LV_EVENT_READY || code == LV_EVENT_CANCEL) && home_add_keyboard)
+        lv_obj_add_flag(home_add_keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void home_mgmt_ta_event_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = lv_event_get_target(e);
+    if (home_add_keyboard) {
+        lv_keyboard_set_textarea(home_add_keyboard, ta);
+        lv_obj_clear_flag(home_add_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void home_mgmt_delete_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= wardrive_home_count) return;
+    for (int i = idx; i < wardrive_home_count - 1; i++)
+        wardrive_home[i] = wardrive_home[i + 1];
+    wardrive_home_count--;
+    wardrive_save_home();
+    home_mgmt_refresh();
+}
+
+static void home_mgmt_add_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (home_add_overlay) { lv_obj_del(home_add_overlay); home_add_overlay = NULL; }
+    home_add_ssid_ta = NULL;
+    home_add_pw_ta = NULL;
+    home_add_keyboard = NULL;
+}
+
+static void home_mgmt_add_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (home_add_ssid_ta) {
+        const char *ssid = lv_textarea_get_text(home_add_ssid_ta);
+        const char *pw = home_add_pw_ta ? lv_textarea_get_text(home_add_pw_ta) : "";
+        if (ssid && ssid[0] && wardrive_home_count < WARDRIVE_HOME_MAX) {
+            wardrive_home_t *h = &wardrive_home[wardrive_home_count];
+            strncpy(h->ssid, ssid, sizeof(h->ssid) - 1);
+            h->ssid[sizeof(h->ssid) - 1] = '\0';
+            h->password[0] = '\0';
+            if (pw && pw[0]) {
+                strncpy(h->password, pw, sizeof(h->password) - 1);
+                h->password[sizeof(h->password) - 1] = '\0';
+            }
+            wardrive_home_count++;
+            wardrive_save_home();
+        }
+    }
+    home_mgmt_add_cancel_cb(NULL);
+    home_mgmt_refresh();
+}
+
+static void home_mgmt_add_open_cb(lv_event_t *e)
+{
+    (void)e;
+    if (home_add_overlay || !function_page) return;
+    if (wardrive_home_count >= WARDRIVE_HOME_MAX) return;
+
+    home_add_overlay = lv_obj_create(function_page);
+    lv_obj_set_size(home_add_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(home_add_overlay, 0, 0);
+    lv_obj_set_style_bg_color(home_add_overlay, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(home_add_overlay, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(home_add_overlay, 0, 0);
+    lv_obj_clear_flag(home_add_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *tl = lv_label_create(home_add_overlay);
+    lv_label_set_text(tl, "Add home network");
+    lv_obj_set_style_text_color(tl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(tl, &lv_font_montserrat_16, 0);
+    lv_obj_align(tl, LV_ALIGN_TOP_MID, 0, 8);
+
+    home_add_ssid_ta = lv_textarea_create(home_add_overlay);
+    lv_textarea_set_one_line(home_add_ssid_ta, true);
+    lv_textarea_set_placeholder_text(home_add_ssid_ta, "SSID");
+    lv_obj_set_width(home_add_ssid_ta, lv_pct(90));
+    lv_obj_align(home_add_ssid_ta, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_add_event_cb(home_add_ssid_ta, home_mgmt_ta_event_cb, LV_EVENT_CLICKED, NULL);
+
+    home_add_pw_ta = lv_textarea_create(home_add_overlay);
+    lv_textarea_set_one_line(home_add_pw_ta, true);
+    lv_textarea_set_placeholder_text(home_add_pw_ta, "password (optional)");
+    lv_obj_set_width(home_add_pw_ta, lv_pct(90));
+    lv_obj_align(home_add_pw_ta, LV_ALIGN_TOP_MID, 0, 74);
+    lv_obj_add_event_cb(home_add_pw_ta, home_mgmt_ta_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *cancel = lv_btn_create(home_add_overlay);
+    lv_obj_set_size(cancel, 100, 38);
+    lv_obj_align(cancel, LV_ALIGN_TOP_LEFT, 20, 116);
+    lv_obj_set_style_bg_color(cancel, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_radius(cancel, 8, 0);
+    lv_obj_t *cl = lv_label_create(cancel);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_set_style_text_color(cl, ui_text_color(), 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel, home_mgmt_add_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save = lv_btn_create(home_add_overlay);
+    lv_obj_set_size(save, 100, 38);
+    lv_obj_align(save, LV_ALIGN_TOP_RIGHT, -20, 116);
+    lv_obj_set_style_bg_color(save, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(save, 8, 0);
+    lv_obj_t *sl = lv_label_create(save);
+    lv_label_set_text(sl, "Save");
+    lv_obj_set_style_text_color(sl, lv_color_white(), 0);
+    lv_obj_center(sl);
+    lv_obj_add_event_cb(save, home_mgmt_add_save_cb, LV_EVENT_CLICKED, NULL);
+
+    home_add_keyboard = lv_keyboard_create(home_add_overlay);
+    lv_keyboard_set_mode(home_add_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_obj_add_flag(home_add_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_keyboard_set_textarea(home_add_keyboard, home_add_ssid_ta);
+    lv_obj_add_event_cb(home_add_keyboard, home_mgmt_kb_event_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(home_add_keyboard, home_mgmt_kb_event_cb, LV_EVENT_CANCEL, NULL);
+}
+
+static void home_mgmt_refresh(void)
+{
+    if (!home_mgmt_list || !lv_obj_is_valid(home_mgmt_list)) return;
+    lv_obj_clean(home_mgmt_list);
+    if (wardrive_home_count == 0) {
+        lv_obj_t *hint = lv_label_create(home_mgmt_list);
+        lv_label_set_text(hint, "No home networks. Tap + Add.");
+        lv_obj_set_style_text_color(hint, lv_color_make(150, 150, 150), 0);
+        lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+        return;
+    }
+    for (int i = 0; i < wardrive_home_count; i++) {
+        lv_obj_t *row = lv_obj_create(home_mgmt_list);
+        lv_obj_set_size(row, lv_pct(100), 44);
+        lv_obj_set_style_bg_color(row, ui_panel_color(), 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_set_style_pad_hor(row, 10, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        char buf[48];
+        snprintf(buf, sizeof(buf), "%.28s%s", wardrive_home[i].ssid,
+                 wardrive_home[i].password[0] ? "  *" : "");
+        lv_obj_t *lbl = lv_label_create(row);
+        lv_label_set_text(lbl, buf);
+        lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+        lv_obj_t *del = lv_btn_create(row);
+        lv_obj_set_size(del, 74, 34);
+        lv_obj_align(del, LV_ALIGN_RIGHT_MID, 0, 0);
+        lv_obj_set_style_bg_color(del, COLOR_MATERIAL_RED, 0);
+        lv_obj_set_style_radius(del, 6, 0);
+        lv_obj_t *dl = lv_label_create(del);
+        lv_label_set_text(dl, "Delete");
+        lv_obj_set_style_text_font(dl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(dl, lv_color_white(), 0);
+        lv_obj_center(dl);
+        lv_obj_add_event_cb(del, home_mgmt_delete_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+}
+
+static void show_home_mgmt_screen(void)
+{
+    create_function_page_base("Home Networks");
+    home_add_overlay = NULL;
+    wardrive_load_home();
+
+    lv_obj_t *hint = lv_label_create(function_page);
+    lv_label_set_text(hint, "Networks that trigger wardrive auto-upload.\n'*' = password saved.");
+    lv_obj_set_style_text_color(hint, ui_text_color(), 0);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 6, 32);
+
+    home_mgmt_list = lv_obj_create(function_page);
+    lv_obj_set_size(home_mgmt_list, lv_pct(98), LCD_V_RES - 30 - 62 - 52);
+    lv_obj_align(home_mgmt_list, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_set_style_bg_color(home_mgmt_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(home_mgmt_list, ui_accent_color(), 0);
+    lv_obj_set_style_border_width(home_mgmt_list, 1, 0);
+    lv_obj_set_flex_flow(home_mgmt_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(home_mgmt_list, 5, 0);
+    lv_obj_set_style_pad_gap(home_mgmt_list, 5, 0);
+    lv_obj_set_scrollbar_mode(home_mgmt_list, LV_SCROLLBAR_MODE_AUTO);
+
+    lv_obj_t *add_btn = lv_btn_create(function_page);
+    lv_obj_set_size(add_btn, 140, 42);
+    lv_obj_align(add_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(add_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(add_btn, 8, 0);
+    lv_obj_t *al = lv_label_create(add_btn);
+    lv_label_set_text(al, LV_SYMBOL_PLUS " Add");
+    lv_obj_set_style_text_font(al, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(al, lv_color_white(), 0);
+    lv_obj_center(al);
+    lv_obj_add_event_cb(add_btn, home_mgmt_add_open_cb, LV_EVENT_CLICKED, NULL);
+
+    home_mgmt_refresh();
+}
+
 // Back To Observer callback from Karma screen
 static void karma_back_to_observer_cb(lv_event_t *e)
 {
@@ -14839,6 +15086,9 @@ static void wardrive_settings_row_cb(lv_event_t *e)
             wd_home_upload = !wd_home_upload;
             nvs_settings_save_home_upload(wd_home_upload);
             break;
+        case 6:
+            show_home_mgmt_screen();   // navigate to the home-network manager
+            return;
         default: break;
     }
     show_wardrive_settings_screen();   // re-render with the new value
@@ -14869,6 +15119,7 @@ static void show_wardrive_settings_screen(void)
     snprintf(buf, sizeof(buf), "%u m", antisurv_sens_m);
     wd_settings_add_row(list, 4, "Anti-surv distance", buf);
     wd_settings_add_row(list, 5, "Home auto-upload", wd_home_upload ? "ON" : "OFF");
+    wd_settings_add_row(list, 6, "Manage home networks", LV_SYMBOL_RIGHT);
 }
 
 // Settings screen - shows submenu with Compromised Data, Scan Time, RedTeam mode, Download Mode
