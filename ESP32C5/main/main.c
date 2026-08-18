@@ -46,6 +46,8 @@
 #include <sys/reent.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <time.h>
 #include "esp_rom_sys.h"
 #include "esp_task_wdt.h"
 #include "nvs_flash.h"
@@ -66,6 +68,7 @@
 
 // TLS (WPA-SEC upload)
 #include "esp_tls.h"
+#include "mbedtls/base64.h"
 
 // NimBLE (BLE scanner)
 #include "nimble/nimble_port.h"
@@ -248,6 +251,13 @@ static inline lv_color_t ui_accent_color(void) {
 #define WPASEC_URL           "https://wpa-sec.stanev.org/"
 #define WPASEC_KEY_PATH      "/sdcard/lab/wpa-sec.txt"
 #define WPASEC_KEY_MAX_LEN   65
+
+// WiGLE upload constants (wardrive CSV .log files -> wigle.net)
+#define WIGLE_URL            "https://api.wigle.net"
+#define WIGLE_UPLOAD_PATH    "/api/v2/file/upload"
+#define WIGLE_KEY_PATH       "/sdcard/lab/wigle_key.txt"   // one line: apiName:apiToken
+#define WIGLE_KEY_MAX_LEN    160                            // apiName(64)+":"+token(64)+slack
+#define WIGLE_WARDRIVE_DIR   "/sdcard/lab/wardrives"
 
 typedef int (*vprintf_like_t)(const char *, va_list);
 
@@ -709,6 +719,8 @@ static const uint8_t wdp_ch_5_dfs[]        = {52, 56, 60, 64, 100, 104, 108, 112
 #define WDP_PSRAM_RESERVE_BYTES   (64 * 1024)
 #define WDP_STATS_INTERVAL_US     (30 * 1000000LL)
 #define WDP_FILE_FLUSH_INTERVAL   50
+#define WDP_RELOG_DISTANCE_M      25.0   // re-log a known AP after moving this far (WiGLE trilateration)
+#define WDP_GPS_FIX_LOST_THRESHOLD 3     // tolerate this many cycles of lost fix before pausing
 
 typedef enum {
     WDP_TIER_24_PRIMARY,
@@ -732,9 +744,58 @@ typedef struct {
     int8_t   rssi;
     wifi_auth_mode_t authmode;
     bool     written_to_file;
-    float    latitude;
+    float    latitude;          // position queued for the next row written
     float    longitude;
+    bool     last_logged_valid; // last_logged_lat/lon hold a real written position
+    double   last_logged_lat;   // GPS position of the most recent row written (trilateration)
+    double   last_logged_lon;
 } wdp_network_t;
+
+// Wardrive KML trace (drive path + Wi-Fi/BLE POIs), written alongside the .log.
+#define WDP_POI_QUEUE_LEN      64       // Wi-Fi/BLE POI snapshots buffered callback -> task
+#define WDP_TRACE_SEG_POINTS   16       // flush a track segment after this many points
+#define WDP_TRACE_SEG_MS       15000    // ...or this long since the last segment write
+#define WDP_TRACE_MIN_STEP_M   3.0      // minimum movement before a new trace vertex
+#define WDP_TRACE_MAX_STEP_M   100.0    // a larger jump starts a new line, not a false connector
+
+// Snapshot of a first-seen Wi-Fi AP or BLE device handed from a radio callback to
+// the wardrive task over a bounded queue. Callbacks never touch the SD card.
+typedef struct {
+    uint8_t          bssid[6];
+    char             ssid[33];
+    int8_t           rssi;
+    uint8_t          channel;
+    wifi_auth_mode_t authmode;
+    bool             is_ble;
+    bool             is_airtag;
+    bool             is_smarttag;
+    uint16_t         company_id;
+    double           lat;
+    double           lon;
+    float            alt;
+    float            acc;
+    time_t           ts;
+} wdp_poi_msg_t;
+
+// Track-segment builder, touched only by the wardrive task.
+typedef struct {
+    double  seg_lat[WDP_TRACE_SEG_POINTS];
+    double  seg_lon[WDP_TRACE_SEG_POINTS];
+    double  seg_alt[WDP_TRACE_SEG_POINTS];
+    int     seg_n;                       // buffered points not yet written
+    bool    have_prev;                   // prev_* holds the last written vertex (stitch)
+    double  prev_lat, prev_lon, prev_alt;
+    bool    have_cur;                    // cur_* holds the last accepted vertex (3 m gate)
+    double  cur_lat, cur_lon;
+    int64_t last_seg_us;
+    int     seg_written;
+    int     poi_written;
+} wdp_trace_ctx_t;
+
+static wdp_trace_ctx_t   wdp_trace;
+static QueueHandle_t     wdp_poi_queue = NULL;
+static volatile uint32_t wdp_poi_dropped = 0;
+static char              wardrive_trace_path[80] = "";
 
 static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
 static int wdp_ducb_channel_count = 0;
@@ -813,6 +874,7 @@ static char portal_selected_html_name[64] = "";
 #define PENDING_ATTACK_WPA_SEC      2
 #define PENDING_ATTACK_MITM         3
 #define PENDING_ATTACK_NMAP         4
+#define PENDING_ATTACK_WIGLE        5
 static int pending_attack_type = 0;
 static char wifi_connect_ssid[33] = "";
 static char wifi_connect_password[64] = "";
@@ -843,6 +905,16 @@ typedef struct {
 } wpasec_ui_msg_t;
 
 static QueueHandle_t wpasec_ui_queue = NULL;
+
+// WiGLE Upload state (reuses wpasec_ui_msg_t for status messages)
+static char wigle_api_key[WIGLE_KEY_MAX_LEN] = "";   // raw "apiName:apiToken"
+static lv_obj_t *wigle_status_list = NULL;
+static lv_obj_t *wigle_progress_label = NULL;
+static lv_timer_t *wigle_upload_timer = NULL;
+static volatile bool wigle_upload_done = false;
+static volatile bool wigle_upload_active = false;
+static TaskHandle_t wigle_upload_task_handle = NULL;
+static QueueHandle_t wigle_ui_queue = NULL;
 
 // Rogue AP UI state
 static lv_obj_t *rogue_ap_content = NULL;
@@ -1082,6 +1154,17 @@ static lv_obj_t *admin_startstop_lbl  = NULL;
 static lv_obj_t *admin_keyboard       = NULL;
 static volatile bool admin_screen_active = false;
 
+// File Manager UI state — on-device SD browser rooted at /sdcard.
+#define FM_ROOT "/sdcard"
+#define FM_MAX_ENTRIES 96
+static lv_obj_t *fm_list       = NULL;
+static lv_obj_t *fm_path_label = NULL;
+static char fm_cwd[192] = FM_ROOT;
+static char fm_entry_paths[FM_MAX_ENTRIES][224];
+static bool fm_entry_isdir[FM_MAX_ENTRIES];
+static int  fm_entry_count = 0;
+static char fm_pending_path[224] = "";   // file targeted by the action popup
+
 // Battery voltage monitor state (DISABLED - using regular C5 chip)
 static lv_obj_t *battery_label = NULL;  // Keep for UI layout
 static char last_voltage_str[32] = "-.--V";  // Persisted across screen changes
@@ -1312,6 +1395,9 @@ static void reset_function_page_children(void) {
     admin_startstop_lbl = NULL;
     admin_keyboard = NULL;
     admin_screen_active = false;
+    // File Manager: widgets are children of function_page, cleared on nav away.
+    fm_list = NULL;
+    fm_path_label = NULL;
     wifi_connect_ta = NULL;
     wifi_connect_keyboard = NULL;
     wifi_connect_status_label = NULL;
@@ -1328,6 +1414,14 @@ static void reset_function_page_children(void) {
     if (wpasec_upload_timer) {
         lv_timer_del(wpasec_upload_timer);
         wpasec_upload_timer = NULL;
+    }
+    // WiGLE upload cleanup
+    wigle_status_list = NULL;
+    wigle_progress_label = NULL;
+    wigle_upload_active = false;   // Signal background task to stop
+    if (wigle_upload_timer) {
+        lv_timer_del(wigle_upload_timer);
+        wigle_upload_timer = NULL;
     }
 }
 
@@ -1391,6 +1485,16 @@ static void wardrive_stop_btn_cb(lv_event_t *e);
 static esp_err_t wardrive_enable_log_capture(void);
 static void wardrive_disable_log_capture(void);
 static void wardrive_task(void *pvParameters);
+static void sd_sync(void);
+// Wardrive KML trace helpers
+static void xml_escape(const char *in, char *out, size_t outsz);
+static void format_epoch_utc(time_t t, char *buffer, size_t size);
+static bool wardrive_trace_init_file(const char *path);
+static bool wdp_trace_flush_segment(const char *path, wdp_trace_ctx_t *c);
+static void wdp_trace_add_point(const char *path, wdp_trace_ctx_t *c,
+                                double lat, double lon, double alt, double *dist_accum);
+static bool wdp_trace_write_poi(const char *path, wdp_trace_ctx_t *c, const wdp_poi_msg_t *p);
+static void wardrive_trace_finalize_file(const char *path);
 static void show_karma_page(void);
 static void karma_start_btn_cb(lv_event_t *e);
 static void karma_stop_btn_cb(lv_event_t *e);
@@ -1423,6 +1527,14 @@ static int wpasec_tls_write_all(esp_tls_t *tls, const char *buf, int len);
 static int wpasec_upload_file(const char *filepath, const char *filename);
 static void wpasec_upload_task(void *pvParameters);
 static void wpasec_upload_timer_cb(lv_timer_t *timer);
+
+// WiGLE upload helpers
+static void show_wigle_upload_page(void);
+static bool wigle_read_key_from_file(const char *path);
+static bool wigle_read_key_from_sd(void);
+static int wigle_upload_file(const char *filepath, const char *filename);
+static void wigle_upload_task(void *pvParameters);
+static void wigle_upload_timer_cb(lv_timer_t *timer);
 
 // Radio mode switching (WiFi <-> BLE)
 static bool ensure_wifi_mode(void);
@@ -1495,6 +1607,13 @@ static void admin_startstop_cb(lv_event_t *e);
 static void admin_pw_ta_event_cb(lv_event_t *e);
 static void admin_pw_toggle_cb(lv_event_t *e);
 static void admin_kb_event_cb(lv_event_t *e);
+
+// File Manager UI (on-device SD browser)
+static void show_file_manager_screen(void);
+static void fm_refresh(void);
+static void fm_entry_cb(lv_event_t *e);
+static void fm_up_cb(lv_event_t *e);
+static void fm_delete_cb(lv_event_t *e);
 
 // Beacon Spam UI
 static void show_beacon_spam_screen(void);
@@ -7237,6 +7356,16 @@ static int wdp_find_bssid(const uint8_t *bssid) {
     return -1;
 }
 
+// Approximate great-circle distance in metres between two lat/lon points.
+// Flat-earth (equirectangular) approximation — accurate to well under a metre
+// at the ~25 m scale we test against, and cheap enough for the RX callback.
+static double gps_distance_meters(double lat1, double lon1, double lat2, double lon2) {
+    const double M_PER_DEG = 111320.0;
+    double dlat_m = (lat2 - lat1) * M_PER_DEG;
+    double dlon_m = (lon2 - lon1) * M_PER_DEG * cos(lat1 * (M_PI / 180.0));
+    return sqrt(dlat_m * dlat_m + dlon_m * dlon_m);
+}
+
 static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (!wardrive_active) return;
     if (type != WIFI_PKT_MGMT) return;
@@ -7280,8 +7409,23 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 
     int existing = wdp_find_bssid(ap_bssid);
     if (existing >= 0) {
-        if (pkt->rx_ctrl.rssi > wdp_seen_networks[existing].rssi) {
-            wdp_seen_networks[existing].rssi = (int8_t)pkt->rx_ctrl.rssi;
+        wdp_network_t *net = &wdp_seen_networks[existing];
+        if (pkt->rx_ctrl.rssi > net->rssi) {
+            net->rssi = (int8_t)pkt->rx_ctrl.rssi;
+        }
+        // Trilateration: if we've driven >25 m from where this AP was last logged,
+        // queue a fresh row at the new GPS position. Multiple observations of the
+        // same BSSID at different points let WiGLE triangulate its true location.
+        if (current_gps.valid && net->last_logged_valid && net->written_to_file) {
+            double moved = gps_distance_meters(net->last_logged_lat, net->last_logged_lon,
+                                               current_gps.latitude, current_gps.longitude);
+            if (moved >= WDP_RELOG_DISTANCE_M) {
+                net->latitude = current_gps.latitude;
+                net->longitude = current_gps.longitude;
+                net->rssi = (int8_t)pkt->rx_ctrl.rssi;
+                net->written_to_file = false;   // the write loop re-logs it
+                wdp_dwell_new_networks++;        // counts as channel activity for D-UCB
+            }
         }
         return;
     }
@@ -7301,8 +7445,28 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     wdp_seen_networks[idx].written_to_file = false;
     wdp_seen_networks[idx].latitude = current_gps.valid ? current_gps.latitude : 0.0f;
     wdp_seen_networks[idx].longitude = current_gps.valid ? current_gps.longitude : 0.0f;
+    wdp_seen_networks[idx].last_logged_valid = false;
+    wdp_seen_networks[idx].last_logged_lat = 0.0;
+    wdp_seen_networks[idx].last_logged_lon = 0.0;
     wdp_seen_count++;
     wdp_dwell_new_networks++;
+
+    // KML trace: hand a compact POI snapshot to the task (never touch SD here).
+    if (wdp_poi_queue && current_gps.valid) {
+        wdp_poi_msg_t poi = {0};
+        memcpy(poi.bssid, ap_bssid, 6);
+        strncpy(poi.ssid, ssid, sizeof(poi.ssid) - 1);
+        poi.rssi     = (int8_t)pkt->rx_ctrl.rssi;
+        poi.channel  = beacon_channel;
+        poi.authmode = authmode;
+        poi.is_ble   = false;
+        poi.lat      = current_gps.latitude;
+        poi.lon      = current_gps.longitude;
+        poi.alt      = current_gps.altitude;
+        poi.acc      = 0.0f;
+        poi.ts       = time(NULL);
+        if (xQueueSend(wdp_poi_queue, &poi, 0) != pdTRUE) wdp_poi_dropped++;
+    }
 }
 
 static bool wdp_grow_network_buffer(void) {
@@ -8192,6 +8356,187 @@ static void handshake_stop_btn_cb(lv_event_t *e)
 }
 
 // Wardrive task kept as wrapper
+// XML-escape a string for KML name/description fields.
+static void xml_escape(const char *in, char *out, size_t outsz) {
+    size_t o = 0;
+    if (outsz == 0) return;
+    for (size_t i = 0; in && in[i] && o + 7 < outsz; i++) {
+        unsigned char c = (unsigned char)in[i];
+        const char *rep = NULL; size_t rlen = 0;
+        switch (c) {
+            case '&':  rep = "&amp;";  rlen = 5; break;
+            case '<':  rep = "&lt;";   rlen = 4; break;
+            case '>':  rep = "&gt;";   rlen = 4; break;
+            case '"':  rep = "&quot;"; rlen = 6; break;
+            case '\'': rep = "&#39;";  rlen = 5; break;
+            default: break;
+        }
+        if (rep) { memcpy(out + o, rep, rlen); o += rlen; }
+        else if (c < 0x20 && c != '\n' && c != '\t') { /* drop control chars */ }
+        else { out[o++] = (char)c; }
+    }
+    out[o] = '\0';
+}
+
+// Format a UTC epoch as "YYYY-MM-DD HH:MM:SS".
+static void format_epoch_utc(time_t t, char *buffer, size_t size) {
+    struct tm tm_utc;
+    gmtime_r(&t, &tm_utc);
+    strftime(buffer, size, "%Y-%m-%d %H:%M:%S", &tm_utc);
+}
+
+// Write the KML header + POI styles and open the <Folder>.
+static bool wardrive_trace_init_file(const char *path) {
+    FILE *file = fopen(path, "w");
+    if (!file) return false;
+    fprintf(file,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n"
+        "<Document>\n"
+        "  <name>Wardrive Trace</name>\n"
+        "  <Style id=\"traceSeg\"><LineStyle><color>ff00ffff</color><width>4</width></LineStyle></Style>\n"
+        "  <Style id=\"wifiOpen\"><IconStyle><color>ff00cc00</color><scale>0.5</scale></IconStyle><LabelStyle><color>ff00cc00</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiWep\"><IconStyle><color>ff00a5ff</color><scale>0.5</scale></IconStyle><LabelStyle><color>ff00a5ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiWpa\"><IconStyle><color>ffff00ff</color><scale>0.5</scale></IconStyle><LabelStyle><color>ffff00ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiWpa2\"><IconStyle><color>ffff0000</color><scale>0.5</scale></IconStyle><LabelStyle><color>ffff0000</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiWpa3\"><IconStyle><color>ff0000ff</color><scale>0.5</scale></IconStyle><LabelStyle><color>ff0000ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiUnknown\"><IconStyle><color>ffb0b0b0</color><scale>0.5</scale></IconStyle><LabelStyle><color>ffb0b0b0</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"blePoi\"><IconStyle><color>ffffff00</color><scale>0.5</scale></IconStyle><LabelStyle><color>ffffff00</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"airTagPoi\"><IconStyle><color>ffff00ff</color><scale>0.6</scale></IconStyle><LabelStyle><color>ffff00ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"smartTagPoi\"><IconStyle><color>ff00d7ff</color><scale>0.6</scale></IconStyle><LabelStyle><color>ff00d7ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Folder>\n    <name>Wardrive</name>\n");
+    fclose(file);
+    return true;
+}
+
+// Write the buffered points as one <Placemark><LineString> segment (>=2 points).
+static bool wdp_trace_flush_segment(const char *path, wdp_trace_ctx_t *c) {
+    if (!c || c->seg_n <= 0) return false;
+    int total = c->seg_n + (c->have_prev ? 1 : 0);
+    if (total < 2) return false;
+
+    FILE *file = fopen(path, "a");
+    if (!file) return false;
+    fprintf(file,
+        "    <Placemark>\n      <name>seg %d</name>\n      <styleUrl>#traceSeg</styleUrl>\n"
+        "      <LineString>\n        <tessellate>1</tessellate>\n        <coordinates>\n",
+        c->seg_written + 1);
+    if (c->have_prev) fprintf(file, "          %.7f,%.7f,%.2f\n", c->prev_lon, c->prev_lat, c->prev_alt);
+    for (int i = 0; i < c->seg_n; i++)
+        fprintf(file, "          %.7f,%.7f,%.2f\n", c->seg_lon[i], c->seg_lat[i], c->seg_alt[i]);
+    fprintf(file, "        </coordinates>\n      </LineString>\n    </Placemark>\n");
+    fclose(file);
+    sd_sync();
+
+    c->prev_lat = c->seg_lat[c->seg_n - 1];
+    c->prev_lon = c->seg_lon[c->seg_n - 1];
+    c->prev_alt = c->seg_alt[c->seg_n - 1];
+    c->have_prev = true;
+    c->seg_written++;
+    c->seg_n = 0;
+    c->last_seg_us = esp_timer_get_time();
+    return true;
+}
+
+// Add a GPS vertex to the track: 3 m sampling, flush a full segment at 16 points,
+// and break the line (no false connector) on a large GPS jump.
+static void wdp_trace_add_point(const char *path, wdp_trace_ctx_t *c,
+                                double lat, double lon, double alt, double *dist_accum) {
+    if (!c) return;
+    if (c->have_cur) {
+        double step = gps_distance_meters(c->cur_lat, c->cur_lon, lat, lon);
+        if (step < WDP_TRACE_MIN_STEP_M) return;
+        if (step > WDP_TRACE_MAX_STEP_M) {
+            wdp_trace_flush_segment(path, c);
+            c->have_prev = false;
+            c->seg_n = 0;
+            c->last_seg_us = esp_timer_get_time();
+        } else if (dist_accum) {
+            *dist_accum += step;
+        }
+    }
+    if (c->seg_n < WDP_TRACE_SEG_POINTS) {
+        c->seg_lat[c->seg_n] = lat;
+        c->seg_lon[c->seg_n] = lon;
+        c->seg_alt[c->seg_n] = alt;
+        c->seg_n++;
+    }
+    c->cur_lat = lat; c->cur_lon = lon; c->have_cur = true;
+    if (c->seg_n >= WDP_TRACE_SEG_POINTS) wdp_trace_flush_segment(path, c);
+}
+
+static const char *wdp_trace_poi_style(wifi_auth_mode_t authmode) {
+    switch (authmode) {
+        case WIFI_AUTH_OPEN:            return "#wifiOpen";
+        case WIFI_AUTH_WEP:             return "#wifiWep";
+        case WIFI_AUTH_WPA_PSK:
+        case WIFI_AUTH_WPA_WPA2_PSK:    return "#wifiWpa";
+        case WIFI_AUTH_WPA2_PSK:
+        case WIFI_AUTH_WPA2_ENTERPRISE: return "#wifiWpa2";
+        case WIFI_AUTH_WPA3_PSK:
+        case WIFI_AUTH_WPA2_WPA3_PSK:   return "#wifiWpa3";
+        default:                        return "#wifiUnknown";
+    }
+}
+
+// Write one Wi-Fi or BLE POI as a <Placemark><Point>. Task-only (touches SD).
+static bool wdp_trace_write_poi(const char *path, wdp_trace_ctx_t *c, const wdp_poi_msg_t *p) {
+    if (!c || !p) return false;
+    FILE *file = fopen(path, "a");
+    if (!file) return false;
+
+    char mac[18];
+    snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             p->bssid[0], p->bssid[1], p->bssid[2], p->bssid[3], p->bssid[4], p->bssid[5]);
+    char ts[32];
+    if (p->ts) format_epoch_utc(p->ts, ts, sizeof(ts));
+    else       snprintf(ts, sizeof(ts), "unknown");
+
+    char name_raw[64];
+    if (p->is_ble && !p->ssid[0]) snprintf(name_raw, sizeof(name_raw), "BLE %s", mac);
+    else                          snprintf(name_raw, sizeof(name_raw), "%s", p->ssid[0] ? p->ssid : "<hidden>");
+    char name_esc[160];
+    xml_escape(name_raw, name_esc, sizeof(name_esc));
+
+    char desc_raw[256];
+    const char *style;
+    if (p->is_ble) {
+        style = p->is_airtag ? "#airTagPoi" : p->is_smarttag ? "#smartTagPoi" : "#blePoi";
+        const char *kind = p->is_airtag ? "AirTag [LE]" : p->is_smarttag ? "SmartTag [LE]" : "BLE";
+        if (p->company_id)
+            snprintf(desc_raw, sizeof(desc_raw),
+                "Address: %s\nType: %s\nRSSI: %d dBm\nManufacturer ID: %u\nTime: %s",
+                mac, kind, (int)p->rssi, (unsigned)p->company_id, ts);
+        else
+            snprintf(desc_raw, sizeof(desc_raw),
+                "Address: %s\nType: %s\nRSSI: %d dBm\nTime: %s", mac, kind, (int)p->rssi, ts);
+    } else {
+        style = wdp_trace_poi_style(p->authmode);
+        snprintf(desc_raw, sizeof(desc_raw),
+            "BSSID: %s\nRSSI: %d dBm\nChannel: %d\nAuth: %s\nTime: %s",
+            mac, (int)p->rssi, (int)p->channel, get_auth_mode_wiggle(p->authmode), ts);
+    }
+    char desc_esc[320];
+    xml_escape(desc_raw, desc_esc, sizeof(desc_esc));
+
+    fprintf(file,
+        "    <Placemark>\n      <name>%s</name>\n      <styleUrl>%s</styleUrl>\n"
+        "      <description>%s</description>\n"
+        "      <Point><coordinates>%.7f,%.7f,%.2f</coordinates></Point>\n    </Placemark>\n",
+        name_esc, style, desc_esc, p->lon, p->lat, p->alt);
+    fclose(file);
+    c->poi_written++;
+    return true;
+}
+
+// Close <Folder>/<Document>/<kml> so the file is valid KML.
+static void wardrive_trace_finalize_file(const char *path) {
+    FILE *file = fopen(path, "a");
+    if (!file) return;
+    fprintf(file, "  </Folder>\n</Document>\n</kml>\n");
+    fclose(file);
+}
+
 static void wardrive_task(void *pvParameters) {
     (void)pvParameters;
     wardrive_promisc_task(pvParameters);
@@ -8259,6 +8604,36 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     wdp_ducb_init();
 
+    // Wardrive KML trace: drive-path track + Wi-Fi POIs alongside the .log. The
+    // promiscuous callback hands POI snapshots over wdp_poi_queue; the task owns
+    // all SD writes. Best-effort — if the KML can't be created, logging continues.
+    memset(&wdp_trace, 0, sizeof(wdp_trace));
+    wdp_trace.last_seg_us = esp_timer_get_time();
+    wdp_poi_dropped = 0;
+    snprintf(wardrive_trace_path, sizeof(wardrive_trace_path),
+             "/sdcard/lab/wardrives/w%d_track.kml", wardrive_file_counter);
+    if (wdp_poi_queue) { vQueueDelete(wdp_poi_queue); wdp_poi_queue = NULL; }
+    wdp_poi_queue = xQueueCreate(WDP_POI_QUEUE_LEN, sizeof(wdp_poi_msg_t));
+    bool trace_ok = false;
+    if (wdp_poi_queue) {
+        if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+        trace_ok = wardrive_trace_init_file(wardrive_trace_path);
+        if (trace_ok && current_gps.valid) {
+            double d = 0;
+            wdp_trace_add_point(wardrive_trace_path, &wdp_trace,
+                                current_gps.latitude, current_gps.longitude,
+                                current_gps.altitude, &d);
+        }
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+    }
+    if (!trace_ok) {
+        if (wdp_poi_queue) { vQueueDelete(wdp_poi_queue); wdp_poi_queue = NULL; }
+        wardrive_trace_path[0] = '\0';
+        ESP_LOGW(TAG, "Wardrive KML trace disabled (no SD/queue)");
+    } else {
+        ESP_LOGI(TAG, "Wardrive KML trace: %s", wardrive_trace_path);
+    }
+
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
     esp_wifi_set_promiscuous_filter(&filt);
     esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
@@ -8266,6 +8641,8 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     int64_t last_stats_us = esp_timer_get_time();
     int networks_since_flush = 0;
+    int gps_fix_lost_count = 0;
+    double wdp_total_distance_m = 0.0;
 
     while (wardrive_active) {
         int ch_idx = wdp_ducb_select_channel();
@@ -8285,8 +8662,15 @@ static void wardrive_promisc_task(void *pvParameters) {
             while (line != NULL) { parse_gps_nmea(line); line = strtok(NULL, "\r\n"); }
         }
 
+        // Debounce GPS-fix loss: a brief NMEA hiccup shouldn't tear down promisc.
+        // Only pause after several consecutive cycles with no valid fix.
         if (!current_gps.valid) {
-            ESP_LOGI(TAG, "[WDP] GPS fix lost, pausing promisc...");
+            gps_fix_lost_count++;
+        } else {
+            gps_fix_lost_count = 0;
+        }
+        if (gps_fix_lost_count >= WDP_GPS_FIX_LOST_THRESHOLD) {
+            ESP_LOGI(TAG, "[WDP] GPS fix lost for %d cycles, pausing promisc...", gps_fix_lost_count);
             esp_wifi_set_promiscuous(false);
             while (wardrive_active && !current_gps.valid) {
                 len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
@@ -8300,6 +8684,26 @@ static void wardrive_promisc_task(void *pvParameters) {
             if (!wardrive_active) break;
             ESP_LOGI(TAG, "[WDP] GPS fix re-acquired, resuming promisc.");
             esp_wifi_set_promiscuous(true);
+            gps_fix_lost_count = 0;
+        }
+
+        // KML trace: extend the drive-path track and flush any queued POIs.
+        // The task owns all SD writes; the callback only enqueues snapshots.
+        if (wardrive_trace_path[0]) {
+            if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+            if (current_gps.valid) {
+                wdp_trace_add_point(wardrive_trace_path, &wdp_trace,
+                                    current_gps.latitude, current_gps.longitude,
+                                    current_gps.altitude, &wdp_total_distance_m);
+            }
+            wdp_poi_msg_t poi;
+            int drained = 0;
+            while (wdp_poi_queue && drained < 32 &&
+                   xQueueReceive(wdp_poi_queue, &poi, 0) == pdTRUE) {
+                wdp_trace_write_poi(wardrive_trace_path, &wdp_trace, &poi);
+                drained++;
+            }
+            if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
         }
 
         if (wdp_needs_grow) wdp_grow_network_buffer();
@@ -8334,6 +8738,11 @@ static void wardrive_promisc_task(void *pvParameters) {
                     mac_str, escaped_ssid, auth, timestamp,
                     net->channel, net->rssi, net->latitude, net->longitude);
             net->written_to_file = true;
+            // Remember where this row was logged so trilateration can measure the
+            // next re-log distance from here.
+            net->last_logged_lat = net->latitude;
+            net->last_logged_lon = net->longitude;
+            net->last_logged_valid = true;
             networks_since_flush++;
             if (networks_since_flush >= WDP_FILE_FLUSH_INTERVAL) {
                 fflush(file);
@@ -8362,12 +8771,25 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
     if (file) { fflush(file); fclose(file); }
+    // Finalize the KML: drain remaining POIs, close the open segment, close tags.
+    if (wardrive_trace_path[0]) {
+        wdp_poi_msg_t poi;
+        while (wdp_poi_queue && xQueueReceive(wdp_poi_queue, &poi, 0) == pdTRUE) {
+            wdp_trace_write_poi(wardrive_trace_path, &wdp_trace, &poi);
+        }
+        wdp_trace_flush_segment(wardrive_trace_path, &wdp_trace);
+        wardrive_trace_finalize_file(wardrive_trace_path);
+    }
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+    if (wdp_poi_queue) { vQueueDelete(wdp_poi_queue); wdp_poi_queue = NULL; }
 
     wardrive_active = false;
     wardrive_task_handle = NULL;
-    ESP_LOGI(TAG, "Wardrive promisc stopped. Total networks: %d. File: w%d.log",
-             wdp_seen_count, wardrive_file_counter);
+    ESP_LOGI(TAG, "Wardrive stopped. Networks:%d TrackSegs:%d POIs:%d Dist:%.0fm File:w%d.log%s",
+             wdp_seen_count, wdp_trace.seg_written, wdp_trace.poi_written,
+             wdp_total_distance_m, wardrive_file_counter,
+             wardrive_trace_path[0] ? " +_track.kml" : "");
+    wardrive_trace_path[0] = '\0';
     vTaskDelete(NULL);
 }
 
@@ -9684,6 +10106,9 @@ static void radio_reset_to_idle(void)
     // WPA-SEC upload
     wpasec_upload_active = false;
 
+    // WiGLE upload
+    wigle_upload_active = false;
+
     // ---- 3. BLE cleanup ----
     if (current_radio_mode == RADIO_MODE_BLE) {
         bt_nimble_deinit();
@@ -9975,6 +10400,7 @@ static void attack_tile_event_cb(lv_event_t *e)
                strcmp(attack_name, "MITM") == 0 ||
                strcmp(attack_name, "Rogue AP") == 0 ||
                strcmp(attack_name, "WPA-SEC Upload") == 0 ||
+               strcmp(attack_name, "WiGLE Upload") == 0 ||
                strcmp(attack_name, "Nmap") == 0) {
         // These attacks require exactly one selected network
         int selected_indices[SCAN_RESULTS_MAX_DISPLAY];
@@ -10028,6 +10454,8 @@ static void attack_tile_event_cb(lv_event_t *e)
                 pending_attack_type = PENDING_ATTACK_ROGUE_AP;
             } else if (strcmp(attack_name, "Nmap") == 0) {
                 pending_attack_type = PENDING_ATTACK_NMAP;
+            } else if (strcmp(attack_name, "WiGLE Upload") == 0) {
+                pending_attack_type = PENDING_ATTACK_WIGLE;
             } else {
                 pending_attack_type = PENDING_ATTACK_WPA_SEC;
             }
@@ -10339,7 +10767,17 @@ static void wifi_connect_btn_cb(lv_event_t *e)
     sta_config.sta.ssid[sizeof(sta_config.sta.ssid) - 1] = '\0';
     strncpy((char *)sta_config.sta.password, wifi_connect_password, sizeof(sta_config.sta.password));
     sta_config.sta.password[sizeof(sta_config.sta.password) - 1] = '\0';
-    
+
+    if (wifi_connect_password[0] == '\0') {
+        // Open networks: also support OWE (Enhanced Open) APs — modern Android
+        // hotspots and public networks advertise no password but require the OWE
+        // handshake + PMF. Threshold stays OPEN so plain-open APs still associate;
+        // owe_enabled is an opt-in capability that doesn't affect plain-open assoc.
+        sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+        sta_config.sta.owe_enabled = true;
+        sta_config.sta.pmf_cfg.capable = true;
+    }
+
     // Ensure STA mode
     wifi_mode_t mode;
     esp_wifi_get_mode(&mode);
@@ -10425,6 +10863,9 @@ static void wifi_connect_next_btn_cb(lv_event_t *e)
             break;
         case PENDING_ATTACK_NMAP:
             show_nmap_screen();
+            break;
+        case PENDING_ATTACK_WIGLE:
+            show_wigle_upload_page();
             break;
         default:
             break;
@@ -12592,6 +13033,536 @@ static void show_wpa_sec_upload_page(void)
     }
 }
 
+// ============================================================================
+// WiGLE Upload Implementation
+// Uploads wardrive CSV files (/sdcard/lab/wardrives/*.log|*.csv, already written
+// in WigleWifi-1.4 format) to api.wigle.net via esp-tls multipart POST with
+// HTTP Basic auth. The API key is "apiName:apiToken" read from
+// /sdcard/lab/wigle_key.txt (Porkchop-compatible) or a file the user picks from
+// SD. Requires an internet-connected STA (connect-first workflow).
+// ============================================================================
+
+// SD file picker state for choosing a WiGLE key file
+#define WIGLE_PICK_MAX 32
+static char wigle_pick_paths[WIGLE_PICK_MAX][160];
+static int  wigle_pick_count = 0;
+
+// Parse "apiName:apiToken" from the first non-empty line of a file into
+// wigle_api_key. Returns true if a well-formed name:token pair was found.
+static bool wigle_read_key_from_file(const char *path)
+{
+    if (!path) return false;
+    bool ok = false;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char line[WIGLE_KEY_MAX_LEN + 8];
+            while (fgets(line, sizeof(line), f)) {
+                // Trim trailing CR/LF/space
+                int len = (int)strlen(line);
+                while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r' ||
+                                   line[len-1] == ' '  || line[len-1] == '\t')) {
+                    line[--len] = '\0';
+                }
+                // Skip leading spaces
+                char *start = line;
+                while (*start == ' ' || *start == '\t') start++;
+                if (*start == '\0' || *start == '#') continue;   // blank/comment
+                char *colon = strchr(start, ':');
+                if (colon && colon != start && *(colon + 1) != '\0' &&
+                    strlen(start) < WIGLE_KEY_MAX_LEN) {
+                    strncpy(wigle_api_key, start, WIGLE_KEY_MAX_LEN - 1);
+                    wigle_api_key[WIGLE_KEY_MAX_LEN - 1] = '\0';
+                    ok = true;
+                }
+                break;  // only look at the first meaningful line
+            }
+            fclose(f);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    return ok;
+}
+
+// Load the WiGLE key from the default file. Tries the Porkchop-style
+// wigle_key.txt first, then ProjectZero's wigle.txt.
+static bool wigle_read_key_from_sd(void)
+{
+    if (wigle_read_key_from_file(WIGLE_KEY_PATH)) return true;
+    return wigle_read_key_from_file("/sdcard/lab/wigle.txt");
+}
+
+// Upload one wardrive CSV to api.wigle.net, streaming the body in 2KB chunks so
+// large logs don't need a full-file RAM buffer. Reads each chunk under the SD
+// mutex but sends it outside the lock, so the display/SD bus isn't blocked for
+// the whole upload.
+// Returns 0 = accepted, 1 = duplicate/already uploaded, 2 = auth error, -1 = error.
+static int wigle_upload_file(const char *filepath, const char *filename)
+{
+    const size_t CHUNK = 2048;
+    int result = -1;
+    FILE *f = NULL;
+    esp_tls_t *tls = NULL;
+    uint8_t *chunk = NULL;
+    long file_size = 0;
+    long remaining = 0;
+    unsigned char b64[240];
+    size_t b64_len = 0;
+    char boundary[40];
+    char body_start[256];
+    char body_end[48];
+    char http_headers[512];
+    char resp_buf[768];
+    int start_len = 0, end_len = 0, body_total_len = 0, hdr_len = 0;
+    int total_read = 0, status = 0;
+    bool duplicate = false, success_false = false;
+    esp_tls_cfg_t tls_cfg = { .crt_bundle_attach = NULL, .timeout_ms = 20000 };
+
+    // Build Basic auth header from "apiName:apiToken"
+    if (mbedtls_base64_encode(b64, sizeof(b64), &b64_len,
+                              (const unsigned char *)wigle_api_key,
+                              strlen(wigle_api_key)) != 0) {
+        ESP_LOGW(TAG, "WiGLE: base64 encode failed");
+        return -1;
+    }
+    b64[b64_len] = '\0';
+
+    // Open the file and read its size (under the SD mutex).
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        f = fopen(filepath, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            file_size = ftell(f);
+            fseek(f, 0, SEEK_SET);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (!f) {
+        ESP_LOGW(TAG, "WiGLE: Failed to open: %s", filepath);
+        return -1;
+    }
+    if (file_size <= 0 || file_size > 16L * 1024 * 1024) {
+        ESP_LOGW(TAG, "WiGLE: Invalid file size: %ld bytes", file_size);
+        goto cleanup;
+    }
+
+    chunk = (uint8_t *)heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM);
+    if (!chunk) chunk = (uint8_t *)malloc(CHUNK);
+    if (!chunk) {
+        ESP_LOGW(TAG, "WiGLE: chunk alloc failed");
+        goto cleanup;
+    }
+
+    // Multipart parts + HTTP request headers
+    snprintf(boundary, sizeof(boundary), "----PancakeWiGLE%lu", (unsigned long)(esp_timer_get_time() / 1000));
+    start_len = snprintf(body_start, sizeof(body_start),
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+        "Content-Type: text/csv\r\n\r\n",
+        boundary, filename);
+    end_len = snprintf(body_end, sizeof(body_end), "\r\n--%s--\r\n", boundary);
+    body_total_len = start_len + (int)file_size + end_len;
+    hdr_len = snprintf(http_headers, sizeof(http_headers),
+        "POST %s HTTP/1.1\r\n"
+        "Host: api.wigle.net\r\n"
+        "Authorization: Basic %s\r\n"
+        "Content-Type: multipart/form-data; boundary=%s\r\n"
+        "Content-Length: %d\r\n"
+        "User-Agent: pancake-wigle\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        WIGLE_UPLOAD_PATH, (char *)b64, boundary, body_total_len);
+
+    tls = esp_tls_init();
+    if (!tls) {
+        ESP_LOGW(TAG, "WiGLE: TLS init failed");
+        goto cleanup;
+    }
+    if (esp_tls_conn_http_new_sync(WIGLE_URL, &tls_cfg, tls) < 0) {
+        ESP_LOGW(TAG, "WiGLE: TLS connect failed");
+        goto cleanup;
+    }
+
+    if (wpasec_tls_write_all(tls, http_headers, hdr_len) < 0 ||
+        wpasec_tls_write_all(tls, body_start, start_len) < 0) {
+        ESP_LOGW(TAG, "WiGLE: header send failed");
+        goto cleanup;
+    }
+
+    // Stream the file body in chunks.
+    remaining = file_size;
+    while (remaining > 0) {
+        size_t want = (remaining > (long)CHUNK) ? CHUNK : (size_t)remaining;
+        size_t got = 0;
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+            got = fread(chunk, 1, want, f);
+            xSemaphoreGive(sd_spi_mutex);
+        }
+        if (got == 0) {
+            ESP_LOGW(TAG, "WiGLE: SD read failed mid-stream");
+            goto cleanup;
+        }
+        if (wpasec_tls_write_all(tls, (const char *)chunk, (int)got) < 0) {
+            ESP_LOGW(TAG, "WiGLE: chunk send failed");
+            goto cleanup;
+        }
+        remaining -= (long)got;
+    }
+
+    if (wpasec_tls_write_all(tls, body_end, end_len) < 0) {
+        ESP_LOGW(TAG, "WiGLE: footer send failed");
+        goto cleanup;
+    }
+
+    // Read response (status line + first part of JSON body)
+    memset(resp_buf, 0, sizeof(resp_buf));
+    while (total_read < (int)sizeof(resp_buf) - 1) {
+        int r = esp_tls_conn_read(tls, resp_buf + total_read, sizeof(resp_buf) - 1 - total_read);
+        if (r <= 0) break;
+        total_read += r;
+    }
+    resp_buf[total_read] = '\0';
+
+    if (total_read > 12 && strncmp(resp_buf, "HTTP/", 5) == 0) {
+        const char *sp = strchr(resp_buf, ' ');
+        if (sp) status = atoi(sp + 1);
+    }
+    duplicate = (strstr(resp_buf, "already") || strstr(resp_buf, "Already") ||
+                 strstr(resp_buf, "duplicate") || strstr(resp_buf, "Duplicate"));
+    success_false = (strstr(resp_buf, "\"success\":false") || strstr(resp_buf, "\"success\": false"));
+
+    if (status == 200 || status == 201 || status == 202) {
+        result = duplicate ? 1 : (success_false ? -1 : 0);
+    } else if (status == 401 || status == 403) {
+        result = 2;   // bad/expired API key
+    } else if (status == 409) {
+        result = 1;   // duplicate
+    } else {
+        ESP_LOGW(TAG, "WiGLE: HTTP error %d", status);
+        result = -1;
+    }
+
+cleanup:
+    if (tls) esp_tls_conn_destroy(tls);
+    if (chunk) free(chunk);
+    if (f) {
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            fclose(f);
+            xSemaphoreGive(sd_spi_mutex);
+        } else {
+            fclose(f);
+        }
+    }
+    return result;
+}
+
+// Background task: upload every wardrive CSV in WIGLE_WARDRIVE_DIR.
+static void wigle_upload_task(void *pvParameters)
+{
+    (void)pvParameters;
+    wpasec_ui_msg_t ui_msg;
+
+    DIR *dir = NULL;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        dir = opendir(WIGLE_WARDRIVE_DIR);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (dir == NULL) {
+        snprintf(ui_msg.text, sizeof(ui_msg.text), "No wardrives folder (%s)", WIGLE_WARDRIVE_DIR);
+        ui_msg.color = lv_color_make(255, 152, 0);
+        if (wigle_ui_queue) xQueueSend(wigle_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+        wigle_upload_done = true;
+        wigle_upload_active = false;
+        wigle_upload_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Count wardrive files (*.log / *.csv / *.txt)
+    struct dirent *entry;
+    int total_files = 0;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_type == DT_DIR) continue;
+            size_t nlen = strlen(entry->d_name);
+            if (nlen > 4 && (strcasecmp(entry->d_name + nlen - 4, ".log") == 0 ||
+                             strcasecmp(entry->d_name + nlen - 4, ".csv") == 0 ||
+                             strcasecmp(entry->d_name + nlen - 4, ".txt") == 0)) {
+                total_files++;
+            }
+        }
+        rewinddir(dir);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    if (total_files == 0) {
+        snprintf(ui_msg.text, sizeof(ui_msg.text), "No wardrive files (.log/.csv/.txt) found");
+        ui_msg.color = lv_color_make(255, 152, 0);
+        if (wigle_ui_queue) xQueueSend(wigle_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            closedir(dir);
+            xSemaphoreGive(sd_spi_mutex);
+        }
+        wigle_upload_done = true;
+        wigle_upload_active = false;
+        wigle_upload_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    snprintf(ui_msg.text, sizeof(ui_msg.text), "Uploading %d wardrive file(s)...", total_files);
+    ui_msg.color = lv_color_make(76, 175, 80);
+    if (wigle_ui_queue) xQueueSend(wigle_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+
+    int current = 0, uploaded = 0, duplicates = 0, failed = 0;
+    bool auth_error = false;
+    while (wigle_upload_active) {
+        char d_name[256];
+        bool got_entry = false;
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            entry = readdir(dir);
+            if (entry != NULL) {
+                strncpy(d_name, entry->d_name, sizeof(d_name) - 1);
+                d_name[sizeof(d_name) - 1] = '\0';
+                got_entry = true;
+            }
+            xSemaphoreGive(sd_spi_mutex);
+        }
+        if (!got_entry) break;
+
+        size_t nlen = strlen(d_name);
+        bool is_wardrive = (nlen > 4 && (strcasecmp(d_name + nlen - 4, ".log") == 0 ||
+                                         strcasecmp(d_name + nlen - 4, ".csv") == 0 ||
+                                         strcasecmp(d_name + nlen - 4, ".txt") == 0));
+        if (!is_wardrive) continue;
+
+        current++;
+        char filepath[300];
+        snprintf(filepath, sizeof(filepath), "%s/%s", WIGLE_WARDRIVE_DIR, d_name);
+
+        char short_name[128];
+        strncpy(short_name, d_name, sizeof(short_name) - 1);
+        short_name[sizeof(short_name) - 1] = '\0';
+
+        snprintf(ui_msg.text, sizeof(ui_msg.text), "[%d/%d] %.120s ...", current, total_files, short_name);
+        ui_msg.color = lv_color_make(76, 175, 80);
+        if (wigle_ui_queue) xQueueSend(wigle_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+
+        int result = wigle_upload_file(filepath, d_name);
+        if (result == 0) {
+            snprintf(ui_msg.text, sizeof(ui_msg.text), "[%d/%d] %.120s -> OK", current, total_files, short_name);
+            ui_msg.color = lv_color_make(76, 175, 80);
+            uploaded++;
+        } else if (result == 1) {
+            snprintf(ui_msg.text, sizeof(ui_msg.text), "[%d/%d] %.120s -> already uploaded", current, total_files, short_name);
+            ui_msg.color = lv_color_make(255, 193, 7);   // amber
+            duplicates++;
+        } else if (result == 2) {
+            // Bad API key — every file will fail the same way, so stop here.
+            snprintf(ui_msg.text, sizeof(ui_msg.text), "Auth failed: check WiGLE key (name:token)");
+            ui_msg.color = lv_color_make(244, 67, 54);
+            if (wigle_ui_queue) xQueueSend(wigle_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+            auth_error = true;
+            break;
+        } else {
+            snprintf(ui_msg.text, sizeof(ui_msg.text), "[%d/%d] %.120s -> FAIL", current, total_files, short_name);
+            ui_msg.color = lv_color_make(244, 67, 54);
+            failed++;
+        }
+        if (wigle_ui_queue) xQueueSend(wigle_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(800));
+    }
+
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        closedir(dir);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    if (auth_error) {
+        snprintf(ui_msg.text, sizeof(ui_msg.text), "Stopped: WiGLE key rejected (401/403)");
+        ui_msg.color = lv_color_make(244, 67, 54);
+    } else {
+        snprintf(ui_msg.text, sizeof(ui_msg.text), "Done: %d up, %d dup, %d failed", uploaded, duplicates, failed);
+        ui_msg.color = (failed > 0) ? lv_color_make(244, 67, 54) : lv_color_make(76, 175, 80);
+    }
+    if (wigle_ui_queue) xQueueSend(wigle_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+
+    wigle_upload_done = true;
+    wigle_upload_active = false;
+    wigle_upload_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// LVGL timer: drain wigle_ui_queue into the status list.
+static void wigle_upload_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!wigle_ui_queue) return;
+    wpasec_ui_msg_t ui_msg;
+    while (xQueueReceive(wigle_ui_queue, &ui_msg, 0) == pdTRUE) {
+        if (wigle_status_list && lv_obj_is_valid(wigle_status_list)) {
+            lv_obj_t *item = lv_list_add_text(wigle_status_list, ui_msg.text);
+            if (item) {
+                lv_obj_set_style_text_color(item, ui_msg.color, 0);
+                lv_obj_set_style_bg_color(item, ui_bg_color(), 0);
+                lv_obj_set_style_bg_opa(item, LV_OPA_COVER, 0);
+                lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_pad_ver(item, 2, 0);
+            }
+            lv_obj_scroll_to_y(wigle_status_list, LV_COORD_MAX, LV_ANIM_ON);
+        }
+        if (wigle_progress_label && lv_obj_is_valid(wigle_progress_label)) {
+            lv_label_set_text(wigle_progress_label, ui_msg.text);
+        }
+    }
+    if (wigle_upload_done) {
+        lv_timer_del(wigle_upload_timer);
+        wigle_upload_timer = NULL;
+    }
+}
+
+// Build the upload UI and kick off the background task.
+static void wigle_start_upload_ui(void)
+{
+    // Title
+    lv_obj_t *title = lv_label_create(function_page);
+    lv_label_set_text(title, "WiGLE Upload");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(76, 175, 80), 0);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 35);
+
+    // Info line: masked key name
+    char info_buf[96];
+    snprintf(info_buf, sizeof(info_buf), "Key: %.6s****  |  %s", wigle_api_key, WIGLE_WARDRIVE_DIR);
+    lv_obj_t *info = lv_label_create(function_page);
+    lv_label_set_text(info, info_buf);
+    lv_obj_set_style_text_color(info, lv_color_make(176, 176, 176), 0);
+    lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(info, LV_ALIGN_TOP_MID, 0, 60);
+
+    wigle_progress_label = lv_label_create(function_page);
+    lv_label_set_text(wigle_progress_label, "Starting upload...");
+    lv_label_set_long_mode(wigle_progress_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(wigle_progress_label, lv_pct(96));
+    lv_obj_set_style_text_color(wigle_progress_label, lv_color_make(76, 175, 80), 0);
+    lv_obj_set_style_text_font(wigle_progress_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(wigle_progress_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(wigle_progress_label, LV_ALIGN_TOP_MID, 0, 76);
+
+    wigle_status_list = lv_list_create(function_page);
+    lv_obj_set_size(wigle_status_list, lv_pct(96), LCD_V_RES - 30 - 100);
+    lv_obj_align(wigle_status_list, LV_ALIGN_TOP_MID, 0, 92);
+    lv_obj_set_style_bg_color(wigle_status_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(wigle_status_list, lv_color_make(76, 175, 80), 0);
+    lv_obj_set_style_border_width(wigle_status_list, 1, 0);
+    lv_obj_set_style_pad_all(wigle_status_list, 4, 0);
+    lv_obj_set_style_text_color(wigle_status_list, lv_color_make(76, 175, 80), 0);
+
+    if (wigle_ui_queue) {
+        vQueueDelete(wigle_ui_queue);
+    }
+    wigle_ui_queue = xQueueCreate(16, sizeof(wpasec_ui_msg_t));
+
+    wigle_upload_done = false;
+    wigle_upload_active = true;
+    wigle_upload_timer = lv_timer_create(wigle_upload_timer_cb, 200, NULL);
+
+    StackType_t *task_stack = (StackType_t *)heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (task_stack) {
+        static StaticTask_t task_buf;
+        wigle_upload_task_handle = xTaskCreateStatic(
+            wigle_upload_task, "wigle_up", 8192, NULL, 5, task_stack, &task_buf);
+        if (!wigle_upload_task_handle) {
+            ESP_LOGE(TAG, "WiGLE: Failed to create upload task");
+            heap_caps_free(task_stack);
+            wigle_upload_active = false;
+            wigle_upload_done = true;
+        }
+    } else {
+        ESP_LOGE(TAG, "WiGLE: Failed to allocate task stack");
+        wigle_upload_active = false;
+        wigle_upload_done = true;
+    }
+}
+
+// Event: a key-file was tapped in the picker -> load it and proceed.
+static void wigle_keyfile_pick_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= wigle_pick_count) return;
+    if (wigle_read_key_from_file(wigle_pick_paths[idx])) {
+        show_wigle_upload_page();   // re-enter; key is now loaded
+    }
+}
+
+// Scan a directory for *.txt candidates and add them to the picker list.
+static void wigle_scan_dir_for_keys(lv_obj_t *list, const char *dirpath)
+{
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        DIR *d = opendir(dirpath);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL && wigle_pick_count < WIGLE_PICK_MAX) {
+                if (ent->d_type == DT_DIR) continue;
+                size_t nlen = strlen(ent->d_name);
+                if (nlen <= 4 || strcasecmp(ent->d_name + nlen - 4, ".txt") != 0) continue;
+                snprintf(wigle_pick_paths[wigle_pick_count], sizeof(wigle_pick_paths[0]),
+                         "%s/%s", dirpath, ent->d_name);
+                lv_obj_t *btn = lv_list_add_btn(list, LV_SYMBOL_FILE, wigle_pick_paths[wigle_pick_count]);
+                lv_obj_set_style_text_font(btn, &lv_font_montserrat_12, 0);
+                lv_obj_add_event_cb(btn, wigle_keyfile_pick_cb, LV_EVENT_CLICKED,
+                                    (void *)(intptr_t)wigle_pick_count);
+                wigle_pick_count++;
+            }
+            closedir(d);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+}
+
+// Show the WiGLE Upload page: load the key (file or picker), then upload.
+static void show_wigle_upload_page(void)
+{
+    create_function_page_base("WiGLE Upload");
+
+    // Try the default key file, unless a key was already loaded via the picker.
+    if (wigle_api_key[0] == '\0') {
+        wigle_read_key_from_sd();
+    }
+
+    if (wigle_api_key[0] == '\0') {
+        // No key: offer a picker of .txt files on the SD card.
+        lv_obj_t *hint = lv_label_create(function_page);
+        lv_label_set_text(hint,
+            "No wigle_key.txt found.\n"
+            "Put 'apiName:apiToken' in\n/sdcard/lab/wigle_key.txt,\n"
+            "or tap a file below to use as key:");
+        lv_obj_set_style_text_color(hint, ui_text_color(), 0);
+        lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 35);
+
+        lv_obj_t *list = lv_list_create(function_page);
+        lv_obj_set_size(list, lv_pct(96), LCD_V_RES - 30 - 100);
+        lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 92);
+        lv_obj_set_style_bg_color(list, ui_bg_color(), 0);
+        lv_obj_set_style_border_color(list, ui_accent_color(), 0);
+        lv_obj_set_style_border_width(list, 1, 0);
+
+        wigle_pick_count = 0;
+        wigle_scan_dir_for_keys(list, "/sdcard/lab");
+        wigle_scan_dir_for_keys(list, "/sdcard");
+        if (wigle_pick_count == 0) {
+            lv_list_add_text(list, "No .txt files found on SD.");
+        }
+        return;
+    }
+
+    wigle_start_upload_ui();
+}
+
 // Attack tiles screen - shown after selecting networks
 static void show_attack_tiles_screen(void)
 {
@@ -12607,7 +13578,10 @@ static void show_attack_tiles_screen(void)
     lv_obj_set_style_pad_gap(attack_tiles, 5, 0);
     lv_obj_set_flex_flow(attack_tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(attack_tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(attack_tiles, LV_OBJ_FLAG_SCROLLABLE);
+    // Vertically scrollable: the attack list now wraps to 3 rows (11 tiles),
+    // so allow scrolling to reach the last row instead of clipping it.
+    lv_obj_set_scroll_dir(attack_tiles, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(attack_tiles, LV_SCROLLBAR_MODE_AUTO);
     
     // Row 1: Deauth, Evil Twin, SAE, Handshake
     create_small_tile(attack_tiles, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, attack_tile_event_cb, "Deauth");
@@ -12619,6 +13593,8 @@ static void show_attack_tiles_screen(void)
     create_small_tile(attack_tiles, LV_SYMBOL_LOOP, "MITM", lv_color_make(121, 85, 72), attack_tile_event_cb, "MITM");
     create_small_tile(attack_tiles, LV_SYMBOL_WIFI, "Rogue AP", COLOR_MATERIAL_INDIGO, attack_tile_event_cb, "Rogue AP");
     create_small_tile(attack_tiles, LV_SYMBOL_UPLOAD, "WPA-SEC", COLOR_MATERIAL_CYAN, attack_tile_event_cb, "WPA-SEC Upload");
+    // WiGLE: connect to the selected network (STA), then upload wardrive CSVs
+    create_small_tile(attack_tiles, LV_SYMBOL_GPS, "WiGLE", COLOR_MATERIAL_GREEN, attack_tile_event_cb, "WiGLE Upload");
     create_small_tile(attack_tiles, LV_SYMBOL_EYE_OPEN, "Observer", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "Sniffer");
     // Nmap: connect to the selected network (STA), then scan its LAN
     create_small_tile(attack_tiles, LV_SYMBOL_LIST, "Nmap", COLOR_MATERIAL_INDIGO, attack_tile_event_cb, "Nmap");
@@ -12724,10 +13700,6 @@ static void show_global_attacks_screen(void)
     // Beacon Spam tile - Pink: flood fake AP beacons from an SSID list
     lv_obj_t *beacon_tile = create_tile(tiles, LV_SYMBOL_WIFI, "Beacon\nSpam", COLOR_MATERIAL_PINK, NULL, NULL);
     lv_obj_add_event_cb(beacon_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Beacon Spam");
-
-    // Admin Portal tile - Teal: WPA2 AP + web file manager for /sdcard/lab
-    lv_obj_t *admin_tile = create_tile(tiles, LV_SYMBOL_SD_CARD, "Admin\nPortal", COLOR_MATERIAL_TEAL, NULL, NULL);
-    lv_obj_add_event_cb(admin_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Admin Portal");
 }
 
 // WiFi Sniff & Karma screen
@@ -13501,6 +14473,10 @@ static void settings_tile_event_cb(lv_event_t *e)
     
     if (strcmp(tile_name, "Compromised Data") == 0) {
         show_wifi_monitor_screen();
+    } else if (strcmp(tile_name, "Admin Portal") == 0) {
+        show_admin_portal_screen();
+    } else if (strcmp(tile_name, "File Manager") == 0) {
+        show_file_manager_screen();
     } else if (strcmp(tile_name, "Scan Time") == 0) {
         show_scan_time_popup();
     } else if (strcmp(tile_name, "RedTeam mode") == 0) {
@@ -13540,7 +14516,13 @@ static void show_settings_screen(void)
     
     // Compromised Data - Blue
     create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Compromised\nData", COLOR_TILE_BLUE, settings_tile_event_cb, "Compromised Data");
-    
+
+    // Admin Portal - Teal: WPA2 AP + web file manager for /sdcard/lab
+    create_tile(tiles, LV_SYMBOL_SD_CARD, "Admin\nPortal", COLOR_MATERIAL_TEAL, settings_tile_event_cb, "Admin Portal");
+
+    // File Manager - Cyan: on-device SD card browser
+    create_tile(tiles, LV_SYMBOL_DIRECTORY, "File\nManager", COLOR_MATERIAL_CYAN, settings_tile_event_cb, "File Manager");
+
     // Scan Time - Purple
     create_tile(tiles, LV_SYMBOL_LOOP, "Scan\nTime", COLOR_MATERIAL_PURPLE, settings_tile_event_cb, "Scan Time");
     
@@ -14804,11 +15786,6 @@ void attack_event_cb(lv_event_t *e)
 
     if (strcmp(attack_name, "Beacon Spam") == 0) {
         show_beacon_spam_screen();
-        return;
-    }
-
-    if (strcmp(attack_name, "Admin Portal") == 0) {
-        show_admin_portal_screen();
         return;
     }
 
@@ -17251,6 +18228,226 @@ static void show_admin_portal_screen(void)
     lv_obj_add_event_cb(admin_keyboard, admin_kb_event_cb, LV_EVENT_CANCEL, NULL);
 
     admin_screen_active = true;
+    ui_locked = false;
+}
+
+// ============================================================================
+// File Manager — on-device SD browser rooted at /sdcard. Tap a folder to enter,
+// ".." to go up, a file to open a Delete/Cancel action popup. Full editing
+// (rename/upload/download/text edit) lives in the web Admin Portal.
+// ============================================================================
+static lv_obj_t *fm_popup = NULL;
+
+static void fm_popup_close(void)
+{
+    if (fm_popup) {
+        lv_obj_del(fm_popup);
+        fm_popup = NULL;
+    }
+}
+
+static void fm_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    fm_popup_close();
+}
+
+static void fm_delete_cb(lv_event_t *e)
+{
+    (void)e;
+    if (fm_pending_path[0]) {
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+            struct stat st;
+            if (stat(fm_pending_path, &st) == 0) {
+                if (S_ISDIR(st.st_mode)) rmdir(fm_pending_path);   // only if empty
+                else remove(fm_pending_path);
+            }
+            xSemaphoreGive(sd_spi_mutex);
+        }
+        fm_pending_path[0] = '\0';
+    }
+    fm_popup_close();
+    fm_refresh();
+}
+
+// Action popup for a tapped file: show name + Delete / Cancel.
+static void fm_show_file_actions(const char *fullpath)
+{
+    strncpy(fm_pending_path, fullpath, sizeof(fm_pending_path) - 1);
+    fm_pending_path[sizeof(fm_pending_path) - 1] = '\0';
+
+    fm_popup_close();
+    fm_popup = lv_obj_create(function_page);
+    lv_obj_set_size(fm_popup, lv_pct(88), 150);
+    lv_obj_center(fm_popup);
+    lv_obj_set_style_bg_color(fm_popup, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(fm_popup, ui_accent_color(), 0);
+    lv_obj_set_style_border_width(fm_popup, 2, 0);
+    lv_obj_set_style_radius(fm_popup, 10, 0);
+    lv_obj_clear_flag(fm_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    const char *base = strrchr(fullpath, '/');
+    base = base ? base + 1 : fullpath;
+    char msg[160];
+    snprintf(msg, sizeof(msg), "%.140s", base);
+    lv_obj_t *name = lv_label_create(fm_popup);
+    lv_label_set_text(name, msg);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(name, lv_pct(96));
+    lv_obj_set_style_text_color(name, ui_text_color(), 0);
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 6);
+
+    lv_obj_t *del_btn = lv_btn_create(fm_popup);
+    lv_obj_set_size(del_btn, 110, 40);
+    lv_obj_align(del_btn, LV_ALIGN_BOTTOM_LEFT, 4, -6);
+    lv_obj_set_style_bg_color(del_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(del_btn, 8, 0);
+    lv_obj_t *dl = lv_label_create(del_btn);
+    lv_label_set_text(dl, LV_SYMBOL_TRASH " Delete");
+    lv_obj_set_style_text_color(dl, lv_color_white(), 0);
+    lv_obj_center(dl);
+    lv_obj_add_event_cb(del_btn, fm_delete_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *cancel_btn = lv_btn_create(fm_popup);
+    lv_obj_set_size(cancel_btn, 110, 40);
+    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_RIGHT, -4, -6);
+    lv_obj_set_style_bg_color(cancel_btn, ui_accent_color(), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_t *cl = lv_label_create(cancel_btn);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_set_style_text_color(cl, lv_color_white(), 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel_btn, fm_cancel_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// List-item tap: enter a directory, go up, or show the file action popup.
+static void fm_entry_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= fm_entry_count) return;
+    if (fm_entry_isdir[idx]) {
+        strncpy(fm_cwd, fm_entry_paths[idx], sizeof(fm_cwd) - 1);
+        fm_cwd[sizeof(fm_cwd) - 1] = '\0';
+        fm_refresh();
+    } else {
+        fm_show_file_actions(fm_entry_paths[idx]);
+    }
+}
+
+static void fm_up_cb(lv_event_t *e)
+{
+    (void)e;
+    if (strcmp(fm_cwd, FM_ROOT) == 0) return;   // already at root
+    char *slash = strrchr(fm_cwd, '/');
+    if (slash && slash != fm_cwd) {
+        *slash = '\0';
+    }
+    if (strlen(fm_cwd) < strlen(FM_ROOT)) {
+        strcpy(fm_cwd, FM_ROOT);
+    }
+    fm_refresh();
+}
+
+// Rebuild the entry list for fm_cwd (directories first, then files).
+static void fm_refresh(void)
+{
+    if (!fm_list || !lv_obj_is_valid(fm_list)) return;
+    lv_obj_clean(fm_list);
+    fm_entry_count = 0;
+
+    if (fm_path_label && lv_obj_is_valid(fm_path_label)) {
+        lv_label_set_text(fm_path_label, fm_cwd);
+    }
+
+    // ".. (up)" entry unless at root
+    if (strcmp(fm_cwd, FM_ROOT) != 0) {
+        lv_obj_t *up = lv_list_add_btn(fm_list, LV_SYMBOL_LEFT, ".. (up)");
+        lv_obj_set_style_text_font(up, &lv_font_montserrat_14, 0);
+        lv_obj_add_event_cb(up, fm_up_cb, LV_EVENT_CLICKED, NULL);
+    }
+
+    // Two passes: directories first, then files.
+    for (int pass = 0; pass < 2; pass++) {
+        if (!(sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE)) {
+            break;
+        }
+        DIR *dir = opendir(fm_cwd);
+        if (dir) {
+            struct dirent *ent;
+            while ((ent = readdir(dir)) != NULL && fm_entry_count < FM_MAX_ENTRIES) {
+                if (ent->d_name[0] == '.' &&
+                    (ent->d_name[1] == '\0' ||
+                     (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
+                    continue;
+                }
+                char full[224];
+                snprintf(full, sizeof(full), "%s/%s", fm_cwd, ent->d_name);
+                struct stat st;
+                bool isdir = (ent->d_type == DT_DIR);
+                long fsize = 0;
+                if (stat(full, &st) == 0) {
+                    isdir = S_ISDIR(st.st_mode);
+                    fsize = (long)st.st_size;
+                }
+                if ((pass == 0) != isdir) continue;   // pass 0 = dirs, pass 1 = files
+
+                int i = fm_entry_count;
+                strncpy(fm_entry_paths[i], full, sizeof(fm_entry_paths[0]) - 1);
+                fm_entry_paths[i][sizeof(fm_entry_paths[0]) - 1] = '\0';
+                fm_entry_isdir[i] = isdir;
+
+                char label[256];
+                if (isdir) {
+                    snprintf(label, sizeof(label), "%s", ent->d_name);
+                } else {
+                    snprintf(label, sizeof(label), "%s  (%ld B)", ent->d_name, fsize);
+                }
+                lv_obj_t *btn = lv_list_add_btn(fm_list,
+                                                isdir ? LV_SYMBOL_DIRECTORY : LV_SYMBOL_FILE,
+                                                label);
+                lv_obj_set_style_text_font(btn, &lv_font_montserrat_12, 0);
+                lv_obj_add_event_cb(btn, fm_entry_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+                fm_entry_count++;
+            }
+            closedir(dir);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    if (fm_entry_count == 0 && strcmp(fm_cwd, FM_ROOT) == 0) {
+        lv_list_add_text(fm_list, "SD card empty or not mounted.");
+    }
+}
+
+static void show_file_manager_screen(void)
+{
+    ui_locked = true;
+    create_function_page_base("File Manager");
+    fm_popup = NULL;
+    strcpy(fm_cwd, FM_ROOT);
+
+    // Ensure SD is mounted before browsing.
+    ensure_sd_mounted();
+
+    fm_path_label = lv_label_create(function_page);
+    lv_label_set_text(fm_path_label, fm_cwd);
+    lv_label_set_long_mode(fm_path_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(fm_path_label, lv_pct(70));
+    lv_obj_set_style_text_color(fm_path_label, ui_accent_color(), 0);
+    lv_obj_set_style_text_font(fm_path_label, &lv_font_montserrat_12, 0);
+    lv_obj_align(fm_path_label, LV_ALIGN_TOP_LEFT, 6, 36);
+
+    fm_list = lv_list_create(function_page);
+    lv_obj_set_size(fm_list, lv_pct(98), LCD_V_RES - 30 - 30);
+    lv_obj_align(fm_list, LV_ALIGN_TOP_MID, 0, 54);
+    lv_obj_set_style_bg_color(fm_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(fm_list, ui_accent_color(), 0);
+    lv_obj_set_style_border_width(fm_list, 1, 0);
+    lv_obj_set_style_pad_all(fm_list, 2, 0);
+
+    fm_refresh();
     ui_locked = false;
 }
 
