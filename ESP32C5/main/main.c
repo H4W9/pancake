@@ -837,6 +837,40 @@ static lv_obj_t *home_add_dd         = NULL;   // scanned-networks dropdown (bac
 static lv_timer_t *home_add_scan_timer = NULL; // polls the scan and fills the dropdown
 static int home_add_edit_idx         = -1;     // -1 = adding new; >=0 = editing that saved entry
 
+// WiFi Spectrum Analyzer (Porkchop-style: sinc lobes + waterfall, heat-map colors).
+// Canvas is drawn directly into a PSRAM RGB565 buffer and blitted via LVGL.
+#define SPEC_CANVAS_W   480
+#define SPEC_CANVAS_H   210
+#define SPEC_SLEFT      22                       // left margin for dB labels
+#define SPEC_SRIGHT     (SPEC_CANVAS_W - 2)
+#define SPEC_SWIDTH     (SPEC_SRIGHT - SPEC_SLEFT)
+#define SPEC_STOP       2
+#define SPEC_CHLBL_Y    (SPEC_CANVAS_H - 12)     // channel-number row
+#define SPEC_WF_ROWS    46
+#define SPEC_WF_BOTTOM  (SPEC_CHLBL_Y - 3)
+#define SPEC_WF_TOP     (SPEC_WF_BOTTOM - SPEC_WF_ROWS)
+#define SPEC_SBOTTOM    (SPEC_WF_TOP - 2)        // spectrum baseline (above waterfall)
+#define SPEC_RSSI_MIN   (-95)
+#define SPEC_RSSI_MAX   (-30)
+#define SPEC_MAX_APS    40
+typedef struct { uint8_t ch; int8_t rssi; char ssid[33]; } spec_ap_t;
+static spec_ap_t   spec_aps[SPEC_MAX_APS];
+static int         spec_ap_count      = 0;
+static int         spec_sel           = -1;      // selected AP (filled lobe + info line)
+static float       spec_center_mhz    = 2437.0f; // view center (channel 6)
+static float       spec_width_mhz     = 60.0f;   // ~12 channels visible
+static lv_obj_t   *spec_canvas        = NULL;
+static lv_color_t *spec_buf           = NULL;    // PSRAM canvas buffer
+static uint8_t    *spec_wf            = NULL;    // PSRAM waterfall [ROWS*SWIDTH]
+static int         spec_wf_row        = 0;
+static int8_t     *spec_col_rssi      = NULL;    // per-column composite RSSI [SWIDTH]
+static int8_t     *spec_col_persist   = NULL;    // smoothed columns for the waterfall
+static lv_obj_t   *spec_info_label    = NULL;
+static lv_timer_t *spec_timer         = NULL;
+static bool        spec_active        = false;
+static uint32_t    spec_last_scan     = 0;
+static uint16_t    spec_noise         = 0xACE1;
+
 static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
 static int wdp_ducb_channel_count = 0;
 static double wdp_ducb_discounted_total = 0.0;
@@ -1273,6 +1307,7 @@ static void attack_tile_event_cb(lv_event_t *e);
 static void update_sniffer_button_ui(void);
 static void show_settings_screen(void);
 static void show_about_screen(void);
+static void show_spectrum_screen(void);
 static void settings_tile_event_cb(lv_event_t *e);
 // Scrollable tiles container of the settings screen + a pending scroll offset
 // to restore after an in-place rebuild (toggles) so the view doesn't jump to
@@ -1389,6 +1424,15 @@ static void reset_function_page_children(void) {
     antisurv_list = NULL;
     antisurv_status_label = NULL;
     antisurv_exit_btn = NULL;
+    // Spectrum Analyzer: stop the render timer and free its PSRAM buffers.
+    spec_active = false;
+    if (spec_timer) { lv_timer_del(spec_timer); spec_timer = NULL; }
+    if (spec_buf) { heap_caps_free(spec_buf); spec_buf = NULL; }
+    if (spec_wf) { heap_caps_free(spec_wf); spec_wf = NULL; }
+    if (spec_col_rssi) { free(spec_col_rssi); spec_col_rssi = NULL; }
+    if (spec_col_persist) { free(spec_col_persist); spec_col_persist = NULL; }
+    spec_canvas = NULL;
+    spec_info_label = NULL;
     // BLE HoneyPair: stop advertising on any nav away (title back button included)
     if (hp_screen_active) {
         honeypair_stop();
@@ -4333,9 +4377,10 @@ static void display_refresh_task(void *pvParameters)
             }
             // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack/deauth_monitor/portal or when handshaker is waiting for scan)
             else if (scan_done_ui_flag) {
-                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active || handshake_waiting_for_scan || g_handshaker_global_mode || home_add_overlay) {
-                    // During attacks, the add-home dialog's SSID scan, or while
-                    // waiting for a scan, just clear the flag without showing results
+                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active || handshake_waiting_for_scan || g_handshaker_global_mode || home_add_overlay || spec_active) {
+                    // During attacks, the add-home dialog's SSID scan, the spectrum
+                    // analyzer's rescans, or while waiting for a scan, just clear the
+                    // flag without showing results
                     scan_done_ui_flag = false;
                 } else {
                 scan_done_ui_flag = false;
@@ -10998,6 +11043,398 @@ static lv_obj_t *create_small_tile(lv_obj_t *parent, const char *icon, const cha
     return tile;
 }
 
+// ============================================================================
+// WiFi Spectrum Analyzer  (Porkchop-style: sinc lobes + waterfall, heat colors)
+// Renders directly into a PSRAM RGB565 canvas buffer, driven by an LVGL timer
+// and periodic WiFi scans. Buttons cycle APs and pan the view.
+// ============================================================================
+
+// Sinc LUT for the RF carrier shape (main lobe + side lobes), distance -22..+22
+// MHz mapped to index 0..44. Ported from the reference implementation.
+static const float SPEC_SINC_LUT[45] = {
+    0.0000f, 0.0650f, 0.1100f, 0.1300f, 0.1100f,
+    0.0650f, 0.0000f, 0.0900f, 0.1500f, 0.1800f,
+    0.1500f, 0.0000f, 0.1700f, 0.2700f, 0.3300f,
+    0.3700f, 0.5000f, 0.6500f, 0.8000f, 0.9100f,
+    0.9700f, 0.9950f, 1.0000f,
+    0.9950f, 0.9700f, 0.9100f, 0.8000f, 0.6500f,
+    0.5000f, 0.3700f, 0.3300f, 0.2700f, 0.1700f,
+    0.0000f, 0.1500f, 0.1800f, 0.1500f, 0.0900f,
+    0.0000f, 0.0650f, 0.1100f, 0.1300f, 0.1100f,
+    0.0650f, 0.0000f
+};
+
+// Build an lv_color_t from a standard RGB565 literal. Decomposing to 8-bit
+// components and using lv_color_make keeps this correct under LV_COLOR_16_SWAP
+// (a raw .full assignment would come out byte-swapped on this build).
+static inline lv_color_t spec_c(uint16_t rgb565) {
+    uint8_t r = (uint8_t)(((rgb565 >> 11) & 0x1F) * 255 / 31);
+    uint8_t g = (uint8_t)(((rgb565 >> 5) & 0x3F) * 255 / 63);
+    uint8_t b = (uint8_t)((rgb565 & 0x1F) * 255 / 31);
+    return lv_color_make(r, g, b);
+}
+
+// RSSI heat map: green (strong) -> yellow -> orange -> red (weak). Same hex as ref.
+static inline lv_color_t spec_rssi_color(int r) {
+    if (r >= -55) return spec_c(0x07E0);
+    if (r >= -68) return spec_c(0xFFE0);
+    if (r >= -80) return spec_c(0xFD20);
+    return spec_c(0xF800);
+}
+static inline lv_color_t spec_int_color(uint8_t i) {
+    if (i >= 157) return spec_c(0x07E0);
+    if (i >= 106) return spec_c(0xFFE0);
+    if (i >= 59)  return spec_c(0xFD20);
+    return spec_c(0xF800);
+}
+
+static inline uint8_t spec_noise_next(void) {
+    spec_noise ^= spec_noise << 7;
+    spec_noise ^= spec_noise >> 9;
+    spec_noise ^= spec_noise << 8;
+    return (uint8_t)(spec_noise & 0x07);
+}
+
+static float spec_sinc(float dist) {
+    float pos = dist + 22.0f;
+    if (pos < 0.0f || pos > 44.0f) return 0.0f;
+    int i = (int)pos;
+    float frac = pos - i;
+    if (i >= 44) return SPEC_SINC_LUT[44];
+    return SPEC_SINC_LUT[i] + frac * (SPEC_SINC_LUT[i + 1] - SPEC_SINC_LUT[i]);
+}
+
+static int spec_fx(float freqMHz) {
+    float leftF = spec_center_mhz - spec_width_mhz / 2.0f;
+    return SPEC_SLEFT + (int)((freqMHz - leftF) * SPEC_SWIDTH / spec_width_mhz);
+}
+static int spec_ry(int rssi) {
+    if (rssi < SPEC_RSSI_MIN) rssi = SPEC_RSSI_MIN;
+    if (rssi > SPEC_RSSI_MAX) rssi = SPEC_RSSI_MAX;
+    int h = SPEC_SBOTTOM - SPEC_STOP;
+    return SPEC_SBOTTOM - (int)(((float)(rssi - SPEC_RSSI_MIN) / (SPEC_RSSI_MAX - SPEC_RSSI_MIN)) * h);
+}
+static float spec_cf(uint8_t ch) {
+    if (ch >= 36) return 5000.0f + (float)ch * 5.0f;
+    if (ch < 1) ch = 1;
+    if (ch == 14) return 2484.0f;
+    if (ch > 13) ch = 13;
+    return 2412.0f + (ch - 1) * 5.0f;
+}
+
+// Direct pixel helpers into the RGB565 canvas buffer.
+static inline void spec_px(int x, int y, lv_color_t col) {
+    if ((unsigned)x < SPEC_CANVAS_W && (unsigned)y < SPEC_CANVAS_H)
+        spec_buf[y * SPEC_CANVAS_W + x] = col;
+}
+static void spec_vline(int x, int y, int h, lv_color_t col) {
+    for (int i = 0; i < h; i++) spec_px(x, y + i, col);
+}
+static void spec_hline(int x, int y, int w, lv_color_t col) {
+    for (int i = 0; i < w; i++) spec_px(x + i, y, col);
+}
+static void spec_line(int x0, int y0, int x1, int y1, lv_color_t col) {
+    int dx = abs(x1 - x0), dy = -abs(y1 - y0);
+    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        spec_px(x0, y0, col);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+static void spec_fill(lv_color_t col) {
+    int n = SPEC_CANVAS_W * SPEC_CANVAS_H;
+    for (int i = 0; i < n; i++) spec_buf[i] = col;
+}
+
+// Draw one AP's sinc lobe: outline (color-coded by RSSI), or filled if selected.
+static void spec_draw_lobe(float centerF, int rssi, bool filled) {
+    int baseY = SPEC_SBOTTOM;
+    int peakY = spec_ry(rssi);
+    int h = baseY - peakY;
+    if (h <= 0) return;
+    lv_color_t col = spec_rssi_color(rssi);
+    int lx = spec_fx(centerF - 22.0f);
+    int rx = spec_fx(centerF + 22.0f);
+    if (rx < SPEC_SLEFT || lx > SPEC_SRIGHT) return;
+    if (lx < SPEC_SLEFT) lx = SPEC_SLEFT;
+    if (rx > SPEC_SRIGHT) rx = SPEC_SRIGHT;
+    int prevX = lx, prevY = baseY;
+    bool have = false;
+    for (int x = lx; x <= rx; x++) {
+        float f = spec_center_mhz - spec_width_mhz / 2.0f +
+                  (float)(x - SPEC_SLEFT) * spec_width_mhz / SPEC_SWIDTH;
+        float amp = spec_sinc(f - centerF);
+        int y = baseY - (int)(h * amp);
+        if (y < SPEC_STOP) y = SPEC_STOP;
+        if (y > baseY) y = baseY;
+        if (filled) {
+            if (y < baseY) spec_vline(x, y, baseY - y, col);
+        } else if (have) {
+            spec_line(prevX, prevY, x, y, col);
+        }
+        prevX = x; prevY = y; have = true;
+    }
+}
+
+// Rebuild the per-column composite RSSI (max over APs) + smoothed persistence.
+static void spec_update_columns(void) {
+    if (!spec_col_rssi || !spec_col_persist) return;
+    for (int x = 0; x < SPEC_SWIDTH; x++)
+        spec_col_rssi[x] = (int8_t)(-92 + (spec_noise_next() % 4) - 2);
+    for (int n = 0; n < spec_ap_count; n++) {
+        float cf = spec_cf(spec_aps[n].ch);
+        int rssi = spec_aps[n].rssi;
+        for (int x = 0; x < SPEC_SWIDTH; x++) {
+            float f = spec_center_mhz - spec_width_mhz / 2.0f +
+                      (float)x * spec_width_mhz / SPEC_SWIDTH;
+            float amp = spec_sinc(f - cf);
+            if (amp < 0.05f) continue;
+            int sig = -92 + (int)((rssi - (-92)) * amp);
+            if (sig > spec_col_rssi[x]) spec_col_rssi[x] = (int8_t)sig;
+        }
+    }
+    for (int x = 0; x < SPEC_SWIDTH; x++) {
+        int p = spec_col_persist[x];
+        p += (spec_col_rssi[x] - p) / 4;   // IIR smoothing
+        spec_col_persist[x] = (int8_t)p;
+    }
+}
+
+// Push the smoothed columns into the circular waterfall history (intensity 0-255).
+static void spec_push_wf(void) {
+    if (!spec_wf || !spec_col_persist) return;
+    int row = spec_wf_row;
+    for (int x = 0; x < SPEC_SWIDTH; x++) {
+        int inten = (spec_col_persist[x] - SPEC_RSSI_MIN) * 255 / (SPEC_RSSI_MAX - SPEC_RSSI_MIN);
+        if (inten < 0) inten = 0;
+        if (inten > 255) inten = 255;
+        spec_wf[row * SPEC_SWIDTH + x] = (uint8_t)inten;
+    }
+    spec_wf_row = (spec_wf_row + 1) % SPEC_WF_ROWS;
+}
+
+static void spec_render(void) {
+    if (!spec_buf || !spec_canvas) return;
+    lv_color_t bg = spec_c(0x0000);
+    lv_color_t fg = spec_c(0xC618);   // light grey axis/labels
+
+    spec_fill(bg);
+
+    lv_draw_label_dsc_t td;
+    lv_draw_label_dsc_init(&td);
+    td.color = fg;
+    td.font = &lv_font_montserrat_12;
+
+    // Y axis + baseline + dB ticks and labels
+    spec_vline(SPEC_SLEFT - 2, SPEC_STOP, SPEC_SBOTTOM - SPEC_STOP, fg);
+    spec_hline(SPEC_SLEFT, SPEC_SBOTTOM, SPEC_SWIDTH, fg);
+    for (int r = -30; r >= -90; r -= 20) {
+        int y = spec_ry(r);
+        spec_hline(SPEC_SLEFT - 4, y, 3, fg);
+        char lbl[6];
+        snprintf(lbl, sizeof(lbl), "%d", r);
+        lv_canvas_draw_text(spec_canvas, 0, (y < 6 ? 0 : y - 6), SPEC_SLEFT - 4, &td, lbl);
+    }
+
+    // Channel ticks + numbers (2.4 GHz + common 5 GHz), only if in view
+    static const uint8_t chs[] = {
+        1,2,3,4,5,6,7,8,9,10,11,12,13,
+        36,40,44,48,149,153,157,161,165
+    };
+    for (unsigned i = 0; i < sizeof(chs); i++) {
+        int x = spec_fx(spec_cf(chs[i]));
+        if (x < SPEC_SLEFT || x > SPEC_SRIGHT) continue;
+        spec_vline(x, SPEC_SBOTTOM, 3, fg);
+        char n[4];
+        snprintf(n, sizeof(n), "%u", chs[i]);
+        lv_canvas_draw_text(spec_canvas, x - 8, SPEC_CHLBL_Y, 18, &td, n);
+    }
+
+    // Lobes: unselected as outlines, selected filled and on top
+    for (int n = 0; n < spec_ap_count; n++) {
+        if (n == spec_sel) continue;
+        spec_draw_lobe(spec_cf(spec_aps[n].ch), spec_aps[n].rssi, false);
+    }
+    if (spec_sel >= 0 && spec_sel < spec_ap_count)
+        spec_draw_lobe(spec_cf(spec_aps[spec_sel].ch), spec_aps[spec_sel].rssi, true);
+
+    // Waterfall (newest at top, aging downward) with intensity dithering
+    if (spec_wf) {
+        spec_hline(SPEC_SLEFT, SPEC_WF_TOP - 1, SPEC_SWIDTH, fg);
+        for (int row = 0; row < SPEC_WF_ROWS; row++) {
+            int bufRow = (spec_wf_row - 1 - row + 2 * SPEC_WF_ROWS) % SPEC_WF_ROWS;
+            int sy = SPEC_WF_TOP + row;
+            for (int x = 0; x < SPEC_SWIDTH; x++) {
+                uint8_t it = spec_wf[bufRow * SPEC_SWIDTH + x];
+                if (it <= 20) continue;
+                bool d;
+                if (it > 200)      d = true;
+                else if (it > 150) d = ((x + row) & 1) == 0;
+                else if (it > 100) d = ((x & 1) == 0) && ((row & 1) == 0);
+                else if (it > 50)  d = ((x % 3) == 0) && ((row & 1) == 0);
+                else               d = ((x % 4) == 0) && ((row % 3) == 0);
+                if (d) spec_px(SPEC_SLEFT + x, sy, spec_int_color(it));
+            }
+        }
+    }
+
+    lv_obj_invalidate(spec_canvas);
+}
+
+static void spec_update_info(void) {
+    if (!spec_info_label) return;
+    char b[96];
+    if (spec_sel >= 0 && spec_sel < spec_ap_count) {
+        spec_ap_t *a = &spec_aps[spec_sel];
+        const char *ss = a->ssid[0] ? a->ssid : "(hidden)";
+        snprintf(b, sizeof(b), "%.24s   ch %u   %d dBm   [%d/%d]",
+                 ss, a->ch, a->rssi, spec_sel + 1, spec_ap_count);
+    } else {
+        snprintf(b, sizeof(b), "%d APs   center %d MHz   (pick an AP)",
+                 spec_ap_count, (int)spec_center_mhz);
+    }
+    lv_label_set_text(spec_info_label, b);
+}
+
+static void spec_timer_cb(lv_timer_t *t) {
+    (void)t;
+    if (!spec_active || !spec_canvas) return;
+    uint32_t now = lv_tick_get();
+    // Refresh AP snapshot from the scanner between scans, then kick the next one.
+    if (now - spec_last_scan > 1200 && wifi_scanner_is_done()) {
+        const wifi_ap_record_t *r = wifi_scanner_get_results_ptr();
+        uint16_t cnt = wifi_scanner_get_count();
+        int c = 0;
+        for (int i = 0; i < cnt && c < SPEC_MAX_APS; i++) {
+            uint8_t ch = r[i].primary;
+            if (!((ch >= 1 && ch <= 14) || (ch >= 36 && ch <= 177))) continue;
+            spec_aps[c].ch = ch;
+            spec_aps[c].rssi = r[i].rssi;
+            strncpy(spec_aps[c].ssid, (const char *)r[i].ssid, 32);
+            spec_aps[c].ssid[32] = '\0';
+            c++;
+        }
+        spec_ap_count = c;
+        if (spec_sel >= spec_ap_count) spec_sel = spec_ap_count - 1;
+        spec_update_info();
+        wifi_scanner_start_scan();
+        spec_last_scan = now;
+    }
+    spec_update_columns();
+    spec_push_wf();
+    spec_render();
+}
+
+// Cycle selected AP (dir +1/-1) and center the view on its channel.
+static void spec_select(int dir) {
+    if (spec_ap_count == 0) return;
+    if (spec_sel < 0) spec_sel = (dir > 0) ? 0 : spec_ap_count - 1;
+    else {
+        spec_sel += dir;
+        if (spec_sel < 0) spec_sel = spec_ap_count - 1;
+        if (spec_sel >= spec_ap_count) spec_sel = 0;
+    }
+    spec_center_mhz = spec_cf(spec_aps[spec_sel].ch);
+    spec_update_info();
+}
+static void spec_pan(float d) {
+    spec_center_mhz += d;
+    if (d < 0) {
+        if (spec_center_mhz > 2483.0f && spec_center_mhz < 5180.0f) spec_center_mhz = 2472.0f;
+        if (spec_center_mhz < 2412.0f) spec_center_mhz = 2412.0f;
+    } else {
+        if (spec_center_mhz > 2483.0f && spec_center_mhz < 5180.0f) spec_center_mhz = 5180.0f;
+        if (spec_center_mhz > 5825.0f) spec_center_mhz = 5825.0f;
+    }
+    spec_update_info();
+}
+static void spec_prev_ap_cb(lv_event_t *e) { (void)e; spec_select(-1); }
+static void spec_next_ap_cb(lv_event_t *e) { (void)e; spec_select(+1); }
+static void spec_pan_l_cb(lv_event_t *e)   { (void)e; spec_pan(-5.0f); }
+static void spec_pan_r_cb(lv_event_t *e)   { (void)e; spec_pan(+5.0f); }
+
+// Small helper: one control button in the bottom row.
+static void spec_make_btn(lv_obj_t *row, const char *txt, lv_event_cb_t cb) {
+    lv_obj_t *b = lv_btn_create(row);
+    lv_obj_set_size(b, 106, 40);
+    lv_obj_set_style_bg_color(b, ui_accent_color(), 0);
+    lv_obj_set_style_radius(b, 8, 0);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_color(l, lv_color_white(), 0);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+}
+
+static void show_spectrum_screen(void) {
+    create_function_page_base("Spectrum");
+    ensure_wifi_mode();
+
+    // Allocate the canvas + waterfall + column buffers in PSRAM (DMA-scarce C5).
+    spec_buf = (lv_color_t *)heap_caps_malloc(
+        (size_t)SPEC_CANVAS_W * SPEC_CANVAS_H * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    spec_wf = (uint8_t *)heap_caps_malloc((size_t)SPEC_WF_ROWS * SPEC_SWIDTH, MALLOC_CAP_SPIRAM);
+    spec_col_rssi = (int8_t *)malloc(SPEC_SWIDTH);
+    spec_col_persist = (int8_t *)malloc(SPEC_SWIDTH);
+    if (!spec_buf || !spec_wf || !spec_col_rssi || !spec_col_persist) {
+        if (spec_buf) { heap_caps_free(spec_buf); spec_buf = NULL; }
+        if (spec_wf) { heap_caps_free(spec_wf); spec_wf = NULL; }
+        if (spec_col_rssi) { free(spec_col_rssi); spec_col_rssi = NULL; }
+        if (spec_col_persist) { free(spec_col_persist); spec_col_persist = NULL; }
+        lv_obj_t *err = lv_label_create(function_page);
+        lv_label_set_text(err, "Spectrum: out of memory");
+        lv_obj_set_style_text_color(err, ui_text_color(), 0);
+        lv_obj_center(err);
+        return;
+    }
+
+    // Initialise state
+    spec_ap_count = 0;
+    spec_sel = -1;
+    spec_center_mhz = 2437.0f;
+    spec_width_mhz = 60.0f;
+    spec_wf_row = 0;
+    spec_noise = 0xACE1;
+    memset(spec_wf, 0, (size_t)SPEC_WF_ROWS * SPEC_SWIDTH);
+    for (int x = 0; x < SPEC_SWIDTH; x++) spec_col_persist[x] = SPEC_RSSI_MIN;
+
+    spec_canvas = lv_canvas_create(function_page);
+    lv_canvas_set_buffer(spec_canvas, spec_buf, SPEC_CANVAS_W, SPEC_CANVAS_H, LV_IMG_CF_TRUE_COLOR);
+    lv_obj_align(spec_canvas, LV_ALIGN_TOP_LEFT, 0, 30);
+
+    spec_info_label = lv_label_create(function_page);
+    lv_label_set_text(spec_info_label, "Scanning...");
+    lv_obj_set_style_text_color(spec_info_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(spec_info_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(spec_info_label, LV_ALIGN_TOP_MID, 0, 30 + SPEC_CANVAS_H + 3);
+
+    lv_obj_t *btn_row = lv_obj_create(function_page);
+    lv_obj_set_size(btn_row, lv_pct(100), 48);
+    lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_style_pad_column(btn_row, 6, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    spec_make_btn(btn_row, LV_SYMBOL_LEFT " AP", spec_prev_ap_cb);
+    spec_make_btn(btn_row, "AP " LV_SYMBOL_RIGHT, spec_next_ap_cb);
+    spec_make_btn(btn_row, LV_SYMBOL_LEFT " Pan", spec_pan_l_cb);
+    spec_make_btn(btn_row, "Pan " LV_SYMBOL_RIGHT, spec_pan_r_cb);
+
+    spec_active = true;
+    spec_last_scan = lv_tick_get();
+    wifi_scanner_start_scan();
+    spec_render();
+
+    spec_timer = lv_timer_create(spec_timer_cb, 100, NULL);
+}
+
 // Main tile event callback - routes to appropriate screen
 static void main_tile_event_cb(lv_event_t *e)
 {
@@ -14425,6 +14862,10 @@ static void show_global_attacks_screen(void)
     // Wardrive tile - Teal (recon) — always available.
     lv_obj_t *wardrive_tile = create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, NULL, NULL);
     lv_obj_add_event_cb(wardrive_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Start Wardrive");
+
+    // Spectrum tile - Indigo (recon) — always available.
+    lv_obj_t *spectrum_tile = create_tile(tiles, LV_SYMBOL_AUDIO, "Spectrum", COLOR_MATERIAL_INDIGO, NULL, NULL);
+    lv_obj_add_event_cb(spectrum_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Spectrum");
 }
 
 // WiFi Sniff & Karma screen
@@ -15985,6 +16426,11 @@ void attack_event_cb(lv_event_t *e)
     // Red Team gate: refuse offensive attacks when the mode is off.
     if (!g_redteam_mode && attack_is_offensive(attack_name)) {
         ESP_LOGW(TAG, "%s blocked — Red Team mode is off", attack_name);
+        return;
+    }
+
+    if (strcmp(attack_name, "Spectrum") == 0) {
+        show_spectrum_screen();
         return;
     }
 
