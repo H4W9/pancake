@@ -6736,18 +6736,21 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     lv_obj_center(rescan_lbl);
     lv_obj_add_event_cb(rescan_btn, sniffer_rescan_cb, LV_EVENT_CLICKED, NULL);
     
-    // Karma button (pink) - go to Karma if probes available
-    lv_obj_t *karma_btn = lv_btn_create(control_row);
-    lv_obj_set_size(karma_btn, 80, 35);
-    lv_obj_set_style_bg_color(karma_btn, COLOR_MATERIAL_PINK, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(karma_btn, lv_color_lighten(COLOR_MATERIAL_PINK, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(karma_btn, 0, 0);
-    lv_obj_set_style_radius(karma_btn, 8, 0);
-    lv_obj_t *karma_lbl = lv_label_create(karma_btn);
-    lv_label_set_text(karma_lbl, "Karma");
-    lv_obj_set_style_text_color(karma_lbl, ui_text_color(), 0);
-    lv_obj_center(karma_lbl);
-    lv_obj_add_event_cb(karma_btn, sniffer_karma_btn_cb, LV_EVENT_CLICKED, NULL);
+    // Karma button (pink) - go to Karma if probes available. Karma is an
+    // offensive evil-twin action, so it only appears in Red Team mode.
+    if (g_redteam_mode) {
+        lv_obj_t *karma_btn = lv_btn_create(control_row);
+        lv_obj_set_size(karma_btn, 80, 35);
+        lv_obj_set_style_bg_color(karma_btn, COLOR_MATERIAL_PINK, LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(karma_btn, lv_color_lighten(COLOR_MATERIAL_PINK, 30), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(karma_btn, 0, 0);
+        lv_obj_set_style_radius(karma_btn, 8, 0);
+        lv_obj_t *karma_lbl = lv_label_create(karma_btn);
+        lv_label_set_text(karma_lbl, "Karma");
+        lv_obj_set_style_text_color(karma_lbl, ui_text_color(), 0);
+        lv_obj_center(karma_lbl);
+        lv_obj_add_event_cb(karma_btn, sniffer_karma_btn_cb, LV_EVENT_CLICKED, NULL);
+    }
     
     // Quit button (teal)
     lv_obj_t *quit_btn = lv_btn_create(control_row);
@@ -15351,10 +15354,9 @@ static void show_wardrive_settings_screen(void)
     lv_obj_t *rssi_slider = lv_slider_create(form);
     lv_slider_set_range(rssi_slider, 0, 50);
     lv_slider_set_value(rssi_slider, wd_rssi_relog_delta, LV_ANIM_OFF);
-    // Inset from the form edges so the knob doesn't crowd the screen edge or the
+    // Narrower than the form so the knob doesn't crowd the screen edge or the
     // scrollbar at the range extremes (same 0-50 value range).
     lv_obj_set_width(rssi_slider, lv_pct(88));
-    lv_obj_set_style_margin_left(rssi_slider, 6, 0);
     lv_obj_add_event_cb(rssi_slider, wd_rssi_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     // ---- Memory cap + Anti-surv sensitivity (side by side) ----
