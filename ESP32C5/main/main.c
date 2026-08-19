@@ -832,6 +832,8 @@ static lv_obj_t *home_add_overlay    = NULL;
 static lv_obj_t *home_add_ssid_ta    = NULL;
 static lv_obj_t *home_add_pw_ta      = NULL;
 static lv_obj_t *home_add_keyboard   = NULL;
+static lv_obj_t *home_add_dd         = NULL;   // scanned-networks dropdown
+static lv_timer_t *home_add_scan_timer = NULL; // polls the scan and fills the dropdown
 
 static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
 static int wdp_ducb_channel_count = 0;
@@ -1269,6 +1271,11 @@ static void attack_tile_event_cb(lv_event_t *e);
 static void update_sniffer_button_ui(void);
 static void show_settings_screen(void);
 static void settings_tile_event_cb(lv_event_t *e);
+// Scrollable tiles container of the settings screen + a pending scroll offset
+// to restore after an in-place rebuild (toggles) so the view doesn't jump to
+// the top. 0 = fresh open, start at top.
+static lv_obj_t *settings_tiles = NULL;
+static lv_coord_t settings_pending_scroll_y = 0;
 static void show_wardrive_settings_screen(void);
 static void home_btn_event_cb(lv_event_t *e);
 static void wifi_scan_next_btn_cb(lv_event_t *e);
@@ -9414,10 +9421,12 @@ static void home_mgmt_delete_cb(lv_event_t *e)
 static void home_mgmt_add_cancel_cb(lv_event_t *e)
 {
     (void)e;
+    if (home_add_scan_timer) { lv_timer_del(home_add_scan_timer); home_add_scan_timer = NULL; }
     if (home_add_overlay) { lv_obj_del(home_add_overlay); home_add_overlay = NULL; }
     home_add_ssid_ta = NULL;
     home_add_pw_ta = NULL;
     home_add_keyboard = NULL;
+    home_add_dd = NULL;
 }
 
 static void home_mgmt_add_save_cb(lv_event_t *e)
@@ -9453,6 +9462,36 @@ static void home_add_dd_cb(lv_event_t *e)
     if (home_add_ssid_ta) lv_textarea_set_text(home_add_ssid_ta, ssid);
 }
 
+// (Re)build the dropdown options from the current WiFi scan results.
+static void home_add_fill_networks(void)
+{
+    if (!home_add_dd || !lv_obj_is_valid(home_add_dd)) return;
+    char opts[640];
+    int off = snprintf(opts, sizeof(opts), "Select network...");
+    const wifi_ap_record_t *recs = wifi_scanner_get_results_ptr();
+    uint16_t cnt = wifi_scanner_get_count();
+    for (int i = 0; i < cnt && off < (int)sizeof(opts) - 40; i++) {
+        if (recs[i].ssid[0] == '\0') continue;   // skip hidden
+        off += snprintf(opts + off, sizeof(opts) - off, "\n%.32s", (const char *)recs[i].ssid);
+    }
+    lv_dropdown_set_options(home_add_dd, opts);
+}
+
+// Poll the background scan; fill the dropdown once it finishes.
+static void home_add_scan_timer_cb(lv_timer_t *t)
+{
+    if (!home_add_overlay || !home_add_dd) {
+        lv_timer_del(t);
+        home_add_scan_timer = NULL;
+        return;
+    }
+    if (wifi_scanner_is_done()) {
+        home_add_fill_networks();
+        lv_timer_del(t);
+        home_add_scan_timer = NULL;
+    }
+}
+
 static void home_mgmt_add_open_cb(lv_event_t *e)
 {
     (void)e;
@@ -9483,22 +9522,21 @@ static void home_mgmt_add_open_cb(lv_event_t *e)
 
     // Dropdown of scanned networks (created after the SSID field so it draws on
     // top of it when its list opens). Pick one to fill the SSID, or type below.
-    lv_obj_t *dd = lv_dropdown_create(home_add_overlay);
-    lv_obj_set_width(dd, lv_pct(92));
-    lv_obj_align(dd, LV_ALIGN_TOP_MID, 0, 36);
-    {
-        char opts[640];
-        int off = snprintf(opts, sizeof(opts), "Select network...");
-        const wifi_ap_record_t *recs = wifi_scanner_get_results_ptr();
-        const uint16_t *cntp = wifi_scanner_get_count_ptr();
-        uint16_t cnt = cntp ? *cntp : 0;
-        for (int i = 0; i < cnt && off < (int)sizeof(opts) - 40; i++) {
-            if (recs[i].ssid[0] == '\0') continue;   // skip hidden
-            off += snprintf(opts + off, sizeof(opts) - off, "\n%.32s", (const char *)recs[i].ssid);
+    home_add_dd = lv_dropdown_create(home_add_overlay);
+    lv_obj_set_width(home_add_dd, lv_pct(92));
+    lv_obj_align(home_add_dd, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_add_event_cb(home_add_dd, home_add_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Show whatever the last scan found immediately, then kick a fresh scan so
+    // the list populates even when we arrived here without scanning first.
+    home_add_fill_networks();
+    if (ensure_wifi_mode()) {
+        if (wifi_scanner_start_scan() == ESP_OK) {
+            lv_dropdown_set_options(home_add_dd, "Scanning...");
+            if (home_add_scan_timer) lv_timer_del(home_add_scan_timer);
+            home_add_scan_timer = lv_timer_create(home_add_scan_timer_cb, 400, NULL);
         }
-        lv_dropdown_set_options(dd, opts);
     }
-    lv_obj_add_event_cb(dd, home_add_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     home_add_pw_ta = lv_textarea_create(home_add_overlay);
     lv_textarea_set_one_line(home_add_pw_ta, true);
@@ -15078,6 +15116,7 @@ static void settings_tile_event_cb(lv_event_t *e)
     } else if (strcmp(tile_name, "RedTeam mode") == 0) {
         g_redteam_mode = !g_redteam_mode;
         nvs_settings_save_redteam(g_redteam_mode);
+        if (settings_tiles) settings_pending_scroll_y = lv_obj_get_scroll_y(settings_tiles);
         show_settings_screen();   // re-render so the tile reflects the new state
     } else if (strcmp(tile_name, "Download Mode") == 0) {
         show_download_mode_screen();
@@ -15093,10 +15132,12 @@ static void settings_tile_event_cb(lv_event_t *e)
         if (current_radio_mode == RADIO_MODE_WIFI) {
             apply_wifi_power_settings();
         }
+        if (settings_tiles) settings_pending_scroll_y = lv_obj_get_scroll_y(settings_tiles);
         show_settings_screen();   // re-render so the tile reflects the new state
     } else if (strcmp(tile_name, "Dark Mode") == 0) {
         dark_mode_enabled = !dark_mode_enabled;
         nvs_settings_save_dark_mode(dark_mode_enabled);
+        if (settings_tiles) settings_pending_scroll_y = lv_obj_get_scroll_y(settings_tiles);
         show_settings_screen();   // re-render with the new theme applied
     }
 }
@@ -15285,8 +15326,9 @@ static void show_wardrive_settings_screen(void)
 static void show_settings_screen(void)
 {
     create_function_page_base("Settings");
-    
+
     lv_obj_t *tiles = lv_obj_create(function_page);
+    settings_tiles = tiles;
     lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
@@ -15315,9 +15357,12 @@ static void show_settings_screen(void)
                 g_redteam_mode ? COLOR_MATERIAL_AMBER : lv_color_make(120, 120, 120),
                 settings_tile_event_cb, "RedTeam mode");
     
-    // Download Mode - Red
-    create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Download\nMode", COLOR_MATERIAL_RED, settings_tile_event_cb, "Download Mode");
-    
+    // Max TX Power - toggles max WiFi transmit power (label reflects state)
+    create_tile(tiles, LV_SYMBOL_CHARGE,
+                g_max_power_mode ? "Max Power\nON" : "Max Power\nOFF",
+                g_max_power_mode ? lv_color_make(0, 170, 60) : lv_color_make(120, 120, 120),
+                settings_tile_event_cb, "Max Power");
+
     // Screen Timeout - Teal
     create_tile(tiles, LV_SYMBOL_BELL, "Screen\nTimeout", COLOR_MATERIAL_TEAL, settings_tile_event_cb, "Screen Timeout");
     
@@ -15330,11 +15375,17 @@ static void show_settings_screen(void)
                 dark_mode_enabled ? COLOR_MATERIAL_INDIGO : lv_color_make(180, 180, 80),
                 settings_tile_event_cb, "Dark Mode");
 
-    // Max TX Power - toggles max WiFi transmit power (label reflects state)
-    create_tile(tiles, LV_SYMBOL_CHARGE,
-                g_max_power_mode ? "Max Power\nON" : "Max Power\nOFF",
-                g_max_power_mode ? lv_color_make(0, 170, 60) : lv_color_make(120, 120, 120),
-                settings_tile_event_cb, "Max Power");
+    // Download Mode - Red
+    create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Download\nMode", COLOR_MATERIAL_RED, settings_tile_event_cb, "Download Mode");
+
+    // Restore scroll position after an in-place rebuild (e.g. toggling a tile)
+    // so the view stays put instead of snapping to the top. Layout must be
+    // computed first for the scroll clamp to know the content height.
+    if (settings_pending_scroll_y != 0) {
+        lv_obj_update_layout(tiles);
+        lv_obj_scroll_to_y(tiles, settings_pending_scroll_y, LV_ANIM_OFF);
+        settings_pending_scroll_y = 0;
+    }
 }
 
 // WiFi Monitor screen
