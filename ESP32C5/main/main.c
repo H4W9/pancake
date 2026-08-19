@@ -11074,6 +11074,15 @@ static inline lv_color_t spec_c(uint16_t rgb565) {
     return lv_color_make(r, g, b);
 }
 
+// Channels the view can tune to, in order (2.4 GHz then common 5 GHz). The
+// Chan buttons step through this list; the same list draws the axis markers.
+static const uint8_t SPEC_CHANS[] = {
+    1,2,3,4,5,6,7,8,9,10,11,12,13,
+    36,40,44,48,149,153,157,161,165
+};
+#define SPEC_CHAN_COUNT ((int)(sizeof(SPEC_CHANS) / sizeof(SPEC_CHANS[0])))
+static int spec_chan_idx = 5;   // index into SPEC_CHANS (default channel 6)
+
 // RSSI heat map: green (strong) -> yellow -> orange -> red (weak). Same hex as ref.
 static inline lv_color_t spec_rssi_color(int r) {
     if (r >= -55) return spec_c(0x07E0);
@@ -11240,19 +11249,18 @@ static void spec_render(void) {
         lv_canvas_draw_text(spec_canvas, 0, (y < 6 ? 0 : y - 6), SPEC_SLEFT - 4, &td, lbl);
     }
 
-    // Channel ticks + numbers (2.4 GHz + common 5 GHz), only if in view
-    static const uint8_t chs[] = {
-        1,2,3,4,5,6,7,8,9,10,11,12,13,
-        36,40,44,48,149,153,157,161,165
-    };
-    for (unsigned i = 0; i < sizeof(chs); i++) {
-        int x = spec_fx(spec_cf(chs[i]));
+    // Channel ticks + numbers (2.4 GHz + common 5 GHz), only if in view. The
+    // currently tuned channel's number is highlighted.
+    for (int i = 0; i < SPEC_CHAN_COUNT; i++) {
+        int x = spec_fx(spec_cf(SPEC_CHANS[i]));
         if (x < SPEC_SLEFT || x > SPEC_SRIGHT) continue;
         spec_vline(x, SPEC_SBOTTOM, 3, fg);
         char n[4];
-        snprintf(n, sizeof(n), "%u", chs[i]);
+        snprintf(n, sizeof(n), "%u", SPEC_CHANS[i]);
+        td.color = (i == spec_chan_idx) ? spec_c(0x07E0) : fg;
         lv_canvas_draw_text(spec_canvas, x - 8, SPEC_CHLBL_Y, 18, &td, n);
     }
+    td.color = fg;
 
     // Lobes: unselected as outlines, selected filled and on top
     for (int n = 0; n < spec_ap_count; n++) {
@@ -11294,8 +11302,8 @@ static void spec_update_info(void) {
         snprintf(b, sizeof(b), "%.24s   ch %u   %d dBm   [%d/%d]",
                  ss, a->ch, a->rssi, spec_sel + 1, spec_ap_count);
     } else {
-        snprintf(b, sizeof(b), "%d APs   center %d MHz   (pick an AP)",
-                 spec_ap_count, (int)spec_center_mhz);
+        snprintf(b, sizeof(b), "%d APs   ch %u tuned   (pick an AP)",
+                 spec_ap_count, SPEC_CHANS[spec_chan_idx]);
     }
     lv_label_set_text(spec_info_label, b);
 }
@@ -11339,23 +11347,24 @@ static void spec_select(int dir) {
         if (spec_sel >= spec_ap_count) spec_sel = 0;
     }
     spec_center_mhz = spec_cf(spec_aps[spec_sel].ch);
+    // Keep the axis channel highlight in sync with the selected AP's channel.
+    for (int i = 0; i < SPEC_CHAN_COUNT; i++) {
+        if (SPEC_CHANS[i] == spec_aps[spec_sel].ch) { spec_chan_idx = i; break; }
+    }
     spec_update_info();
 }
-static void spec_pan(float d) {
-    spec_center_mhz += d;
-    if (d < 0) {
-        if (spec_center_mhz > 2483.0f && spec_center_mhz < 5180.0f) spec_center_mhz = 2472.0f;
-        if (spec_center_mhz < 2412.0f) spec_center_mhz = 2412.0f;
-    } else {
-        if (spec_center_mhz > 2483.0f && spec_center_mhz < 5180.0f) spec_center_mhz = 5180.0f;
-        if (spec_center_mhz > 5825.0f) spec_center_mhz = 5825.0f;
-    }
+// Step to the previous/next channel across both bands and center the view on it.
+static void spec_chan_step(int dir) {
+    spec_chan_idx += dir;
+    if (spec_chan_idx < 0) spec_chan_idx = SPEC_CHAN_COUNT - 1;
+    if (spec_chan_idx >= SPEC_CHAN_COUNT) spec_chan_idx = 0;
+    spec_center_mhz = spec_cf(SPEC_CHANS[spec_chan_idx]);
     spec_update_info();
 }
 static void spec_prev_ap_cb(lv_event_t *e) { (void)e; spec_select(-1); }
 static void spec_next_ap_cb(lv_event_t *e) { (void)e; spec_select(+1); }
-static void spec_pan_l_cb(lv_event_t *e)   { (void)e; spec_pan(-5.0f); }
-static void spec_pan_r_cb(lv_event_t *e)   { (void)e; spec_pan(+5.0f); }
+static void spec_chan_l_cb(lv_event_t *e)  { (void)e; spec_chan_step(-1); }
+static void spec_chan_r_cb(lv_event_t *e)  { (void)e; spec_chan_step(+1); }
 
 // Small helper: one control button in the bottom row.
 static void spec_make_btn(lv_obj_t *row, const char *txt, lv_event_cb_t cb) {
@@ -11395,6 +11404,7 @@ static void show_spectrum_screen(void) {
     // Initialise state
     spec_ap_count = 0;
     spec_sel = -1;
+    spec_chan_idx = 5;              // channel 6
     spec_center_mhz = 2437.0f;
     spec_width_mhz = 60.0f;
     spec_wf_row = 0;
@@ -11424,8 +11434,8 @@ static void show_spectrum_screen(void) {
     lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
     spec_make_btn(btn_row, LV_SYMBOL_LEFT " AP", spec_prev_ap_cb);
     spec_make_btn(btn_row, "AP " LV_SYMBOL_RIGHT, spec_next_ap_cb);
-    spec_make_btn(btn_row, LV_SYMBOL_LEFT " Pan", spec_pan_l_cb);
-    spec_make_btn(btn_row, "Pan " LV_SYMBOL_RIGHT, spec_pan_r_cb);
+    spec_make_btn(btn_row, LV_SYMBOL_LEFT " Chan", spec_chan_l_cb);
+    spec_make_btn(btn_row, "Chan " LV_SYMBOL_RIGHT, spec_chan_r_cb);
 
     spec_active = true;
     spec_last_scan = lv_tick_get();
