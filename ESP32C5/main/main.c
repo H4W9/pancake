@@ -4328,8 +4328,9 @@ static void display_refresh_task(void *pvParameters)
             }
             // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack/deauth_monitor/portal or when handshaker is waiting for scan)
             else if (scan_done_ui_flag) {
-                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active || handshake_waiting_for_scan || g_handshaker_global_mode) {
-                    // During attacks or while waiting for scan, just clear the flag without showing results
+                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active || handshake_waiting_for_scan || g_handshaker_global_mode || home_add_overlay) {
+                    // During attacks, the add-home dialog's SSID scan, or while
+                    // waiting for a scan, just clear the flag without showing results
                     scan_done_ui_flag = false;
                 } else {
                 scan_done_ui_flag = false;
