@@ -9547,6 +9547,17 @@ static void home_mgmt_add_open_cb(lv_event_t *e)
     lv_obj_align(home_add_pw_ta, LV_ALIGN_TOP_MID, 0, 132);
     lv_obj_add_event_cb(home_add_pw_ta, home_mgmt_ta_event_cb, LV_EVENT_CLICKED, NULL);
 
+    // Match the dropdown->SSID gap to the SSID->password gap. The dropdown and
+    // text fields differ in height, so measure them after layout and place the
+    // dropdown so its bottom sits one field-gap above the SSID field's top.
+    lv_obj_update_layout(home_add_overlay);
+    {
+        lv_coord_t ta_h  = lv_obj_get_height(home_add_ssid_ta);
+        lv_coord_t dd_h  = lv_obj_get_height(home_add_dd);
+        lv_coord_t gap   = 132 - (82 + ta_h);   // existing gap between the two fields
+        lv_obj_align(home_add_dd, LV_ALIGN_TOP_MID, 0, 82 - gap - dd_h);
+    }
+
     lv_obj_t *cancel = lv_btn_create(home_add_overlay);
     lv_obj_set_size(cancel, 110, 40);
     lv_obj_align(cancel, LV_ALIGN_TOP_LEFT, 22, 184);
