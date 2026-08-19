@@ -8,6 +8,7 @@
 #include "driver/spi_master.h"
 #include "driver/i2c.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -2317,6 +2318,7 @@ static void nvs_settings_save_timeout(int32_t ms)                     { nvs_save
 static void nvs_settings_save_brightness(uint8_t pct)                 { nvs_save_enqueue(1, pct, 0); }
 static void nvs_settings_save_scan_time(uint16_t min_ms, uint16_t max_ms) { nvs_save_enqueue(2, min_ms, max_ms); }
 static void nvs_settings_save_max_power(bool enabled)                 { nvs_save_enqueue(4, enabled ? 1 : 0, 0); }
+static void nvs_settings_save_dark_mode(bool enabled)                 { nvs_save_enqueue(3, enabled ? 1 : 0, 0); }
 static void nvs_settings_save_redteam(bool enabled)                  { nvs_save_enqueue(5, enabled ? 1 : 0, 0); }
 static void nvs_settings_save_wd_5ghz(bool enabled)                  { nvs_save_enqueue(6, enabled ? 1 : 0, 0); }
 static void nvs_settings_save_wd_rssidelta(uint8_t d)                { nvs_save_enqueue(7, d, 0); }
@@ -2329,34 +2331,60 @@ static void nvs_settings_save_home_upload(bool enabled)             { nvs_save_e
 // Backlight / Brightness / Screen Dimming
 // ============================================================================
 
+// Hardware backlight PWM (LEDC) on LCD_BL_IO, gamma-corrected like Marauder/M5.
+#define BL_LEDC_MODE     LEDC_LOW_SPEED_MODE
+#define BL_LEDC_TIMER    LEDC_TIMER_0
+#define BL_LEDC_CHANNEL  LEDC_CHANNEL_0
+#define BL_LEDC_RES      LEDC_TIMER_12_BIT
+#define BL_LEDC_FREQ_HZ  5000
+#define BL_DUTY_MAX      4095
+
 static void init_backlight(void)
 {
 #if LCD_BL_IO >= 0
-    // Pancake backlight is on a GPIO (not tied to 3V3): drive it to turn the panel on.
-    gpio_config_t bk_cfg = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = 1ULL << LCD_BL_IO,
+    // Pancake's backlight GPIO supports PWM dimming (as Marauder does). Drive it
+    // with LEDC instead of a plain on/off level so brightness is real hardware
+    // dimming — no software darkening overlay needed.
+    ledc_timer_config_t bl_timer = {
+        .speed_mode      = BL_LEDC_MODE,
+        .duty_resolution = BL_LEDC_RES,
+        .timer_num       = BL_LEDC_TIMER,
+        .freq_hz         = BL_LEDC_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
     };
-    gpio_config(&bk_cfg);
-    gpio_set_level(LCD_BL_IO, LCD_BL_ACTIVE_LEVEL);
-#else
-    // No backlight GPIO configured (LED tied to 3V3).
-    (void)0;
+    ledc_timer_config(&bl_timer);
+
+    ledc_channel_config_t bl_ch = {
+        .gpio_num   = LCD_BL_IO,
+        .speed_mode = BL_LEDC_MODE,
+        .channel    = BL_LEDC_CHANNEL,
+        .timer_sel  = BL_LEDC_TIMER,
+        .duty       = BL_DUTY_MAX,          // start full on
+        .hpoint     = 0,
+        .flags.output_invert = (LCD_BL_ACTIVE_LEVEL == 0) ? 1 : 0,
+    };
+    ledc_channel_config(&bl_ch);
 #endif
-    // Brightness levels are handled by a software overlay on lv_layer_top().
 }
 
 static void set_backlight_percent(uint8_t percent)
 {
-    // Software brightness: a black overlay on lv_layer_top() with variable opacity.
-    // 100% brightness = fully transparent overlay (OPA_TRANSP).
-    // 10% brightness  = nearly opaque overlay.
-    if (!brightness_overlay) return;
     if (percent > 100) percent = 100;
-    if (percent < 10)  percent = 10;
-    // Map 10-100% to opacity 230-0  (linear)
-    lv_opa_t opa = (lv_opa_t)(255 - (uint16_t)percent * 255 / 100);
-    lv_obj_set_style_bg_opa(brightness_overlay, opa, 0);
+    if (percent < 5)   percent = 5;   // keep the panel visible at minimum
+
+    // The legacy software overlay is no longer the brightness control — keep it
+    // fully transparent so it doesn't darken on top of the PWM backlight.
+    if (brightness_overlay) {
+        lv_obj_set_style_bg_opa(brightness_overlay, LV_OPA_TRANSP, 0);
+    }
+
+#if LCD_BL_IO >= 0
+    // Gamma 2.2 maps the slider % to perceptually-linear brightness.
+    float lin = powf((float)percent / 100.0f, 2.2f);
+    uint32_t duty = (uint32_t)(lin * (float)BL_DUTY_MAX + 0.5f);
+    ledc_set_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL, duty);
+    ledc_update_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL);
+#endif
 }
 
 static void screen_set_dimmed(bool dimmed)
@@ -2372,6 +2400,11 @@ static void screen_set_dimmed(bool dimmed)
         if (brightness_overlay) {
             lv_obj_add_flag(brightness_overlay, LV_OBJ_FLAG_HIDDEN);
         }
+#if LCD_BL_IO >= 0
+        // Backlight fully off for a true screen-off.
+        ledc_set_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL, 0);
+        ledc_update_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL);
+#endif
         if (panel_handle) {
             esp_lcd_panel_disp_on_off(panel_handle, false);
         }
@@ -15061,6 +15094,10 @@ static void settings_tile_event_cb(lv_event_t *e)
             apply_wifi_power_settings();
         }
         show_settings_screen();   // re-render so the tile reflects the new state
+    } else if (strcmp(tile_name, "Dark Mode") == 0) {
+        dark_mode_enabled = !dark_mode_enabled;
+        nvs_settings_save_dark_mode(dark_mode_enabled);
+        show_settings_screen();   // re-render with the new theme applied
     }
 }
 
@@ -15286,6 +15323,12 @@ static void show_settings_screen(void)
     
     // Screen Brightness - Orange
     create_tile(tiles, LV_SYMBOL_IMAGE, "Screen\nBrightness", COLOR_MATERIAL_ORANGE, settings_tile_event_cb, "Screen Brightness");
+
+    // Dark Mode / theme - toggles the light/dark palette (label reflects state)
+    create_tile(tiles, LV_SYMBOL_EYE_OPEN,
+                dark_mode_enabled ? "Dark Mode\nON" : "Dark Mode\nOFF",
+                dark_mode_enabled ? COLOR_MATERIAL_INDIGO : lv_color_make(180, 180, 80),
+                settings_tile_event_cb, "Dark Mode");
 
     // Max TX Power - toggles max WiFi transmit power (label reflects state)
     create_tile(tiles, LV_SYMBOL_CHARGE,

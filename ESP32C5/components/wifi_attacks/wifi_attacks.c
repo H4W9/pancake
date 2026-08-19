@@ -2466,18 +2466,6 @@ static esp_err_t admin_root_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// OS captive-portal probe endpoints (Windows /connecttest.txt & /ncsi.txt,
-// Android /generate_204 & /gen_204, iOS /hotspot-detect.html): reply with a
-// 302 to the admin page so the "Sign in to network" sheet pops automatically
-// instead of the OS deciding it has real internet.
-static esp_err_t admin_redirect_handler(httpd_req_t *req) {
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "http://172.0.0.1/");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
-    httpd_resp_send(req, NULL, 0);
-    return ESP_OK;
-}
-
 // GET /api/list?path=<rel> -> JSON array of {name,dir,size}
 static esp_err_t admin_list_handler(httpd_req_t *req) {
     char full[SD_PATH_MAX];
@@ -2739,18 +2727,10 @@ static esp_err_t start_admin_services(void) {
     httpd_register_uri_handler(portal_server, &delete_uri);
     httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = admin_root_handler };
     httpd_register_uri_handler(portal_server, &root_uri);
-    // OS captive-portal probes -> 302 to the admin page (auto-pop the sign-in sheet).
-    httpd_uri_t connecttest_uri = { .uri = "/connecttest.txt", .method = HTTP_GET, .handler = admin_redirect_handler };
-    httpd_register_uri_handler(portal_server, &connecttest_uri);
-    httpd_uri_t ncsi_uri = { .uri = "/ncsi.txt", .method = HTTP_GET, .handler = admin_redirect_handler };
-    httpd_register_uri_handler(portal_server, &ncsi_uri);
-    httpd_uri_t gen204_uri = { .uri = "/generate_204", .method = HTTP_GET, .handler = admin_redirect_handler };
-    httpd_register_uri_handler(portal_server, &gen204_uri);
-    httpd_uri_t gen204b_uri = { .uri = "/gen_204", .method = HTTP_GET, .handler = admin_redirect_handler };
-    httpd_register_uri_handler(portal_server, &gen204b_uri);
-    httpd_uri_t hotspot_uri = { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = admin_redirect_handler };
-    httpd_register_uri_handler(portal_server, &hotspot_uri);
-    // Catch-all so any other OS detection URL also loads the admin UI.
+    // Catch-all: serve the admin UI for every other GET (matches the reference).
+    // OS captive-portal probes get the admin HTML too, which both triggers the
+    // sign-in sheet AND lets a normal browser reach the page — a 302 redirect on
+    // those probe URLs is what broke manual browser access.
     httpd_uri_t catchall_uri = { .uri = "/*", .method = HTTP_GET, .handler = admin_root_handler };
     httpd_register_uri_handler(portal_server, &catchall_uri);
 
