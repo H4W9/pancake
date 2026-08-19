@@ -23,6 +23,7 @@
 #include "esp_event.h"
 #include "freertos/semphr.h"
 #include "esp_system.h"
+#include "esp_idf_version.h"
 #include "soc/lp_aon_reg.h"
 #include "wifi_cli.h"
 #include "wifi_scanner.h"
@@ -832,8 +833,9 @@ static lv_obj_t *home_add_overlay    = NULL;
 static lv_obj_t *home_add_ssid_ta    = NULL;
 static lv_obj_t *home_add_pw_ta      = NULL;
 static lv_obj_t *home_add_keyboard   = NULL;
-static lv_obj_t *home_add_dd         = NULL;   // scanned-networks dropdown
+static lv_obj_t *home_add_dd         = NULL;   // scanned-networks dropdown (backing store for the SSID combobox list)
 static lv_timer_t *home_add_scan_timer = NULL; // polls the scan and fills the dropdown
+static int home_add_edit_idx         = -1;     // -1 = adding new; >=0 = editing that saved entry
 
 static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
 static int wdp_ducb_channel_count = 0;
@@ -1270,6 +1272,7 @@ static void main_tile_event_cb(lv_event_t *e);
 static void attack_tile_event_cb(lv_event_t *e);
 static void update_sniffer_button_ui(void);
 static void show_settings_screen(void);
+static void show_about_screen(void);
 static void settings_tile_event_cb(lv_event_t *e);
 // Scrollable tiles container of the settings screen + a pending scroll offset
 // to restore after an in-place rebuild (toggles) so the view doesn't jump to
@@ -1563,6 +1566,8 @@ static void wardrive_home_no_cb(lv_event_t *e);
 static void show_home_mgmt_screen(void);
 static void home_mgmt_refresh(void);
 static void home_mgmt_delete_cb(lv_event_t *e);
+static void home_mgmt_edit_cb(lv_event_t *e);
+static void home_mgmt_open_editor(int edit_idx);
 static void home_mgmt_add_open_cb(lv_event_t *e);
 static void home_mgmt_add_save_cb(lv_event_t *e);
 static void home_mgmt_add_cancel_cb(lv_event_t *e);
@@ -9428,6 +9433,7 @@ static void home_mgmt_add_cancel_cb(lv_event_t *e)
     home_add_pw_ta = NULL;
     home_add_keyboard = NULL;
     home_add_dd = NULL;
+    home_add_edit_idx = -1;
 }
 
 static void home_mgmt_add_save_cb(lv_event_t *e)
@@ -9436,8 +9442,13 @@ static void home_mgmt_add_save_cb(lv_event_t *e)
     if (home_add_ssid_ta) {
         const char *ssid = lv_textarea_get_text(home_add_ssid_ta);
         const char *pw = home_add_pw_ta ? lv_textarea_get_text(home_add_pw_ta) : "";
-        if (ssid && ssid[0] && wardrive_home_count < WARDRIVE_HOME_MAX) {
-            wardrive_home_t *h = &wardrive_home[wardrive_home_count];
+        // Editing an existing entry overwrites it in place; otherwise append.
+        int idx = home_add_edit_idx;
+        bool ok = (idx >= 0 && idx < wardrive_home_count) ||
+                  (idx < 0 && wardrive_home_count < WARDRIVE_HOME_MAX);
+        if (ssid && ssid[0] && ok) {
+            if (idx < 0) idx = wardrive_home_count;
+            wardrive_home_t *h = &wardrive_home[idx];
             strncpy(h->ssid, ssid, sizeof(h->ssid) - 1);
             h->ssid[sizeof(h->ssid) - 1] = '\0';
             h->password[0] = '\0';
@@ -9445,7 +9456,7 @@ static void home_mgmt_add_save_cb(lv_event_t *e)
                 strncpy(h->password, pw, sizeof(h->password) - 1);
                 h->password[sizeof(h->password) - 1] = '\0';
             }
-            wardrive_home_count++;
+            if (home_add_edit_idx < 0) wardrive_home_count++;
             wardrive_save_home();
         }
     }
@@ -9457,10 +9468,20 @@ static void home_mgmt_add_save_cb(lv_event_t *e)
 static void home_add_dd_cb(lv_event_t *e)
 {
     lv_obj_t *dd = lv_event_get_target(e);
+    lv_dropdown_close(dd);
     if (lv_dropdown_get_selected(dd) == 0) return;
     char ssid[64];
     lv_dropdown_get_selected_str(dd, ssid, sizeof(ssid));
     if (home_add_ssid_ta) lv_textarea_set_text(home_add_ssid_ta, ssid);
+}
+
+// Arrow button at the end of the SSID field -> drop the scanned-networks list.
+static void home_add_arrow_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!home_add_dd) return;
+    if (home_add_keyboard) lv_obj_add_flag(home_add_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_dropdown_open(home_add_dd);
 }
 
 // (Re)build the dropdown options from the current WiFi scan results.
@@ -9493,11 +9514,14 @@ static void home_add_scan_timer_cb(lv_timer_t *t)
     }
 }
 
-static void home_mgmt_add_open_cb(lv_event_t *e)
+// Build the add/edit-home-network overlay. edit_idx < 0 adds a new entry;
+// edit_idx >= 0 edits that saved entry (fields pre-filled, saved in place).
+static void home_mgmt_open_editor(int edit_idx)
 {
-    (void)e;
     if (home_add_overlay || !function_page) return;
-    if (wardrive_home_count >= WARDRIVE_HOME_MAX) return;
+    if (edit_idx < 0 && wardrive_home_count >= WARDRIVE_HOME_MAX) return;
+    if (edit_idx >= wardrive_home_count) return;
+    home_add_edit_idx = edit_idx;
 
     home_add_overlay = lv_obj_create(function_page);
     lv_obj_set_size(home_add_overlay, LCD_H_RES, LCD_V_RES);
@@ -9508,36 +9532,49 @@ static void home_mgmt_add_open_cb(lv_event_t *e)
     lv_obj_clear_flag(home_add_overlay, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *tl = lv_label_create(home_add_overlay);
-    lv_label_set_text(tl, "Add home network");
+    lv_label_set_text(tl, edit_idx >= 0 ? "Edit home network" : "Add home network");
     lv_obj_set_style_text_color(tl, ui_text_color(), 0);
     lv_obj_set_style_text_font(tl, &lv_font_montserrat_16, 0);
     lv_obj_align(tl, LV_ALIGN_TOP_MID, 0, 6);
 
-    // SSID field first so the dropdown callback can fill it.
-    home_add_ssid_ta = lv_textarea_create(home_add_overlay);
-    lv_textarea_set_one_line(home_add_ssid_ta, true);
-    lv_textarea_set_placeholder_text(home_add_ssid_ta, "SSID (or pick above)");
-    lv_obj_set_width(home_add_ssid_ta, lv_pct(92));
-    lv_obj_align(home_add_ssid_ta, LV_ALIGN_TOP_MID, 0, 82);
-    lv_obj_add_event_cb(home_add_ssid_ta, home_mgmt_ta_event_cb, LV_EVENT_CLICKED, NULL);
-
-    // Dropdown of scanned networks (created after the SSID field so it draws on
-    // top of it when its list opens). Pick one to fill the SSID, or type below.
+    // Invisible dropdown that backs the SSID combobox. It is never tapped
+    // directly; the arrow button opens its list, which anchors to this rect.
     home_add_dd = lv_dropdown_create(home_add_overlay);
     lv_obj_set_width(home_add_dd, lv_pct(92));
-    lv_obj_align(home_add_dd, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_align(home_add_dd, LV_ALIGN_TOP_MID, 0, 82);
+    lv_obj_set_style_bg_opa(home_add_dd, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(home_add_dd, 0, 0);
+    lv_dropdown_set_symbol(home_add_dd, NULL);
     lv_obj_add_event_cb(home_add_dd, home_add_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    // Show whatever the last scan found immediately, then kick a fresh scan so
-    // the list populates even when we arrived here without scanning first.
-    home_add_fill_networks();
-    if (ensure_wifi_mode()) {
-        if (wifi_scanner_start_scan() == ESP_OK) {
-            lv_dropdown_set_options(home_add_dd, "Scanning...");
-            if (home_add_scan_timer) lv_timer_del(home_add_scan_timer);
-            home_add_scan_timer = lv_timer_create(home_add_scan_timer_cb, 400, NULL);
-        }
-    }
+    // SSID combobox: one field = text area (tap to type) + arrow (tap for list).
+    lv_obj_t *field_box = lv_obj_create(home_add_overlay);
+    lv_obj_set_width(field_box, lv_pct(92));
+    lv_obj_set_height(field_box, 44);
+    lv_obj_align(field_box, LV_ALIGN_TOP_MID, 0, 82);
+    lv_obj_set_style_bg_opa(field_box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(field_box, 0, 0);
+    lv_obj_set_style_pad_all(field_box, 0, 0);
+    lv_obj_set_style_pad_column(field_box, 6, 0);
+    lv_obj_set_flex_flow(field_box, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(field_box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(field_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    home_add_ssid_ta = lv_textarea_create(field_box);
+    lv_textarea_set_one_line(home_add_ssid_ta, true);
+    lv_textarea_set_placeholder_text(home_add_ssid_ta, "SSID");
+    lv_obj_set_flex_grow(home_add_ssid_ta, 1);
+    lv_obj_add_event_cb(home_add_ssid_ta, home_mgmt_ta_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *arrow = lv_btn_create(field_box);
+    lv_obj_set_size(arrow, 44, 40);
+    lv_obj_set_style_bg_color(arrow, ui_accent_color(), 0);
+    lv_obj_set_style_radius(arrow, 6, 0);
+    lv_obj_t *arl = lv_label_create(arrow);
+    lv_label_set_text(arl, LV_SYMBOL_DOWN);
+    lv_obj_set_style_text_color(arl, lv_color_white(), 0);
+    lv_obj_center(arl);
+    lv_obj_add_event_cb(arrow, home_add_arrow_cb, LV_EVENT_CLICKED, NULL);
 
     home_add_pw_ta = lv_textarea_create(home_add_overlay);
     lv_textarea_set_one_line(home_add_pw_ta, true);
@@ -9547,15 +9584,20 @@ static void home_mgmt_add_open_cb(lv_event_t *e)
     lv_obj_align(home_add_pw_ta, LV_ALIGN_TOP_MID, 0, 132);
     lv_obj_add_event_cb(home_add_pw_ta, home_mgmt_ta_event_cb, LV_EVENT_CLICKED, NULL);
 
-    // Match the dropdown->SSID gap to the SSID->password gap. The dropdown and
-    // text fields differ in height, so measure them after layout and place the
-    // dropdown so its bottom sits one field-gap above the SSID field's top.
-    lv_obj_update_layout(home_add_overlay);
-    {
-        lv_coord_t ta_h  = lv_obj_get_height(home_add_ssid_ta);
-        lv_coord_t dd_h  = lv_obj_get_height(home_add_dd);
-        lv_coord_t gap   = 132 - (82 + ta_h);   // existing gap between the two fields
-        lv_obj_align(home_add_dd, LV_ALIGN_TOP_MID, 0, 82 - gap - dd_h);
+    // Pre-fill when editing an existing entry.
+    if (edit_idx >= 0) {
+        lv_textarea_set_text(home_add_ssid_ta, wardrive_home[edit_idx].ssid);
+        lv_textarea_set_text(home_add_pw_ta, wardrive_home[edit_idx].password);
+    }
+
+    // Populate the SSID list from the last scan, then kick a fresh scan.
+    home_add_fill_networks();
+    if (ensure_wifi_mode()) {
+        if (wifi_scanner_start_scan() == ESP_OK) {
+            lv_dropdown_set_options(home_add_dd, "Scanning...");
+            if (home_add_scan_timer) lv_timer_del(home_add_scan_timer);
+            home_add_scan_timer = lv_timer_create(home_add_scan_timer_cb, 400, NULL);
+        }
     }
 
     lv_obj_t *cancel = lv_btn_create(home_add_overlay);
@@ -9580,12 +9622,34 @@ static void home_mgmt_add_open_cb(lv_event_t *e)
     lv_obj_center(sl);
     lv_obj_add_event_cb(save, home_mgmt_add_save_cb, LV_EVENT_CLICKED, NULL);
 
+    // Keyboard: same size/placement/theme as the rest of the UI (see the WiFi
+    // Connect screen). Full width, bottom 40%, hidden until a field is tapped.
     home_add_keyboard = lv_keyboard_create(home_add_overlay);
     lv_keyboard_set_mode(home_add_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_add_flag(home_add_keyboard, LV_OBJ_FLAG_HIDDEN);
     lv_keyboard_set_textarea(home_add_keyboard, home_add_ssid_ta);
+    lv_obj_set_size(home_add_keyboard, lv_pct(100), lv_pct(40));
+    lv_obj_align(home_add_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(home_add_keyboard, ui_bg_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(home_add_keyboard, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(home_add_keyboard, lv_color_make(0, 100, 0), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(home_add_keyboard, lv_color_make(0, 150, 0), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(home_add_keyboard, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_color(home_add_keyboard, ui_border_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_width(home_add_keyboard, 1, LV_PART_ITEMS);
+    lv_obj_add_flag(home_add_keyboard, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(home_add_keyboard, home_mgmt_kb_event_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(home_add_keyboard, home_mgmt_kb_event_cb, LV_EVENT_CANCEL, NULL);
+}
+
+static void home_mgmt_add_open_cb(lv_event_t *e)
+{
+    (void)e;
+    home_mgmt_open_editor(-1);
+}
+
+static void home_mgmt_edit_cb(lv_event_t *e)
+{
+    home_mgmt_open_editor((int)(intptr_t)lv_event_get_user_data(e));
 }
 
 static void home_mgmt_refresh(void)
@@ -9609,7 +9673,7 @@ static void home_mgmt_refresh(void)
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
         char buf[48];
-        snprintf(buf, sizeof(buf), "%.28s%s", wardrive_home[i].ssid,
+        snprintf(buf, sizeof(buf), "%.20s%s", wardrive_home[i].ssid,
                  wardrive_home[i].password[0] ? "  *" : "");
         lv_obj_t *lbl = lv_label_create(row);
         lv_label_set_text(lbl, buf);
@@ -9618,7 +9682,7 @@ static void home_mgmt_refresh(void)
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
 
         lv_obj_t *del = lv_btn_create(row);
-        lv_obj_set_size(del, 74, 34);
+        lv_obj_set_size(del, 66, 34);
         lv_obj_align(del, LV_ALIGN_RIGHT_MID, 0, 0);
         lv_obj_set_style_bg_color(del, COLOR_MATERIAL_RED, 0);
         lv_obj_set_style_radius(del, 6, 0);
@@ -9628,6 +9692,18 @@ static void home_mgmt_refresh(void)
         lv_obj_set_style_text_color(dl, lv_color_white(), 0);
         lv_obj_center(dl);
         lv_obj_add_event_cb(del, home_mgmt_delete_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        lv_obj_t *edit = lv_btn_create(row);
+        lv_obj_set_size(edit, 56, 34);
+        lv_obj_align(edit, LV_ALIGN_RIGHT_MID, -72, 0);
+        lv_obj_set_style_bg_color(edit, COLOR_MATERIAL_TEAL, 0);
+        lv_obj_set_style_radius(edit, 6, 0);
+        lv_obj_t *el = lv_label_create(edit);
+        lv_label_set_text(el, "Edit");
+        lv_obj_set_style_text_font(el, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(el, lv_color_white(), 0);
+        lv_obj_center(el);
+        lv_obj_add_event_cb(edit, home_mgmt_edit_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
     }
 }
 
@@ -15151,6 +15227,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         nvs_settings_save_dark_mode(dark_mode_enabled);
         if (settings_tiles) settings_pending_scroll_y = lv_obj_get_scroll_y(settings_tiles);
         show_settings_screen();   // re-render with the new theme applied
+    } else if (strcmp(tile_name, "About") == 0) {
+        show_about_screen();
     }
 }
 
@@ -15273,7 +15351,10 @@ static void show_wardrive_settings_screen(void)
     lv_obj_t *rssi_slider = lv_slider_create(form);
     lv_slider_set_range(rssi_slider, 0, 50);
     lv_slider_set_value(rssi_slider, wd_rssi_relog_delta, LV_ANIM_OFF);
-    lv_obj_set_width(rssi_slider, lv_pct(100));
+    // Inset from the form edges so the knob doesn't crowd the screen edge or the
+    // scrollbar at the range extremes (same 0-50 value range).
+    lv_obj_set_width(rssi_slider, lv_pct(88));
+    lv_obj_set_style_margin_left(rssi_slider, 6, 0);
     lv_obj_add_event_cb(rssi_slider, wd_rssi_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     // ---- Memory cap + Anti-surv sensitivity (side by side) ----
@@ -15390,6 +15471,9 @@ static void show_settings_screen(void)
     // Download Mode - Red
     create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Download\nMode", COLOR_MATERIAL_RED, settings_tile_event_cb, "Download Mode");
 
+    // About - Blue Grey: firmware info (kept last)
+    create_tile(tiles, LV_SYMBOL_LIST, "About", COLOR_MATERIAL_INDIGO, settings_tile_event_cb, "About");
+
     // Restore scroll position after an in-place rebuild (e.g. toggling a tile)
     // so the view stays put instead of snapping to the top. Layout must be
     // computed first for the scroll clamp to know the content height.
@@ -15398,6 +15482,63 @@ static void show_settings_screen(void)
         lv_obj_scroll_to_y(tiles, settings_pending_scroll_y, LV_ANIM_OFF);
         settings_pending_scroll_y = 0;
     }
+}
+
+// About screen - firmware name, version and build info.
+static void show_about_screen(void)
+{
+    create_function_page_base("About");
+
+    lv_obj_t *panel = lv_obj_create(function_page);
+    lv_obj_set_size(panel, lv_pct(96), LCD_V_RES - 30 - 12);
+    lv_obj_align(panel, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(panel, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(panel, ui_accent_color(), 0);
+    lv_obj_set_style_border_width(panel, 1, 0);
+    lv_obj_set_style_radius(panel, 8, 0);
+    lv_obj_set_style_pad_all(panel, 12, 0);
+    lv_obj_set_style_pad_row(panel, 6, 0);
+    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_AUTO);
+
+    // Title
+    lv_obj_t *name = lv_label_create(panel);
+    lv_label_set_text(name, "JanOS \xC2\xB7 projectZero");
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(name, ui_accent_color(), 0);
+
+    lv_obj_t *desc = lv_label_create(panel);
+    lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(desc, lv_pct(100));
+    lv_label_set_text(desc,
+        "Dual-band WiFi & BLE pentest and wardriving firmware for the Pancake ESP32-C5.");
+    lv_obj_set_style_text_font(desc, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(desc, ui_text_color(), 0);
+
+    // Info rows: label + value, one per line.
+    char line[96];
+    struct { const char *k; const char *v; } rows[] = {
+        { "Version",   JANOS_VERSION },
+        { "Board",     "Pancake ESP32-C5" },
+        { "Built",     __DATE__ " " __TIME__ },
+        { "IDF",       esp_get_idf_version() },
+    };
+    for (unsigned i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        snprintf(line, sizeof(line), "%s:  %s", rows[i].k, rows[i].v);
+        lv_obj_t *r = lv_label_create(panel);
+        lv_label_set_text(r, line);
+        lv_obj_set_style_text_font(r, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(r, ui_text_color(), 0);
+    }
+
+    // Free heap (a little runtime "such")
+    snprintf(line, sizeof(line), "Free heap:  %u KB",
+             (unsigned)(esp_get_free_heap_size() / 1024));
+    lv_obj_t *heap = lv_label_create(panel);
+    lv_label_set_text(heap, line);
+    lv_obj_set_style_text_font(heap, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(heap, lv_color_make(150, 150, 150), 0);
 }
 
 // WiFi Monitor screen
