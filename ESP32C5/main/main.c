@@ -2409,7 +2409,9 @@ static void nvs_settings_save_sound(bool enabled)                   { nvs_save_e
 typedef struct { uint16_t freq, dur, pause; } sfx_note_t;   // {0,0,0} = end
 
 // Note tables (freq Hz, duration ms, pause ms) — ported from Porkchop SFX.
-static const sfx_note_t SND_CLICK[]      = { {1050, 6, 0}, {0, 0, 0} };
+// A very short high tick reads as a "click" on the passive buzzer (rather than
+// a sustained beep); the pump runs fast enough to render a ~2 ms note.
+static const sfx_note_t SND_CLICK[]      = { {1400, 2, 0}, {0, 0, 0} };
 static const sfx_note_t SND_MODE_ENTER[] = { {700, 30, 10}, {1000, 40, 0}, {0, 0, 0} };
 static const sfx_note_t SND_BACK[]       = { {800, 25, 0}, {0, 0, 0} };
 static const sfx_note_t SND_CONFIRM[]    = { {800, 40, 15}, {1100, 50, 0}, {0, 0, 0} };
@@ -2530,7 +2532,7 @@ static void sfx_init(void) {
     };
     if (ledc_channel_config(&cc) != ESP_OK) return;
     sfx_buzz_ready = true;
-    sfx_timer = lv_timer_create(sfx_pump, 5, NULL);
+    sfx_timer = lv_timer_create(sfx_pump, 2, NULL);   // fine granularity for short clicks
 }
 
 // ============================================================================
@@ -9690,6 +9692,22 @@ static void home_add_arrow_cb(lv_event_t *e)
     lv_dropdown_open(home_add_dd);
 }
 
+// True when the backing dropdown's list is currently visible.
+static bool home_add_dd_is_open(void)
+{
+    if (!home_add_dd) return false;
+    lv_obj_t *list = lv_dropdown_get_list(home_add_dd);
+    return list && !lv_obj_has_flag(list, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Tapping empty overlay space closes an open list (LVGL won't, since the field
+// covers the invisible dropdown button).
+static void home_add_overlay_click_cb(lv_event_t *e)
+{
+    (void)e;
+    if (home_add_dd_is_open()) lv_dropdown_close(home_add_dd);
+}
+
 // (Re)build the dropdown options from the current WiFi scan results.
 static void home_add_fill_networks(void)
 {
@@ -9714,7 +9732,14 @@ static void home_add_scan_timer_cb(lv_timer_t *t)
         return;
     }
     if (wifi_scanner_is_done()) {
+        bool was_open = home_add_dd_is_open();
         home_add_fill_networks();
+        // If the user is looking at the "Scanning..." list, refresh it in place
+        // to the found APs without needing another tap.
+        if (was_open) {
+            lv_dropdown_close(home_add_dd);
+            lv_dropdown_open(home_add_dd);
+        }
         lv_timer_del(t);
         home_add_scan_timer = NULL;
     }
@@ -9736,6 +9761,8 @@ static void home_mgmt_open_editor(int edit_idx)
     lv_obj_set_style_bg_opa(home_add_overlay, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(home_add_overlay, 0, 0);
     lv_obj_clear_flag(home_add_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(home_add_overlay, LV_OBJ_FLAG_CLICKABLE);   // tap empty space closes the list
+    lv_obj_add_event_cb(home_add_overlay, home_add_overlay_click_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *tl = lv_label_create(home_add_overlay);
     lv_label_set_text(tl, edit_idx >= 0 ? "Edit home network" : "Add home network");
@@ -11537,10 +11564,10 @@ static void spec_chan_l_cb(lv_event_t *e)  { (void)e; spec_chan_step(-1); }
 static void spec_chan_r_cb(lv_event_t *e)  { (void)e; spec_chan_step(+1); }
 
 // Small helper: one control button in the bottom row.
-static void spec_make_btn(lv_obj_t *row, const char *txt, lv_event_cb_t cb) {
+static void spec_make_btn(lv_obj_t *row, const char *txt, lv_color_t color, lv_event_cb_t cb) {
     lv_obj_t *b = lv_btn_create(row);
     lv_obj_set_size(b, 106, 40);
-    lv_obj_set_style_bg_color(b, ui_accent_color(), 0);
+    lv_obj_set_style_bg_color(b, color, 0);
     lv_obj_set_style_radius(b, 8, 0);
     lv_obj_t *l = lv_label_create(b);
     lv_label_set_text(l, txt);
@@ -11602,10 +11629,11 @@ static void show_spectrum_screen(void) {
     lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
-    spec_make_btn(btn_row, LV_SYMBOL_LEFT " AP", spec_prev_ap_cb);
-    spec_make_btn(btn_row, "AP " LV_SYMBOL_RIGHT, spec_next_ap_cb);
-    spec_make_btn(btn_row, LV_SYMBOL_LEFT " Chan", spec_chan_l_cb);
-    spec_make_btn(btn_row, "Chan " LV_SYMBOL_RIGHT, spec_chan_r_cb);
+    // AP buttons green, Chan buttons orange (distinct, no blue).
+    spec_make_btn(btn_row, LV_SYMBOL_LEFT " AP", COLOR_MATERIAL_GREEN, spec_prev_ap_cb);
+    spec_make_btn(btn_row, "AP " LV_SYMBOL_RIGHT, COLOR_MATERIAL_GREEN, spec_next_ap_cb);
+    spec_make_btn(btn_row, LV_SYMBOL_LEFT " Chan", COLOR_MATERIAL_ORANGE, spec_chan_l_cb);
+    spec_make_btn(btn_row, "Chan " LV_SYMBOL_RIGHT, COLOR_MATERIAL_ORANGE, spec_chan_r_cb);
 
     spec_active = true;
     spec_last_scan = lv_tick_get();
@@ -15978,12 +16006,13 @@ static void show_wardrive_settings_screen(void)
         lv_label_set_text(wd_rssi_val_label, b);
     }
     lv_obj_set_style_text_color(wd_rssi_val_label, COLOR_MATERIAL_TEAL, 0);
-    lv_obj_t *rssi_slider = lv_slider_create(form);
+    // Center the slider in its own row so it sits inset from both the left edge
+    // and the scrollbar/right edge (equal margins), same 0-50 value range.
+    lv_obj_t *rssi_row = wd_flow_row(form, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *rssi_slider = lv_slider_create(rssi_row);
     lv_slider_set_range(rssi_slider, 0, 50);
     lv_slider_set_value(rssi_slider, wd_rssi_relog_delta, LV_ANIM_OFF);
-    // Narrower than the form so the knob doesn't crowd the screen edge or the
-    // scrollbar at the range extremes (same 0-50 value range).
-    lv_obj_set_width(rssi_slider, lv_pct(88));
+    lv_obj_set_width(rssi_slider, lv_pct(86));
     lv_obj_add_event_cb(rssi_slider, wd_rssi_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     // ---- Memory cap + Anti-surv sensitivity (side by side) ----
@@ -17615,15 +17644,25 @@ static void battery_monitor_task(void *arg)
 {
     (void)arg;
     char voltage_str[32];
+    uint8_t last_good_pct = 255;   // remembered across transient I2C read failures
 
     // Initial delay to let UI stabilize
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     for (;;) {
         uint8_t pct = read_max17048_percent();
+        // A single read can fail under I2C contention with the touch controller.
+        // Retry a couple of times before giving up this cycle.
+        for (int i = 0; i < 3 && pct == 255; i++) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            pct = read_max17048_percent();
+        }
+        if (pct != 255) last_good_pct = pct;
+        // Show the last known percentage rather than "--" once we have one.
+        pct = last_good_pct;
 
         if (pct == 255) {
-            // MAX17048 not responding
+            // Never got a reading yet (gauge still settling at power-on)
             snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_EMPTY " --");
         } else if (pct >= 75) {
             snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_FULL " %d%%", pct);
