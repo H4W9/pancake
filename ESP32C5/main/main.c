@@ -2397,7 +2397,10 @@ static void nvs_settings_save_sound(bool enabled)                   { nvs_save_e
 
 // ============================================================================
 // UI Sound Effects — passive buzzer on GPIO6 driven by LEDC square-wave tones.
-// Non-blocking note-sequence player (Porkchop-style), pumped by an LVGL timer.
+// Mimics Porkchop's tone(pin,freq,duration): each note is turned OFF by a
+// hardware one-shot esp_timer at exactly `duration`, so a note never sustains
+// even if the UI thread stalls. The same timer chains through the sequence
+// (note -> pause -> next note), then pulls the next queued sound.
 // ============================================================================
 #define BUZZER_GPIO        6
 #define BUZZ_LEDC_MODE     LEDC_LOW_SPEED_MODE
@@ -2421,15 +2424,18 @@ static const sfx_note_t SND_BOOT[]       = {
     {210, 320, 90},  {240, 360, 0}, {0, 0, 0}
 };
 
-static const sfx_note_t *sfx_seq       = NULL;
-static uint8_t           sfx_step      = 0;
-static uint32_t          sfx_step_start = 0;
-static bool              sfx_in_note   = false;
-static lv_timer_t       *sfx_timer     = NULL;
+// Sequence state — owned exclusively by the esp_timer callback context.
+enum { SFX_IDLE, SFX_NOTE, SFX_PAUSE };
+static const sfx_note_t *sfx_seq        = NULL;
+static int               sfx_step       = 0;
+static uint8_t           sfx_phase      = SFX_IDLE;
+static esp_timer_handle_t sfx_note_timer = NULL;
 static bool              sfx_buzz_ready = false;
+// Event queue — shared (producers: LVGL/main task; consumer: timer task).
 #define SFX_Q 6
 static const sfx_note_t *sfx_queue[SFX_Q];
 static volatile uint8_t  sfx_qhead = 0, sfx_qtail = 0;
+static portMUX_TYPE      sfx_qmux = portMUX_INITIALIZER_UNLOCKED;
 
 static void buzz_tone(uint16_t freq) {
     if (!sfx_buzz_ready) return;
@@ -2444,65 +2450,70 @@ static void buzz_tone(uint16_t freq) {
 }
 static inline void buzz_off(void) { buzz_tone(0); }
 
-// Queue a sound (safe to call from anywhere; drops oldest if the ring is full).
+// Start step `sfx_step` of the current sequence: sound the note (or silence) and
+// arm the one-shot for its duration. Returns false when the sequence is done.
+static bool sfx_begin_step(void) {
+    const sfx_note_t *n = &sfx_seq[sfx_step];
+    if (n->freq == 0 && n->dur == 0) return false;   // terminator
+    buzz_tone(n->freq);                              // freq 0 => silent gap
+    sfx_phase = SFX_NOTE;
+    esp_timer_start_once(sfx_note_timer, (uint64_t)n->dur * 1000);
+    return true;
+}
+
+// Pull the next queued sound and start it; go idle if the queue is empty.
+static void sfx_pull_next(void) {
+    const sfx_note_t *s = NULL;
+    portENTER_CRITICAL(&sfx_qmux);
+    if (sfx_qtail != sfx_qhead) { s = sfx_queue[sfx_qtail]; sfx_qtail = (sfx_qtail + 1) % SFX_Q; }
+    portEXIT_CRITICAL(&sfx_qmux);
+    if (!s) { sfx_seq = NULL; sfx_phase = SFX_IDLE; return; }
+    sfx_seq = s;
+    sfx_step = 0;
+    if (!sfx_begin_step()) { sfx_seq = NULL; sfx_phase = SFX_IDLE; sfx_pull_next(); }
+}
+
+// One-shot fired: advance the sequence. Runs in the esp_timer task, the sole
+// owner of sfx_seq/step/phase, so no locking is needed for that state.
+static void sfx_timer_cb(void *arg) {
+    (void)arg;
+    if (!g_sound_enabled) {
+        buzz_off();
+        sfx_seq = NULL; sfx_phase = SFX_IDLE;
+        portENTER_CRITICAL(&sfx_qmux); sfx_qtail = sfx_qhead; portEXIT_CRITICAL(&sfx_qmux);
+        return;
+    }
+    if (sfx_seq) {
+        const sfx_note_t *n = &sfx_seq[sfx_step];
+        if (sfx_phase == SFX_NOTE) {
+            buzz_off();                          // hardware-timed note end
+            if (n->pause > 0) {                  // hold the gap, then advance
+                sfx_phase = SFX_PAUSE;
+                esp_timer_start_once(sfx_note_timer, (uint64_t)n->pause * 1000);
+                return;
+            }
+        }
+        sfx_step++;                              // move to the next note
+        if (sfx_begin_step()) return;            // started it
+        sfx_seq = NULL;                          // sequence finished
+    }
+    sfx_pull_next();
+}
+
+// Queue a sound (safe from any task). Kicks the sequencer if it's idle.
 static void sfx_play(const sfx_note_t *seq) {
     if (!g_sound_enabled || !seq || !sfx_buzz_ready) return;
+    portENTER_CRITICAL(&sfx_qmux);
     uint8_t next = (sfx_qhead + 1) % SFX_Q;
     if (next == sfx_qtail) sfx_qtail = (sfx_qtail + 1) % SFX_Q;   // drop oldest
     sfx_queue[sfx_qhead] = seq;
     sfx_qhead = next;
-}
-
-static void sfx_start(const sfx_note_t *seq) {
-    sfx_seq = seq;
-    sfx_step = 0;
-    sfx_step_start = lv_tick_get();
-    sfx_in_note = true;
-    buzz_tone(seq[0].freq);
-}
-
-// Non-blocking state machine, pumped every few ms by an LVGL timer.
-static void sfx_pump(lv_timer_t *t) {
-    (void)t;
-    if (!g_sound_enabled) {
-        if (sfx_seq) { buzz_off(); sfx_seq = NULL; }
-        sfx_qtail = sfx_qhead;
-        return;
-    }
-    if (sfx_seq == NULL) {
-        if (sfx_qtail != sfx_qhead) {
-            const sfx_note_t *s = sfx_queue[sfx_qtail];
-            sfx_qtail = (sfx_qtail + 1) % SFX_Q;
-            sfx_start(s);
-        } else {
-            return;
-        }
-    }
-    uint32_t now = lv_tick_get();
-    const sfx_note_t *n = &sfx_seq[sfx_step];
-    uint32_t elapsed = now - sfx_step_start;
-    if (sfx_in_note) {
-        if (elapsed >= n->dur) {
-            if (n->pause > 0) {
-                buzz_off();
-                sfx_in_note = false;
-                sfx_step_start = now;
-            } else {
-                sfx_step++;
-                const sfx_note_t *nx = &sfx_seq[sfx_step];
-                if (nx->freq == 0 && nx->dur == 0) { buzz_off(); sfx_seq = NULL; return; }
-                sfx_step_start = now;
-                sfx_in_note = true;
-                buzz_tone(nx->freq);
-            }
-        }
-    } else if (elapsed >= n->pause) {
-        sfx_step++;
-        const sfx_note_t *nx = &sfx_seq[sfx_step];
-        if (nx->freq == 0 && nx->dur == 0) { buzz_off(); sfx_seq = NULL; return; }
-        sfx_step_start = now;
-        sfx_in_note = true;
-        buzz_tone(nx->freq);
+    portEXIT_CRITICAL(&sfx_qmux);
+    // If the sequencer is idle, kick it. If it's mid-note the timer is active and
+    // will pick this up when the current sound ends. start_once errors harmlessly
+    // if a concurrent callback already armed the timer.
+    if (!esp_timer_is_active(sfx_note_timer)) {
+        esp_timer_start_once(sfx_note_timer, 1);
     }
 }
 
@@ -2530,8 +2541,12 @@ static void sfx_init(void) {
         .hpoint     = 0,
     };
     if (ledc_channel_config(&cc) != ESP_OK) return;
+    const esp_timer_create_args_t ta = {
+        .callback = sfx_timer_cb,
+        .name = "sfx",
+    };
+    if (esp_timer_create(&ta, &sfx_note_timer) != ESP_OK) return;
     sfx_buzz_ready = true;
-    sfx_timer = lv_timer_create(sfx_pump, 2, NULL);   // fine granularity for short clicks
 }
 
 // ============================================================================
