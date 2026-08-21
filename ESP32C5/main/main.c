@@ -2410,10 +2410,7 @@ typedef struct { uint16_t freq, dur, pause; } sfx_note_t;   // {0,0,0} = end
 
 // Note tables (freq Hz, duration ms, pause ms) — ported from Porkchop SFX.
 static const sfx_note_t SND_CLICK[]      = { {1050, 6, 0}, {0, 0, 0} };
-static const sfx_note_t SND_MENU[]       = { {900, 7, 0}, {0, 0, 0} };
-static const sfx_note_t SND_TYPING[]     = { {1200, 4, 0}, {0, 0, 0} };
 static const sfx_note_t SND_MODE_ENTER[] = { {700, 30, 10}, {1000, 40, 0}, {0, 0, 0} };
-static const sfx_note_t SND_MODE_EXIT[]  = { {900, 30, 10}, {600, 40, 0}, {0, 0, 0} };
 static const sfx_note_t SND_BACK[]       = { {800, 25, 0}, {0, 0, 0} };
 static const sfx_note_t SND_CONFIRM[]    = { {800, 40, 15}, {1100, 50, 0}, {0, 0, 0} };
 static const sfx_note_t SND_BOOT[]       = {
@@ -11119,6 +11116,7 @@ void show_function_page(const char *name)
 static void home_btn_event_cb(lv_event_t *e)
 {
     (void)e;
+    sfx_play(SND_BACK);   // menu-close sound
     // Send "reboot" command via UART (GPS UART port)
     const char *reboot_cmd = "reboot\n";
     uart_write_bytes(GPS_UART_NUM, reboot_cmd, strlen(reboot_cmd));
