@@ -2409,9 +2409,8 @@ static void nvs_settings_save_sound(bool enabled)                   { nvs_save_e
 typedef struct { uint16_t freq, dur, pause; } sfx_note_t;   // {0,0,0} = end
 
 // Note tables (freq Hz, duration ms, pause ms) — ported from Porkchop SFX.
-// A very short high tick reads as a "click" on the passive buzzer (rather than
-// a sustained beep); the pump runs fast enough to render a ~2 ms note.
-static const sfx_note_t SND_CLICK[]      = { {1400, 2, 0}, {0, 0, 0} };
+// SND_CLICK matches Porkchop's UI click exactly (1050 Hz, 6 ms).
+static const sfx_note_t SND_CLICK[]      = { {1050, 6, 0}, {0, 0, 0} };
 static const sfx_note_t SND_MODE_ENTER[] = { {700, 30, 10}, {1000, 40, 0}, {0, 0, 0} };
 static const sfx_note_t SND_BACK[]       = { {800, 25, 0}, {0, 0, 0} };
 static const sfx_note_t SND_CONFIRM[]    = { {800, 40, 15}, {1100, 50, 0}, {0, 0, 0} };
@@ -3814,10 +3813,10 @@ void app_main(void)
     indev_drv.feedback_cb = sfx_indev_feedback;   // click on every touch press
     lv_indev_drv_register(&indev_drv);
 
-    // Buzzer UI sounds (GPIO6). Init after settings load so g_sound_enabled is
-    // correct, then play the boot chime.
+    // Buzzer UI sounds (GPIO6). Set up the LEDC channel + pump now, but hold the
+    // boot chime until after the MAX17048 probe so buzzer switching noise on the
+    // shared board can't corrupt the I2C probe (see below).
     sfx_init();
-    sfx_play(SND_BOOT);
 
     if (screen_idle_timer == NULL) {
         screen_idle_timer = lv_timer_create(screen_idle_timer_cb, SCREEN_INACTIVITY_CHECK_MS, NULL);
@@ -3917,25 +3916,28 @@ void app_main(void)
     check_heap_integrity("Before main loop");
     print_memory_stats();
     
-    // MAX17048 fuel gauge — shares I2C bus with FT6336U touch
-    if (init_max17048() == ESP_OK) {
-        battery_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-        if (battery_task_stack != NULL) {
-            battery_task_handle = xTaskCreateStatic(battery_monitor_task, "bat_mon", 4096, NULL,
-                tskIDLE_PRIORITY + 1, battery_task_stack, &battery_task_buffer);
-            if (battery_task_handle == NULL) {
-                ESP_LOGE(TAG, "Failed to create battery monitor task");
-                heap_caps_free(battery_task_stack);
-                battery_task_stack = NULL;
-            } else {
-                ESP_LOGI(TAG, "Battery monitor task running (PSRAM stack, 30s refresh)");
-            }
+    // MAX17048 fuel gauge — shares I2C bus with FT6336U touch. Probe in silence
+    // (boot chime not yet played) and create the monitor task regardless of the
+    // probe result: read_max17048_percent() self-heals, so the gauge recovers
+    // even if this first probe was disturbed.
+    init_max17048();
+    battery_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (battery_task_stack != NULL) {
+        battery_task_handle = xTaskCreateStatic(battery_monitor_task, "bat_mon", 4096, NULL,
+            tskIDLE_PRIORITY + 1, battery_task_stack, &battery_task_buffer);
+        if (battery_task_handle == NULL) {
+            ESP_LOGE(TAG, "Failed to create battery monitor task");
+            heap_caps_free(battery_task_stack);
+            battery_task_stack = NULL;
         } else {
-            ESP_LOGE(TAG, "Failed to allocate battery task stack from PSRAM");
+            ESP_LOGI(TAG, "Battery monitor task running (PSRAM stack)");
         }
     } else {
-        ESP_LOGW(TAG, "Battery ADC init failed - voltage monitor disabled");
+        ESP_LOGE(TAG, "Failed to allocate battery task stack from PSRAM");
     }
+
+    // Now it's safe to make noise: play the boot chime.
+    sfx_play(SND_BOOT);
 
     // Deferred-NVS writer: LVGL callbacks run on the display task's PSRAM stack and
     // must not write internal flash, so settings saves are queued to this task,
@@ -17605,23 +17607,30 @@ static esp_err_t max17048_read_reg(uint8_t reg, uint16_t *value)
 
 static esp_err_t init_max17048(void)
 {
-    // Probe the MAX17048 on the shared I2C bus
-    if (!i2c_mutex || xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
-        return ESP_ERR_TIMEOUT;
-
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (MAX17048_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    xSemaphoreGive(i2c_mutex);
+    // Probe the MAX17048 on the shared I2C bus. Retry a few times — a single
+    // probe can be disturbed by bus contention or buzzer switching noise.
+    esp_err_t ret = ESP_FAIL;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (!i2c_mutex || xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (MAX17048_ADDR << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
+        i2c_cmd_link_delete(cmd);
+        xSemaphoreGive(i2c_mutex);
+        if (ret == ESP_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
 
     if (ret == ESP_OK) {
         max17048_found = true;
         ESP_LOGI(TAG, "MAX17048 detected at 0x%02X", MAX17048_ADDR);
     } else {
-        ESP_LOGW(TAG, "MAX17048 not found (ret=%s) — battery display disabled", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "MAX17048 probe failed (ret=%s) — will keep retrying in the monitor task", esp_err_to_name(ret));
     }
     return ret;
 }
@@ -17629,9 +17638,11 @@ static esp_err_t init_max17048(void)
 // Returns battery percentage 0-100, or 255 if unavailable
 static uint8_t read_max17048_percent(void)
 {
-    if (!max17048_found) return 255;
+    // Always attempt the read (self-healing): a successful read means the gauge
+    // is present even if the initial boot-time probe was disturbed.
     uint16_t raw = 0;
     if (max17048_read_reg(MAX17048_REG_SOC, &raw) != ESP_OK) return 255;
+    max17048_found = true;
     // Upper byte = integer %, lower byte = 1/256 fractional
     uint8_t percent = raw >> 8;
     if (percent > 100) percent = 100;
@@ -17690,7 +17701,9 @@ static void battery_monitor_task(void *arg)
             xSemaphoreGive(lvgl_mutex);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(BATTERY_UPDATE_INTERVAL_MS));
+        // Poll quickly until we have a first reading (so "--" is only ever
+        // momentary), then relax to the normal refresh interval.
+        vTaskDelay(pdMS_TO_TICKS(last_good_pct == 255 ? 1000 : BATTERY_UPDATE_INTERVAL_MS));
     }
 }
 #endif  // MAX17048 battery fuel gauge
