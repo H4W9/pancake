@@ -426,6 +426,12 @@ static int rom_vprintf(const char *fmt, va_list ap)
 
 // Scanner UI state
 static volatile bool scan_done_ui_flag = false;
+// Positive intent: only the WiFi Scan & Attack flow wants the network-selection
+// "Scan Results" screen to appear when a scan finishes. Every other feature that
+// starts a scan (spectrum, add-home SSID list, sniffer dog, deauth monitor, …)
+// leaves this false, so a completing scan never hijacks their screen. Cleared on
+// any nav-away by reset_function_page_children().
+static volatile bool scan_results_wanted = false;
 #define SCAN_RESULTS_MAX_DISPLAY 32
 
 // Whitelist for BSSID protection
@@ -570,7 +576,11 @@ static int sniffer_dog_channel_index = 0;
 static int64_t sniffer_dog_last_channel_hop = 0;
 static const int sniffer_channel_hop_delay_ms = 250;
 static volatile uint32_t snifferdog_kick_count = 0;
-static char snifferdog_last_pair[48] = "N/A";
+// Last kicked pair stored as raw MAC bytes (formatted by the UI, never in the
+// promiscuous callback — see sniffer_dog_promiscuous_callback).
+static uint8_t snifferdog_last_ap[6]  = {0};
+static uint8_t snifferdog_last_sta[6] = {0};
+static bool    snifferdog_have_pair   = false;
 static portMUX_TYPE snifferdog_stats_spin = portMUX_INITIALIZER_UNLOCKED;
 
 // Sniffer UI state
@@ -870,7 +880,6 @@ static int8_t     *spec_col_persist   = NULL;    // smoothed columns for the wat
 static lv_obj_t   *spec_info_label    = NULL;
 static lv_timer_t *spec_timer         = NULL;
 static bool        spec_active        = false;
-static bool        spec_scan_guard    = false;   // suppress the scan-result nav for one scan after exit
 static uint32_t    spec_last_scan     = 0;
 static uint16_t    spec_noise         = 0xACE1;
 
@@ -1427,13 +1436,10 @@ static void reset_function_page_children(void) {
     antisurv_list = NULL;
     antisurv_status_label = NULL;
     antisurv_exit_btn = NULL;
+    // Any nav-away cancels the intent to show the WiFi Scan & Attack results
+    // screen, so a scan that finishes right after we leave is ignored.
+    scan_results_wanted = false;
     // Spectrum Analyzer: stop the render timer and free its PSRAM buffers.
-    // If a rescan is still in flight, guard the one scan-done that will land
-    // after we leave so it doesn't pop the (empty) Scan Results screen.
-    if (spec_active) {
-        spec_scan_guard = !wifi_scanner_is_done();
-        scan_done_ui_flag = false;
-    }
     spec_active = false;
     if (spec_timer) { lv_timer_del(spec_timer); spec_timer = NULL; }
     if (spec_buf) { heap_caps_free(spec_buf); spec_buf = NULL; }
@@ -2837,40 +2843,22 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
     // Send deauth frame from AP to STA
     uint8_t deauth_frame[sizeof(deauth_frame_default)];
     memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
-    
+
     memcpy(&deauth_frame[4], sta_mac, 6);   // Destination: specific STA
     memcpy(&deauth_frame[10], ap_mac, 6);   // Source: AP
     memcpy(&deauth_frame[16], ap_mac, 6);   // BSSID: AP
-    
-    // Log deauth packet info: SSID (unknown when sniffing), BSSID, Channel
-    ESP_LOGI(TAG, "[SNIFFERDOG] SSID: %-32s | BSSID: %02X:%02X:%02X:%02X:%02X:%02X | CH: %2d | STA: %02X:%02X:%02X:%02X:%02X:%02X",
-             "(sniffed-unknown)",
-             ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
-             sniffer_dog_current_channel,
-             sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5]);
-    
-    // Log raw deauth frame bytes (hex)
-    {
-        char hexbuf[3 * sizeof(deauth_frame_default) + 1];
-        char *p = hexbuf;
-        for (size_t i = 0; i < sizeof(deauth_frame_default); i++) {
-            int written = sprintf(p, "%02X", deauth_frame[i]);
-            p += written;
-            if (i + 1 < sizeof(deauth_frame_default)) {
-                *p++ = ' ';
-            }
-        }
-        *p = '\0';
-        //ESP_LOGI(TAG, "[SNIFFERDOG] DEAUTH RAW: %s", hexbuf);
-    }
 
     esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame_default), false);
+
+    // This runs in the WiFi RX callback on EVERY matching packet, so it must be
+    // cheap: no per-packet logging, and the spinlock (shared with the UI task)
+    // is held only long enough to bump the counter and copy 12 raw MAC bytes.
+    // The UI formats the "AP -> STA" string from these bytes when it draws.
     portENTER_CRITICAL(&snifferdog_stats_spin);
     snifferdog_kick_count++;
-    snprintf(snifferdog_last_pair, sizeof(snifferdog_last_pair),
-             "%02X:%02X:%02X:%02X:%02X:%02X -> %02X:%02X:%02X:%02X:%02X:%02X",
-             ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
-             sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5]);
+    memcpy(snifferdog_last_ap, ap_mac, 6);
+    memcpy(snifferdog_last_sta, sta_mac, 6);
+    snifferdog_have_pair = true;
     portEXIT_CRITICAL(&snifferdog_stats_spin);
 }
 
@@ -4167,11 +4155,13 @@ static void display_refresh_task(void *pvParameters)
 
             if (snifferdog_ui_active && (snifferdog_kick_label || snifferdog_recent_label)) {
                 uint32_t kicks;
-                char recent_buf[48];
+                uint8_t ap[6], sta[6];
+                bool have_pair;
                 portENTER_CRITICAL(&snifferdog_stats_spin);
                 kicks = snifferdog_kick_count;
-                strncpy(recent_buf, snifferdog_last_pair, sizeof(recent_buf));
-                recent_buf[sizeof(recent_buf) - 1] = '\0';
+                have_pair = snifferdog_have_pair;
+                memcpy(ap, snifferdog_last_ap, 6);
+                memcpy(sta, snifferdog_last_sta, 6);
                 portEXIT_CRITICAL(&snifferdog_stats_spin);
 
                 if (snifferdog_kick_label) {
@@ -4180,8 +4170,15 @@ static void display_refresh_task(void *pvParameters)
                     lv_label_set_text(snifferdog_kick_label, buf);
                 }
                 if (snifferdog_recent_label) {
-                    char buf[96];
-                    snprintf(buf, sizeof(buf), "Recent kick: %s", recent_buf);
+                    char buf[64];
+                    if (have_pair) {
+                        snprintf(buf, sizeof(buf),
+                                 "Recent kick: %02X:%02X:%02X:%02X:%02X:%02X -> %02X:%02X:%02X:%02X:%02X:%02X",
+                                 ap[0], ap[1], ap[2], ap[3], ap[4], ap[5],
+                                 sta[0], sta[1], sta[2], sta[3], sta[4], sta[5]);
+                    } else {
+                        snprintf(buf, sizeof(buf), "Recent kick: N/A");
+                    }
                     lv_label_set_text(snifferdog_recent_label, buf);
                 }
             }
@@ -4550,17 +4547,17 @@ static void display_refresh_task(void *pvParameters)
                 // Start the actual monitoring
                 deauth_monitor_start_monitoring();
             }
-            // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack/deauth_monitor/portal or when handshaker is waiting for scan)
+            // A scan finished. Show the network-selection "Scan Results" screen
+            // ONLY if the WiFi Scan & Attack flow asked for it. Any other scan
+            // (spectrum, add-home SSID list, sniffer dog, wardrive, etc.) just
+            // clears the flag — so leaving those screens mid-scan can never pop
+            // an empty results screen.
             else if (scan_done_ui_flag) {
-                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active || handshake_waiting_for_scan || g_handshaker_global_mode || home_add_overlay || spec_active || spec_scan_guard) {
-                    // During attacks, the add-home dialog's SSID scan, the spectrum
-                    // analyzer's rescans, or while waiting for a scan, just clear the
-                    // flag without showing results. spec_scan_guard also swallows the
-                    // one scan that may still finish just after leaving the analyzer.
+                if (!scan_results_wanted) {
                     scan_done_ui_flag = false;
-                    spec_scan_guard = false;   // one-shot
                 } else {
                 scan_done_ui_flag = false;
+                scan_results_wanted = false;   // consume the intent
 
                 if (function_page) { lv_obj_del(function_page); function_page = NULL; }
                 reset_function_page_children();
@@ -5890,8 +5887,7 @@ static void snifferdog_yes_btn_cb(lv_event_t *e)
     // Reset counters
     portENTER_CRITICAL(&snifferdog_stats_spin);
     snifferdog_kick_count = 0;
-    strncpy(snifferdog_last_pair, "N/A", sizeof(snifferdog_last_pair));
-    snifferdog_last_pair[sizeof(snifferdog_last_pair) - 1] = '\0';
+    snifferdog_have_pair = false;
     portEXIT_CRITICAL(&snifferdog_stats_spin);
     
     // Title label (white, centered)
@@ -6026,8 +6022,7 @@ static void snifferdog_stop_btn_cb(lv_event_t *e)
     snifferdog_stop_btn = NULL;
     portENTER_CRITICAL(&snifferdog_stats_spin);
     snifferdog_kick_count = 0;
-    strncpy(snifferdog_last_pair, "N/A", sizeof(snifferdog_last_pair));
-    snifferdog_last_pair[sizeof(snifferdog_last_pair) - 1] = '\0';
+    snifferdog_have_pair = false;
     portEXIT_CRITICAL(&snifferdog_stats_spin);
     snifferdog_ui_active = false;  // Clear snifferdog UI active flag
     scan_done_ui_flag = false;  // Clear any pending scan done flag
@@ -11922,8 +11917,9 @@ static void show_wifi_scan_attack_screen(void)
     // Clear previous selections when user manually starts scan
     wifi_scanner_clear_selections();
     wifi_scanner_clear_targets();
-    
-    // Start scan
+
+    // Start scan — this flow wants the network-selection results screen.
+    scan_results_wanted = true;
     wifi_scanner_start_scan();
 }
 
@@ -14978,9 +14974,9 @@ static void show_attack_tiles_screen(void)
     create_small_tile(attack_tiles, LV_SYMBOL_UPLOAD, "WPA-SEC", COLOR_MATERIAL_CYAN, attack_tile_event_cb, "WPA-SEC Upload");
     // WiGLE: connect to the selected network (STA), then upload wardrive CSVs
     create_small_tile(attack_tiles, LV_SYMBOL_GPS, "WiGLE", COLOR_MATERIAL_GREEN, attack_tile_event_cb, "WiGLE Upload");
-    create_small_tile(attack_tiles, LV_SYMBOL_EYE_OPEN, "Observer", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "Sniffer");
     // Nmap: connect to the selected network (STA), then scan its LAN
     create_small_tile(attack_tiles, LV_SYMBOL_LIST, "Nmap", COLOR_MATERIAL_INDIGO, attack_tile_event_cb, "Nmap");
+    create_small_tile(attack_tiles, LV_SYMBOL_EYE_OPEN, "Observer", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "Sniffer");
 
     // Horizontal separator line above Selected Networks
     lv_obj_t *separator = lv_obj_create(function_page);
@@ -16215,14 +16211,24 @@ static void show_about_screen(void)
         lv_obj_set_style_text_color(r, ui_text_color(), 0);
     }
 
-    // Runtime memory (free internal heap + free PSRAM)
-    snprintf(line, sizeof(line), "Free heap:  %u KB    Free PSRAM:  %u KB",
-             (unsigned)(esp_get_free_heap_size() / 1024),
-             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
-    lv_obj_t *heap = lv_label_create(panel);
-    lv_label_set_text(heap, line);
-    lv_obj_set_style_text_font(heap, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(heap, lv_color_make(150, 150, 150), 0);
+    // Runtime memory as free/total, one line per pool.
+    //   Internal RAM  — all internal SRAM available to the heap
+    //   DMA RAM       — the DMA-capable subset (scarce; draw buffers, SD, WiFi)
+    //   PSRAM         — external 8 MB pool used for big buffers
+    struct { const char *k; uint32_t caps; } mem[] = {
+        { "Internal RAM", MALLOC_CAP_INTERNAL },
+        { "DMA RAM",      MALLOC_CAP_DMA },
+        { "PSRAM",        MALLOC_CAP_SPIRAM },
+    };
+    for (unsigned i = 0; i < sizeof(mem) / sizeof(mem[0]); i++) {
+        snprintf(line, sizeof(line), "%s:  %u / %u KB free", mem[i].k,
+                 (unsigned)(heap_caps_get_free_size(mem[i].caps) / 1024),
+                 (unsigned)(heap_caps_get_total_size(mem[i].caps) / 1024));
+        lv_obj_t *m = lv_label_create(panel);
+        lv_label_set_text(m, line);
+        lv_obj_set_style_text_font(m, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(m, lv_color_make(150, 150, 150), 0);
+    }
 }
 
 // WiFi Monitor screen
@@ -16724,7 +16730,8 @@ void attack_event_cb(lv_event_t *e)
         wifi_scanner_clear_selections();
         wifi_scanner_clear_targets();
 
-        // Start scan
+        // Start scan — this flow wants the network-selection results screen.
+        scan_results_wanted = true;
         wifi_scanner_start_scan();
         return;
     }
@@ -17653,15 +17660,29 @@ static esp_err_t init_max17048(void)
 // Returns battery percentage 0-100, or 255 if unavailable
 static uint8_t read_max17048_percent(void)
 {
-    // Always attempt the read (self-healing): a successful read means the gauge
-    // is present even if the initial boot-time probe was disturbed.
-    uint16_t raw = 0;
-    if (max17048_read_reg(MAX17048_REG_SOC, &raw) != ESP_OK) return 255;
+    // Take the median of several quick reads to reject single-read glitches that
+    // would otherwise make the displayed percentage jump around. Always attempt
+    // the read (self-healing): a good read means the gauge is present even if the
+    // initial boot-time probe was disturbed.
+    uint8_t samples[5];
+    int n = 0;
+    for (int i = 0; i < 5 && n < 3; i++) {
+        uint16_t raw = 0;
+        if (max17048_read_reg(MAX17048_REG_SOC, &raw) != ESP_OK) continue;
+        uint8_t pct = raw >> 8;             // upper byte = integer %
+        if (pct > 100) pct = 100;
+        samples[n++] = pct;
+    }
+    if (n == 0) return 255;
     max17048_found = true;
-    // Upper byte = integer %, lower byte = 1/256 fractional
-    uint8_t percent = raw >> 8;
-    if (percent > 100) percent = 100;
-    return percent;
+    // Insertion sort the (<=3) samples and return the middle one.
+    for (int i = 1; i < n; i++) {
+        uint8_t v = samples[i];
+        int j = i - 1;
+        while (j >= 0 && samples[j] > v) { samples[j + 1] = samples[j]; j--; }
+        samples[j + 1] = v;
+    }
+    return samples[n / 2];
 }
 
 // Returns cell voltage in volts, or 0.0 if unavailable
@@ -17671,6 +17692,7 @@ static void battery_monitor_task(void *arg)
     (void)arg;
     char voltage_str[32];
     uint8_t last_good_pct = 255;   // remembered across transient I2C read failures
+    int32_t batt_smooth = -1;      // EMA of the SOC (fixed-point x16); -1 = unseeded
 
     // Initial delay to let UI stabilize
     vTaskDelay(pdMS_TO_TICKS(2000));
@@ -17683,7 +17705,13 @@ static void battery_monitor_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(20));
             pct = read_max17048_percent();
         }
-        if (pct != 255) last_good_pct = pct;
+        if (pct != 255) {
+            // Low-pass the reading so the display doesn't flicker between menus.
+            // Battery % changes slowly, so a slow EMA is exactly right.
+            if (batt_smooth < 0) batt_smooth = (int32_t)pct * 16;   // seed on first reading
+            else batt_smooth += ((int32_t)pct * 16 - batt_smooth) / 4;
+            last_good_pct = (uint8_t)((batt_smooth + 8) / 16);
+        }
         // Show the last known percentage rather than "--" once we have one.
         pct = last_good_pct;
 
