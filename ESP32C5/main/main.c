@@ -1253,7 +1253,8 @@ static volatile bool admin_screen_active = false;
 // (File Manager removed — file management is handled by the web Admin Portal.)
 
 // Battery voltage monitor state (DISABLED - using regular C5 chip)
-static lv_obj_t *battery_label = NULL;  // Keep for UI layout
+static lv_obj_t *battery_label = NULL;  // Currently-visible battery label (bound per screen)
+static lv_obj_t *main_battery_label = NULL;  // Persistent label in the main-menu title bar
 static char last_voltage_str[32] = "-.--V";  // Persisted across screen changes
 static bool max17048_found = false;
 static StaticTask_t battery_task_buffer;
@@ -3552,6 +3553,7 @@ static void create_home_ui(void)
     lv_obj_add_event_cb(title_label, screenshot_btn_event_cb, LV_EVENT_CLICKED, NULL);
 
     battery_label = lv_label_create(title_bar);
+    main_battery_label = battery_label;   // persistent; rebind to it on return to menu
     lv_label_set_text(battery_label, last_voltage_str);
     lv_obj_set_style_text_color(battery_label, ui_muted_color(), 0);
     lv_obj_set_style_text_font(battery_label, &lv_font_montserrat_12, 0);
@@ -11870,8 +11872,14 @@ static void show_main_tiles(void)
     create_tile(tiles_container, LV_SYMBOL_GPS, "Deauth\nMonitor", UI_ACCENT_AMBER, main_tile_event_cb, "Deauth Monitor");
     create_tile(tiles_container, LV_SYMBOL_BLUETOOTH, "Bluetooth", UI_ACCENT_CYAN, main_tile_event_cb, "Bluetooth");
     
-    // Show title bar
+    // Show title bar. Rebind the battery label to the persistent main-menu one
+    // (the global pointer was pointing at the now-deleted function-page label)
+    // and refresh it so the menu shows the current reading, not a stale value.
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
+    if (main_battery_label && lv_obj_is_valid(main_battery_label)) {
+        battery_label = main_battery_label;
+        lv_label_set_text(battery_label, last_voltage_str);
+    }
 }
 
 // WiFi Scan Next button callback - shows attack tiles
