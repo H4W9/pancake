@@ -57,6 +57,7 @@ jobs:
       # The build system can't read git reliably inside the container, so we
       # sed the header before building — same approach as ESP32_Scrabble.
       - name: Stamp commit SHA
+        shell: bash
         env:
           GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
