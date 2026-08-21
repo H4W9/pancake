@@ -14,6 +14,10 @@ extern "C" {
 // Version
 #define JANOS_VERSION "0.5.3"
 
+// Git short commit SHA. The CI "Stamp commit SHA" step sed-replaces this value
+// with the real short SHA before building; stays "dev" for local builds.
+#define JANOS_COMMIT "dev"
+
 // Maximum limits
 #define MAX_AP_CNT 64
 #define MAX_SCAN_RESULTS 64

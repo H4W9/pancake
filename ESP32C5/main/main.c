@@ -232,6 +232,7 @@ static bool     wd_require_gps       = true;  // wait for a GPS fix before loggi
 static uint8_t  wd_mem_cap_mb        = 4;     // max PSRAM (MB) the wardrive buffer may grow to
 static uint16_t antisurv_sens_m      = 100;   // anti-surv "following" alert distance (m)
 static bool     wd_home_upload       = false; // auto-upload on home network (default OFF)
+static bool     g_sound_enabled       = true;  // buzzer UI sounds (boot/clicks/menus)
 static lv_obj_t *wd_rssi_val_label   = NULL;  // Wardrive Settings slider value label
 
 static inline lv_color_t ui_bg_color(void) {
@@ -323,6 +324,7 @@ static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel 
 #define NVS_KEY_WD_MEMCAP   "wd_memcap"
 #define NVS_KEY_ANTISURV_M  "antisurv_m"
 #define NVS_KEY_WD_HOMEUP   "wd_homeup"
+#define NVS_KEY_SOUND       "sound_en"
 
 // ============================================================================
 // Theme-aware style helpers
@@ -868,6 +870,7 @@ static int8_t     *spec_col_persist   = NULL;    // smoothed columns for the wat
 static lv_obj_t   *spec_info_label    = NULL;
 static lv_timer_t *spec_timer         = NULL;
 static bool        spec_active        = false;
+static bool        spec_scan_guard    = false;   // suppress the scan-result nav for one scan after exit
 static uint32_t    spec_last_scan     = 0;
 static uint16_t    spec_noise         = 0xACE1;
 
@@ -1425,6 +1428,12 @@ static void reset_function_page_children(void) {
     antisurv_status_label = NULL;
     antisurv_exit_btn = NULL;
     // Spectrum Analyzer: stop the render timer and free its PSRAM buffers.
+    // If a rescan is still in flight, guard the one scan-done that will land
+    // after we leave so it doesn't pop the (empty) Scan Results screen.
+    if (spec_active) {
+        spec_scan_guard = !wifi_scanner_is_done();
+        scan_done_ui_flag = false;
+    }
     spec_active = false;
     if (spec_timer) { lv_timer_del(spec_timer); spec_timer = NULL; }
     if (spec_buf) { heap_caps_free(spec_buf); spec_buf = NULL; }
@@ -2300,6 +2309,7 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_WD_MEMCAP, &u8v) == ESP_OK && u8v > 0) wd_mem_cap_mb = u8v;
         if (nvs_get_u16(h, NVS_KEY_ANTISURV_M, &u16v) == ESP_OK && u16v > 0) antisurv_sens_m = u16v;
         if (nvs_get_u8(h, NVS_KEY_WD_HOMEUP, &u8v) == ESP_OK)  wd_home_upload = (u8v != 0);
+        if (nvs_get_u8(h, NVS_KEY_SOUND, &u8v) == ESP_OK)      g_sound_enabled = (u8v != 0);
         nvs_close(h);
         ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d",
                  (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms,
@@ -2354,6 +2364,7 @@ static void nvs_writer_task(void *arg)
             case 9: nvs_set_u8(h, NVS_KEY_WD_MEMCAP, (uint8_t)req.a); break;
             case 10: nvs_set_u16(h, NVS_KEY_ANTISURV_M, (uint16_t)req.a); break;
             case 11: nvs_set_u8(h, NVS_KEY_WD_HOMEUP, req.a ? 1 : 0); break;
+            case 12: nvs_set_u8(h, NVS_KEY_SOUND, req.a ? 1 : 0); break;
             default: nvs_close(h); continue;
         }
         nvs_commit(h);
@@ -2382,6 +2393,148 @@ static void nvs_settings_save_wd_reqgps(bool enabled)               { nvs_save_e
 static void nvs_settings_save_wd_memcap(uint8_t mb)                  { nvs_save_enqueue(9, mb, 0); }
 static void nvs_settings_save_antisurv_m(uint16_t m)                { nvs_save_enqueue(10, m, 0); }
 static void nvs_settings_save_home_upload(bool enabled)             { nvs_save_enqueue(11, enabled ? 1 : 0, 0); }
+static void nvs_settings_save_sound(bool enabled)                   { nvs_save_enqueue(12, enabled ? 1 : 0, 0); }
+
+// ============================================================================
+// UI Sound Effects — passive buzzer on GPIO6 driven by LEDC square-wave tones.
+// Non-blocking note-sequence player (Porkchop-style), pumped by an LVGL timer.
+// ============================================================================
+#define BUZZER_GPIO        6
+#define BUZZ_LEDC_MODE     LEDC_LOW_SPEED_MODE
+#define BUZZ_LEDC_TIMER    LEDC_TIMER_1        // backlight uses TIMER_0/CHANNEL_0
+#define BUZZ_LEDC_CHANNEL  LEDC_CHANNEL_1
+#define BUZZ_LEDC_RES      LEDC_TIMER_10_BIT
+#define BUZZ_DUTY_ON       512                 // ~50% of 1024 (square wave)
+
+typedef struct { uint16_t freq, dur, pause; } sfx_note_t;   // {0,0,0} = end
+
+// Note tables (freq Hz, duration ms, pause ms) — ported from Porkchop SFX.
+static const sfx_note_t SND_CLICK[]      = { {1050, 6, 0}, {0, 0, 0} };
+static const sfx_note_t SND_MENU[]       = { {900, 7, 0}, {0, 0, 0} };
+static const sfx_note_t SND_TYPING[]     = { {1200, 4, 0}, {0, 0, 0} };
+static const sfx_note_t SND_MODE_ENTER[] = { {700, 30, 10}, {1000, 40, 0}, {0, 0, 0} };
+static const sfx_note_t SND_MODE_EXIT[]  = { {900, 30, 10}, {600, 40, 0}, {0, 0, 0} };
+static const sfx_note_t SND_BACK[]       = { {800, 25, 0}, {0, 0, 0} };
+static const sfx_note_t SND_CONFIRM[]    = { {800, 40, 15}, {1100, 50, 0}, {0, 0, 0} };
+static const sfx_note_t SND_BOOT[]       = {
+    {140, 650, 140}, {600, 12, 30}, {700, 12, 30}, {520, 12, 60},
+    {120, 180, 80},  {800, 12, 30}, {640, 12, 30}, {500, 12, 60},
+    {900, 10, 30},   {700, 10, 30}, {850, 10, 60}, {170, 230, 70},
+    {210, 320, 90},  {240, 360, 0}, {0, 0, 0}
+};
+
+static const sfx_note_t *sfx_seq       = NULL;
+static uint8_t           sfx_step      = 0;
+static uint32_t          sfx_step_start = 0;
+static bool              sfx_in_note   = false;
+static lv_timer_t       *sfx_timer     = NULL;
+static bool              sfx_buzz_ready = false;
+#define SFX_Q 6
+static const sfx_note_t *sfx_queue[SFX_Q];
+static volatile uint8_t  sfx_qhead = 0, sfx_qtail = 0;
+
+static void buzz_tone(uint16_t freq) {
+    if (!sfx_buzz_ready) return;
+    if (freq == 0) {
+        ledc_set_duty(BUZZ_LEDC_MODE, BUZZ_LEDC_CHANNEL, 0);
+        ledc_update_duty(BUZZ_LEDC_MODE, BUZZ_LEDC_CHANNEL);
+        return;
+    }
+    ledc_set_freq(BUZZ_LEDC_MODE, BUZZ_LEDC_TIMER, freq);
+    ledc_set_duty(BUZZ_LEDC_MODE, BUZZ_LEDC_CHANNEL, BUZZ_DUTY_ON);
+    ledc_update_duty(BUZZ_LEDC_MODE, BUZZ_LEDC_CHANNEL);
+}
+static inline void buzz_off(void) { buzz_tone(0); }
+
+// Queue a sound (safe to call from anywhere; drops oldest if the ring is full).
+static void sfx_play(const sfx_note_t *seq) {
+    if (!g_sound_enabled || !seq || !sfx_buzz_ready) return;
+    uint8_t next = (sfx_qhead + 1) % SFX_Q;
+    if (next == sfx_qtail) sfx_qtail = (sfx_qtail + 1) % SFX_Q;   // drop oldest
+    sfx_queue[sfx_qhead] = seq;
+    sfx_qhead = next;
+}
+
+static void sfx_start(const sfx_note_t *seq) {
+    sfx_seq = seq;
+    sfx_step = 0;
+    sfx_step_start = lv_tick_get();
+    sfx_in_note = true;
+    buzz_tone(seq[0].freq);
+}
+
+// Non-blocking state machine, pumped every few ms by an LVGL timer.
+static void sfx_pump(lv_timer_t *t) {
+    (void)t;
+    if (!g_sound_enabled) {
+        if (sfx_seq) { buzz_off(); sfx_seq = NULL; }
+        sfx_qtail = sfx_qhead;
+        return;
+    }
+    if (sfx_seq == NULL) {
+        if (sfx_qtail != sfx_qhead) {
+            const sfx_note_t *s = sfx_queue[sfx_qtail];
+            sfx_qtail = (sfx_qtail + 1) % SFX_Q;
+            sfx_start(s);
+        } else {
+            return;
+        }
+    }
+    uint32_t now = lv_tick_get();
+    const sfx_note_t *n = &sfx_seq[sfx_step];
+    uint32_t elapsed = now - sfx_step_start;
+    if (sfx_in_note) {
+        if (elapsed >= n->dur) {
+            if (n->pause > 0) {
+                buzz_off();
+                sfx_in_note = false;
+                sfx_step_start = now;
+            } else {
+                sfx_step++;
+                const sfx_note_t *nx = &sfx_seq[sfx_step];
+                if (nx->freq == 0 && nx->dur == 0) { buzz_off(); sfx_seq = NULL; return; }
+                sfx_step_start = now;
+                sfx_in_note = true;
+                buzz_tone(nx->freq);
+            }
+        }
+    } else if (elapsed >= n->pause) {
+        sfx_step++;
+        const sfx_note_t *nx = &sfx_seq[sfx_step];
+        if (nx->freq == 0 && nx->dur == 0) { buzz_off(); sfx_seq = NULL; return; }
+        sfx_step_start = now;
+        sfx_in_note = true;
+        buzz_tone(nx->freq);
+    }
+}
+
+// Global touch feedback: soft click on every press (typing keys, buttons, tiles).
+static void sfx_indev_feedback(lv_indev_drv_t *drv, uint8_t code) {
+    (void)drv;
+    if (code == LV_EVENT_PRESSED) sfx_play(SND_CLICK);
+}
+
+static void sfx_init(void) {
+    ledc_timer_config_t tc = {
+        .speed_mode      = BUZZ_LEDC_MODE,
+        .duty_resolution = BUZZ_LEDC_RES,
+        .timer_num       = BUZZ_LEDC_TIMER,
+        .freq_hz         = 1000,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    if (ledc_timer_config(&tc) != ESP_OK) return;
+    ledc_channel_config_t cc = {
+        .gpio_num   = BUZZER_GPIO,
+        .speed_mode = BUZZ_LEDC_MODE,
+        .channel    = BUZZ_LEDC_CHANNEL,
+        .timer_sel  = BUZZ_LEDC_TIMER,
+        .duty       = 0,
+        .hpoint     = 0,
+    };
+    if (ledc_channel_config(&cc) != ESP_OK) return;
+    sfx_buzz_ready = true;
+    sfx_timer = lv_timer_create(sfx_pump, 5, NULL);
+}
 
 // ============================================================================
 // Backlight / Brightness / Screen Dimming
@@ -3659,7 +3812,13 @@ void app_main(void)
     indev_drv.type = LV_INDEV_TYPE_POINTER;
     indev_drv.read_cb = lvgl_touch_read_cb;
     indev_drv.user_data = &touch_handle;
+    indev_drv.feedback_cb = sfx_indev_feedback;   // click on every touch press
     lv_indev_drv_register(&indev_drv);
+
+    // Buzzer UI sounds (GPIO6). Init after settings load so g_sound_enabled is
+    // correct, then play the boot chime.
+    sfx_init();
+    sfx_play(SND_BOOT);
 
     if (screen_idle_timer == NULL) {
         screen_idle_timer = lv_timer_create(screen_idle_timer_cb, SCREEN_INACTIVITY_CHECK_MS, NULL);
@@ -4377,11 +4536,13 @@ static void display_refresh_task(void *pvParameters)
             }
             // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack/deauth_monitor/portal or when handshaker is waiting for scan)
             else if (scan_done_ui_flag) {
-                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active || handshake_waiting_for_scan || g_handshaker_global_mode || home_add_overlay || spec_active) {
+                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active || handshake_waiting_for_scan || g_handshaker_global_mode || home_add_overlay || spec_active || spec_scan_guard) {
                     // During attacks, the add-home dialog's SSID scan, the spectrum
                     // analyzer's rescans, or while waiting for a scan, just clear the
-                    // flag without showing results
+                    // flag without showing results. spec_scan_guard also swallows the
+                    // one scan that may still finish just after leaving the analyzer.
                     scan_done_ui_flag = false;
+                    spec_scan_guard = false;   // one-shot
                 } else {
                 scan_done_ui_flag = false;
 
@@ -9587,8 +9748,11 @@ static void home_mgmt_open_editor(int edit_idx)
 
     // Invisible dropdown that backs the SSID combobox. It is never tapped
     // directly; the arrow button opens its list, which anchors to this rect.
+    // Match the field row's rect (y=82, height 44) so the opened list drops
+    // BELOW the whole field instead of overlaying the arrow button.
     home_add_dd = lv_dropdown_create(home_add_overlay);
     lv_obj_set_width(home_add_dd, lv_pct(92));
+    lv_obj_set_height(home_add_dd, 44);
     lv_obj_align(home_add_dd, LV_ALIGN_TOP_MID, 0, 82);
     lv_obj_set_style_bg_opa(home_add_dd, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(home_add_dd, 0, 0);
@@ -10609,7 +10773,10 @@ static void create_function_page_base(const char *name)
 {
     // Print memory stats when opening new page
     print_memory_stats();
-    
+
+    // Menu-open chime (any screen transition).
+    sfx_play(SND_MODE_ENTER);
+
     evil_twin_disable_log_capture();
     evil_twin_log_ta = NULL;
     evil_twin_content = NULL;
@@ -11074,11 +11241,13 @@ static inline lv_color_t spec_c(uint16_t rgb565) {
     return lv_color_make(r, g, b);
 }
 
-// Channels the view can tune to, in order (2.4 GHz then common 5 GHz). The
+// Channels the view can tune to, in order (all 2.4 GHz then all 5 GHz). The
 // Chan buttons step through this list; the same list draws the axis markers.
-static const uint8_t SPEC_CHANS[] = {
-    1,2,3,4,5,6,7,8,9,10,11,12,13,
-    36,40,44,48,149,153,157,161,165
+static const uint16_t SPEC_CHANS[] = {
+    1,2,3,4,5,6,7,8,9,10,11,12,13,14,
+    36,40,44,48,52,56,60,64,
+    100,104,108,112,116,120,124,128,132,136,140,144,
+    149,153,157,161,165,169,173,177
 };
 #define SPEC_CHAN_COUNT ((int)(sizeof(SPEC_CHANS) / sizeof(SPEC_CHANS[0])))
 static int spec_chan_idx = 5;   // index into SPEC_CHANS (default channel 6)
@@ -11255,10 +11424,13 @@ static void spec_render(void) {
         int x = spec_fx(spec_cf(SPEC_CHANS[i]));
         if (x < SPEC_SLEFT || x > SPEC_SRIGHT) continue;
         spec_vline(x, SPEC_SBOTTOM, 3, fg);
-        char n[4];
-        snprintf(n, sizeof(n), "%u", SPEC_CHANS[i]);
+        char n[6];
+        snprintf(n, sizeof(n), "%u", (unsigned)SPEC_CHANS[i]);
+        // Center the number under the tick; max_w must fit 3 digits (~24px) so
+        // "149" doesn't get clipped to "14".
+        int digits = (int)strlen(n);
         td.color = (i == spec_chan_idx) ? spec_c(0x07E0) : fg;
-        lv_canvas_draw_text(spec_canvas, x - 8, SPEC_CHLBL_Y, 18, &td, n);
+        lv_canvas_draw_text(spec_canvas, x - digits * 3, SPEC_CHLBL_Y, 28, &td, n);
     }
     td.color = fg;
 
@@ -15681,6 +15853,12 @@ static void settings_tile_event_cb(lv_event_t *e)
         nvs_settings_save_dark_mode(dark_mode_enabled);
         if (settings_tiles) settings_pending_scroll_y = lv_obj_get_scroll_y(settings_tiles);
         show_settings_screen();   // re-render with the new theme applied
+    } else if (strcmp(tile_name, "Sound") == 0) {
+        g_sound_enabled = !g_sound_enabled;
+        nvs_settings_save_sound(g_sound_enabled);
+        if (g_sound_enabled) sfx_play(SND_CONFIRM);   // confirm only when turning on
+        if (settings_tiles) settings_pending_scroll_y = lv_obj_get_scroll_y(settings_tiles);
+        show_settings_screen();   // re-render so the tile reflects the new state
     } else if (strcmp(tile_name, "About") == 0) {
         show_about_screen();
     }
@@ -15924,6 +16102,12 @@ static void show_settings_screen(void)
     // Download Mode - Red
     create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Download\nMode", COLOR_MATERIAL_RED, settings_tile_event_cb, "Download Mode");
 
+    // Sound ON/OFF - buzzer UI sounds (label reflects state), kept before About
+    create_tile(tiles, g_sound_enabled ? LV_SYMBOL_VOLUME_MAX : LV_SYMBOL_MUTE,
+                g_sound_enabled ? "Sound\nON" : "Sound\nOFF",
+                g_sound_enabled ? COLOR_MATERIAL_GREEN : lv_color_make(120, 120, 120),
+                settings_tile_event_cb, "Sound");
+
     // About - Blue Grey: firmware info (kept last)
     create_tile(tiles, LV_SYMBOL_LIST, "About", COLOR_MATERIAL_INDIGO, settings_tile_event_cb, "About");
 
@@ -15955,9 +16139,9 @@ static void show_about_screen(void)
     lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_AUTO);
 
-    // Title
+    // Title (montserrat_20 is ASCII-only, so use a plain "/" separator)
     lv_obj_t *name = lv_label_create(panel);
-    lv_label_set_text(name, "JanOS \xC2\xB7 projectZero");
+    lv_label_set_text(name, "JanOS / projectZero");
     lv_obj_set_style_text_font(name, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(name, ui_accent_color(), 0);
 
@@ -15969,10 +16153,12 @@ static void show_about_screen(void)
     lv_obj_set_style_text_font(desc, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(desc, ui_text_color(), 0);
 
-    // Info rows: label + value, one per line.
+    // Info rows: label + value, one per line. JANOS_COMMIT is injected by the
+    // build (git short SHA); falls back to "dev" for local builds.
     char line[96];
     struct { const char *k; const char *v; } rows[] = {
         { "Version",   JANOS_VERSION },
+        { "Commit",    JANOS_COMMIT },
         { "Board",     "Pancake ESP32-C5" },
         { "Built",     __DATE__ " " __TIME__ },
         { "IDF",       esp_get_idf_version() },
@@ -15985,9 +16171,10 @@ static void show_about_screen(void)
         lv_obj_set_style_text_color(r, ui_text_color(), 0);
     }
 
-    // Free heap (a little runtime "such")
-    snprintf(line, sizeof(line), "Free heap:  %u KB",
-             (unsigned)(esp_get_free_heap_size() / 1024));
+    // Runtime memory (free internal heap + free PSRAM)
+    snprintf(line, sizeof(line), "Free heap:  %u KB    Free PSRAM:  %u KB",
+             (unsigned)(esp_get_free_heap_size() / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
     lv_obj_t *heap = lv_label_create(panel);
     lv_label_set_text(heap, line);
     lv_obj_set_style_text_font(heap, &lv_font_montserrat_14, 0);

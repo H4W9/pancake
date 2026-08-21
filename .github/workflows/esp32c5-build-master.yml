@@ -30,7 +30,7 @@ on:
     types: [published, edited]
 
 env:
-  FW_BASENAME: pancake-esp32c5
+  FW_BASENAME: JanOS_pancake
 
 jobs:
   build:
@@ -52,6 +52,19 @@ jobs:
           restore-keys: |
             espidf-release-v6.0-${{ runner.os }}-
             espidf-release-v6.0-
+
+      # Stamp the git short SHA into JANOS_COMMIT (shown on the About screen).
+      # The build system can't read git reliably inside the container, so we
+      # sed the header before building — same approach as ESP32_Scrabble.
+      - name: Stamp commit SHA
+        env:
+          GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          SHORT=${GIT_SHA:0:7}
+          HDR=ESP32C5/components/wifi_cli/include/wifi_common.h
+          sed -i -E "s/#define JANOS_COMMIT[[:space:]]+\"[^\"]*\"/#define JANOS_COMMIT \"$SHORT\"/" "$HDR"
+          grep JANOS_COMMIT "$HDR"
 
       - name: Build firmware
         run: bash ESP32C5/.github/scripts/container_build.sh --no-docker
@@ -123,7 +136,7 @@ jobs:
           cp "${out_dir}/bootloader.bin" "${out_dir}/bootloader-esp32c5.bin"
           cp "${out_dir}/partition-table.bin" "${out_dir}/partition-table-esp32c5.bin"
           cp "$app_src" "${out_dir}/${FW_BASENAME}.bin"
-          cp "$app_src" "${out_dir}/${FW_BASENAME}-${version}.bin"
+          cp "$app_src" "${out_dir}/${FW_BASENAME}_v${version}.bin"
 
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
@@ -134,20 +147,20 @@ jobs:
           python -m pip install --disable-pip-version-check --no-cache-dir esptool
           out_dir="release_artifacts/firmware"
           python -m esptool --chip esp32c5 merge_bin \
-            -o "${out_dir}/${FW_BASENAME}-full-${{ steps.prepare.outputs.version }}.bin" \
+            -o "${out_dir}/${FW_BASENAME}_full_v${{ steps.prepare.outputs.version }}.bin" \
             --flash_mode dio --flash_freq 80m --flash_size 8MB \
             0x2000 "${out_dir}/bootloader.bin" \
             0x8000 "${out_dir}/partition-table.bin" \
             0x10000 "${out_dir}/projectZero.bin"
-          cp "${out_dir}/${FW_BASENAME}-full-${{ steps.prepare.outputs.version }}.bin" \
-            "${out_dir}/${FW_BASENAME}-full.bin"
+          cp "${out_dir}/${FW_BASENAME}_full_v${{ steps.prepare.outputs.version }}.bin" \
+            "${out_dir}/${FW_BASENAME}_full.bin"
 
       - name: Package firmware bundle
         shell: bash
         run: |
           set -euo pipefail
           cd release_artifacts/firmware
-          out="${FW_BASENAME}-${{ steps.prepare.outputs.version }}.zip"
+          out="${FW_BASENAME}_v${{ steps.prepare.outputs.version }}.zip"
           rm -f "$out"
           zip -9 "$out" \
             flash_board.py \
@@ -157,9 +170,9 @@ jobs:
             partition-table-esp32c5.bin \
             projectZero.bin \
             "${FW_BASENAME}.bin" \
-            "${FW_BASENAME}-${{ steps.prepare.outputs.version }}.bin" \
-            "${FW_BASENAME}-full.bin" \
-            "${FW_BASENAME}-full-${{ steps.prepare.outputs.version }}.bin"
+            "${FW_BASENAME}_v${{ steps.prepare.outputs.version }}.bin" \
+            "${FW_BASENAME}_full.bin" \
+            "${FW_BASENAME}_full_v${{ steps.prepare.outputs.version }}.bin"
 
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@v4
@@ -210,10 +223,10 @@ jobs:
             release_artifacts/firmware/partition-table-esp32c5.bin
             release_artifacts/firmware/projectZero.bin
             release_artifacts/firmware/${{ env.FW_BASENAME }}.bin
-            release_artifacts/firmware/${{ env.FW_BASENAME }}-${{ needs.package.outputs.fw_version }}.bin
-            release_artifacts/firmware/${{ env.FW_BASENAME }}-full.bin
-            release_artifacts/firmware/${{ env.FW_BASENAME }}-full-${{ needs.package.outputs.fw_version }}.bin
-            release_artifacts/firmware/${{ env.FW_BASENAME }}-${{ needs.package.outputs.fw_version }}.zip
+            release_artifacts/firmware/${{ env.FW_BASENAME }}_v${{ needs.package.outputs.fw_version }}.bin
+            release_artifacts/firmware/${{ env.FW_BASENAME }}_full.bin
+            release_artifacts/firmware/${{ env.FW_BASENAME }}_full_v${{ needs.package.outputs.fw_version }}.bin
+            release_artifacts/firmware/${{ env.FW_BASENAME }}_v${{ needs.package.outputs.fw_version }}.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -267,9 +280,9 @@ jobs:
             --pattern "bootloader.bin" \
             --pattern "partition-table.bin" \
             --pattern "${FW_BASENAME}.bin" \
-            --pattern "${FW_BASENAME}-full.bin"
+            --pattern "${FW_BASENAME}_full.bin"
 
-          for f in flash_board.py bootloader.bin partition-table.bin "${FW_BASENAME}.bin" "${FW_BASENAME}-full.bin"; do
+          for f in flash_board.py bootloader.bin partition-table.bin "${FW_BASENAME}.bin" "${FW_BASENAME}_full.bin"; do
             if [ ! -f "ESP32C5/docs/firmware/$f" ]; then
               echo "Missing release asset: $f" >&2
               exit 1
@@ -303,7 +316,7 @@ jobs:
                       "offset": 0x8000,
                   },
                   {
-                      "path": "firmware/pancake-esp32c5.bin",
+                      "path": "firmware/JanOS_pancake.bin",
                       "offset": 0x10000,
                   },
               ],
@@ -320,7 +333,7 @@ jobs:
                               "offset": 0x8000,
                           },
                           {
-                              "path": "firmware/pancake-esp32c5.bin",
+                              "path": "firmware/JanOS_pancake.bin",
                               "offset": 0x10000,
                           }
                       ],
@@ -339,49 +352,3 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-
-  discord:
-    name: Discord
-    needs: [release, package, pages]
-    # Temporary hard-disable. Re-enable by restoring the previous condition.
-    if: ${{ false }}
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Notify Discord
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.GIT_BUILD }}
-          FW_VERSION: ${{ needs.package.outputs.fw_version }}
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.package.outputs.fw_version) }}
-          REPO: ${{ github.repository }}
-          PAGES_URL: ${{ needs.pages.outputs.page_url }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -z "${DISCORD_WEBHOOK:-}" ]; then
-            echo "DISCORD_WEBHOOK not configured, skipping notification"
-            exit 0
-          fi
-
-          TAG="${RELEASE_TAG:-v${FW_VERSION}}"
-          BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
-          RELEASE_PAGE="https://github.com/${REPO}/releases/tag/${TAG}"
-          PAGE_LINK="${PAGES_URL:-https://${GITHUB_REPOSITORY%/*}.github.io/${GITHUB_REPOSITORY#*/}/}"
-
-          content=$(
-            printf '%s\n' \
-              "pancake ESP32-C5" \
-              "Release ${TAG} published." \
-              "Release page:" \
-              "${RELEASE_PAGE}" \
-              "Pages:" \
-              "${PAGE_LINK}" \
-              "Firmware (${FW_VERSION}):" \
-              "${BASE_URL}/${FW_BASENAME}-${FW_VERSION}.bin" \
-              "Full image:" \
-              "${BASE_URL}/${FW_BASENAME}-full-${FW_VERSION}.bin" \
-              "ZIP bundle:" \
-              "${BASE_URL}/${FW_BASENAME}-${FW_VERSION}.zip"
-          )
-
-          payload=$(jq -n --arg content "$content" '{content:$content}')
-          curl -X POST -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK"
