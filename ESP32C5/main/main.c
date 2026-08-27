@@ -13912,6 +13912,21 @@ static void show_rogue_ap_page(void)
  * Trims whitespace/newline. Requires sd_spi_mutex to be available.
  * @return true on success, false if file missing or empty
  */
+// Uploads need a real DHCP-assigned IP. Association (WIFI_EVENT_STA_CONNECTED)
+// is signalled before DHCP completes, so DNS + TLS would fail without this wait.
+// Returns true once the STA interface has a non-zero IP, false on timeout.
+static bool upload_wait_for_sta_ip(int timeout_ms)
+{
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta) return false;
+    esp_netif_ip_info_t ip;
+    for (int waited = 0; waited <= timeout_ms; waited += 100) {
+        if (esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr != 0) return true;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return false;
+}
+
 static bool wpasec_read_key_from_sd(void)
 {
     wpasec_api_key[0] = '\0';
@@ -14114,6 +14129,18 @@ static void wpasec_upload_task(void *pvParameters)
     (void)pvParameters;
 
     wpasec_ui_msg_t ui_msg;
+
+    // Wait for a real IP before any network I/O (association != has IP).
+    if (!upload_wait_for_sta_ip(12000)) {
+        snprintf(ui_msg.text, sizeof(ui_msg.text), "No network (no IP yet) - connect to WiFi first");
+        ui_msg.color = lv_color_make(244, 67, 54); // red
+        if (wpasec_ui_queue) xQueueSend(wpasec_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+        wpasec_upload_done = true;
+        wpasec_upload_active = false;
+        wpasec_upload_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
 
     // Open handshakes directory (need SD mutex)
     DIR *dir = NULL;
@@ -14641,6 +14668,18 @@ static void wigle_upload_task(void *pvParameters)
 {
     (void)pvParameters;
     wpasec_ui_msg_t ui_msg;
+
+    // Wait for a real IP before any network I/O (association != has IP).
+    if (!upload_wait_for_sta_ip(12000)) {
+        snprintf(ui_msg.text, sizeof(ui_msg.text), "No network (no IP yet) - connect to WiFi first");
+        ui_msg.color = lv_color_make(244, 67, 54);
+        if (wigle_ui_queue) xQueueSend(wigle_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+        wigle_upload_done = true;
+        wigle_upload_active = false;
+        wigle_upload_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
 
     DIR *dir = NULL;
     if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
