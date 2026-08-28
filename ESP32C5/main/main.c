@@ -16069,10 +16069,14 @@ static void show_wardrive_settings_screen(void)
     // Center the slider in its own row so it sits inset from both the left edge
     // and the scrollbar/right edge (equal margins), same 0-50 value range.
     lv_obj_t *rssi_row = wd_flow_row(form, LV_FLEX_ALIGN_CENTER);
+    // The knob is taller than the track; give the row extra height so the knob
+    // (vertically centered) isn't cut off top and bottom.
+    lv_obj_set_height(rssi_row, 30);
     lv_obj_t *rssi_slider = lv_slider_create(rssi_row);
     lv_slider_set_range(rssi_slider, 0, 50);
     lv_slider_set_value(rssi_slider, wd_rssi_relog_delta, LV_ANIM_OFF);
     lv_obj_set_width(rssi_slider, lv_pct(86));
+    lv_obj_set_height(rssi_slider, 8);   // thin track; knob centered in the taller row
     lv_obj_add_event_cb(rssi_slider, wd_rssi_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     // ---- Memory cap + Anti-surv sensitivity (side by side) ----
