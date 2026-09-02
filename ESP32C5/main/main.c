@@ -434,6 +434,182 @@ static volatile bool scan_done_ui_flag = false;
 static volatile bool scan_results_wanted = false;
 #define SCAN_RESULTS_MAX_DISPLAY 32
 
+// Short security label + recolor-markup color for a scan result's auth mode
+// (used by the two-line results rows, styled after the M5Monster Tab5 UI).
+static const char *wifi_auth_short(wifi_auth_mode_t m)
+{
+    switch (m) {
+        case WIFI_AUTH_OPEN:            return "OPEN";
+        case WIFI_AUTH_WEP:             return "WEP";
+        case WIFI_AUTH_WPA_PSK:         return "WPA";
+        case WIFI_AUTH_WPA2_PSK:        return "WPA2";
+        case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/2";
+        case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-E";
+        case WIFI_AUTH_WPA3_PSK:        return "WPA3";
+        case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/3";
+        case WIFI_AUTH_OWE:             return "OWE";
+        default:                        return "?";
+    }
+}
+static const char *wifi_auth_color(wifi_auth_mode_t m)
+{
+    if (m == WIFI_AUTH_OPEN) return "#FF6666";                                  // open = red (weak)
+    if (m == WIFI_AUTH_WEP || m == WIFI_AUTH_WPA_PSK) return "#FFAA33";         // legacy = orange
+    if (m == WIFI_AUTH_WPA3_PSK || m == WIFI_AUTH_WPA2_WPA3_PSK) return "#55DD55"; // strong = green
+    return "#00CCCC";                                                          // WPA2 = cyan
+}
+
+// ============================================================================
+// Scan-results row decoration: vendor (OUI) + passive beacon inspection for MFP
+// (RSN capabilities) and AP uptime (TSF). Ported from projectZero's
+// inspect_network — pancake is standalone, so it sniffs beacons locally, one AP
+// at a time, on a background task while the results screen is shown. Cancelled
+// on any nav-away via reset_function_page_children (same pattern as the deauth
+// monitor). Radio ownership is handed cleanly to whatever runs next.
+// ============================================================================
+typedef struct {
+    uint8_t  bssid[6];
+    volatile bool active;
+    volatile uint32_t beacons_seen;
+    volatile uint64_t tsf_us;
+    volatile bool mfp_capable;
+    volatile bool mfp_required;
+} inspect_state_t;
+static inspect_state_t g_inspect;
+static lv_obj_t   *inspect_labels[SCAN_RESULTS_MAX_DISPLAY];
+static uint8_t     inspect_bssid[SCAN_RESULTS_MAX_DISPLAY][6];
+static uint8_t     inspect_chan[SCAN_RESULTS_MAX_DISPLAY];
+static int         inspect_count = 0;
+static volatile bool inspect_active = false;
+static TaskHandle_t inspect_task_handle = NULL;
+static StackType_t *inspect_task_stack = NULL;
+static StaticTask_t inspect_task_buf;
+
+// Promiscuous callback: parse the target AP's beacon for TSF (uptime) + RSN MFP.
+static void inspect_beacon_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (!g_inspect.active) return;
+    if (type != WIFI_PKT_MGMT) return;
+    const wifi_promiscuous_pkt_t *f = (const wifi_promiscuous_pkt_t *)buf;
+    int total = (int)f->rx_ctrl.sig_len;
+    if (total < 24 + 12) return;
+    const uint8_t *pl = f->payload;
+    if ((pl[0] & 0xFC) != 0x80) return;                     // beacon (type 0 / subtype 8)
+    if (memcmp(pl + 16, g_inspect.bssid, 6) != 0) return;   // Addr3 = BSSID
+    const uint8_t *body = pl + 24;
+    int body_len = total - 24;
+    if (body_len < 12) return;
+
+    uint64_t tsf = 0;
+    for (int i = 0; i < 8; i++) tsf |= ((uint64_t)body[i]) << (i * 8);
+
+    int p = 12;
+    bool mfpc = false, mfpr = false;
+    while (p + 2 <= body_len) {
+        uint8_t id = body[p], len = body[p + 1];
+        if (p + 2 + (int)len > body_len) break;
+        const uint8_t *d = body + p + 2;
+        if (id == 48 && len >= 2) {                         // RSN IE
+            int q = 0;
+            do {
+                if ((int)len < q + 2) break; q += 2;        // version
+                if ((int)len < q + 4) break; q += 4;        // group cipher
+                if ((int)len < q + 2) break;
+                uint16_t pw = (uint16_t)d[q] | ((uint16_t)d[q + 1] << 8); q += 2;
+                if ((int)len < q + pw * 4) break; q += pw * 4;
+                if ((int)len < q + 2) break;
+                uint16_t akm = (uint16_t)d[q] | ((uint16_t)d[q + 1] << 8); q += 2;
+                if ((int)len < q + akm * 4) break; q += akm * 4;
+                if ((int)len < q + 2) break;
+                uint16_t cap = (uint16_t)d[q] | ((uint16_t)d[q + 1] << 8);
+                mfpr = (cap & (1u << 6)) != 0;
+                mfpc = (cap & (1u << 7)) != 0;
+            } while (0);
+        }
+        p += 2 + (int)len;
+    }
+    g_inspect.tsf_us = tsf;
+    g_inspect.mfp_capable = mfpc;
+    g_inspect.mfp_required = mfpr;
+    g_inspect.beacons_seen++;
+}
+
+static void inspect_task(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < inspect_count && inspect_active; i++) {
+        memset((void *)&g_inspect, 0, sizeof(g_inspect));
+        memcpy((void *)g_inspect.bssid, inspect_bssid[i], 6);
+        esp_wifi_set_channel(inspect_chan[i], WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_promiscuous_rx_cb(inspect_beacon_cb);
+        esp_wifi_set_promiscuous(true);
+        g_inspect.active = true;
+        for (int w = 0; w < 24 && inspect_active && g_inspect.beacons_seen == 0; w++) {
+            vTaskDelay(pdMS_TO_TICKS(50));   // up to ~1.2 s per AP
+        }
+        g_inspect.active = false;
+        if (!inspect_active) break;          // cancelled: leave the radio to the next owner
+        esp_wifi_set_promiscuous(false);
+
+        // Build the detail line: vendor (OUI) + MFP + uptime.
+        const uint8_t *b = inspect_bssid[i];
+        uint8_t oui3[3] = { b[0], b[1], b[2] };
+        const char *vendor = oui_lookup(oui3);
+        char detail[110];
+        if (g_inspect.beacons_seen == 0) {
+            snprintf(detail, sizeof(detail), "%.24s", vendor ? vendor : "unknown vendor");
+        } else {
+            uint64_t s = g_inspect.tsf_us / 1000000ULL;
+            const char *mfp = g_inspect.mfp_required ? "req" : (g_inspect.mfp_capable ? "opt" : "no");
+            snprintf(detail, sizeof(detail), "%.24s   MFP:%s   up %llud %02u:%02u",
+                     vendor ? vendor : "unknown", mfp,
+                     (unsigned long long)(s / 86400ULL),
+                     (unsigned)((s % 86400ULL) / 3600ULL),
+                     (unsigned)((s % 3600ULL) / 60ULL));
+        }
+
+        if (inspect_active && lvgl_mutex &&
+            xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (inspect_active && lv_obj_is_valid(inspect_labels[i])) {
+                lv_label_set_text(inspect_labels[i], detail);
+            }
+            xSemaphoreGive(lvgl_mutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    inspect_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void inspect_start(void)
+{
+    if (inspect_count == 0 || inspect_task_handle != NULL) return;
+    // Reclaim a finished previous run's PSRAM stack.
+    if (inspect_task_stack) { heap_caps_free(inspect_task_stack); inspect_task_stack = NULL; }
+    inspect_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (!inspect_task_stack) return;
+    inspect_active = true;
+    inspect_task_handle = xTaskCreateStatic(inspect_task, "inspect", 4096, NULL, 4,
+                                            inspect_task_stack, &inspect_task_buf);
+    if (!inspect_task_handle) {
+        inspect_active = false;
+        heap_caps_free(inspect_task_stack);
+        inspect_task_stack = NULL;
+    }
+}
+
+// Stop inspection and reclaim the radio. Non-blocking: the task sees the flag,
+// stops touching labels (guarded by lv_obj_is_valid under the LVGL mutex) and
+// leaves the radio alone so the next owner can configure it.
+static void inspect_stop(void)
+{
+    if (inspect_active) {
+        inspect_active = false;
+        esp_wifi_set_promiscuous(false);
+    }
+    inspect_count = 0;
+}
+
 // Whitelist for BSSID protection
 #define MAX_WHITELISTED_BSSIDS 150
 typedef struct {
@@ -1440,6 +1616,8 @@ static void reset_function_page_children(void) {
     // Any nav-away cancels the intent to show the WiFi Scan & Attack results
     // screen, so a scan that finishes right after we leave is ignored.
     scan_results_wanted = false;
+    // Stop the scan-results beacon inspection and hand the radio to the next screen.
+    inspect_stop();
     // Spectrum Analyzer: stop the render timer and free its PSRAM buffers.
     spec_active = false;
     if (spec_timer) { lv_timer_del(spec_timer); spec_timer = NULL; }
@@ -4596,6 +4774,7 @@ static void display_refresh_task(void *pvParameters)
                             lv_list_add_text(scan_list, "Failed to fetch results");
                         } else {
                             if (got > display_count) got = display_count;
+                            inspect_count = 0;   // rebuild the inspection list for this render
                             for (int i = 0; i < got; i++) {
                                 lv_obj_t *row = lv_list_add_btn(scan_list, NULL, "");
                                 if (!row) break;
@@ -4621,31 +4800,76 @@ static void display_refresh_task(void *pvParameters)
                                 lv_obj_set_style_text_color(cb, ui_text_color(), 0);
                                 lv_obj_set_style_pad_all(cb, 6, LV_PART_MAIN);
 
-                                lv_obj_t *ssid_lbl = lv_label_create(row);
+                                // Two-line row (Tab5 style): SSID on top, then a
+                                // color-coded info line (BSSID | CH | band | security | RSSI).
+                                lv_obj_t *text_cont = lv_obj_create(row);
+                                if (!text_cont) break;
+                                lv_obj_set_size(text_cont, lv_pct(88), LV_SIZE_CONTENT);
+                                lv_obj_set_style_bg_opa(text_cont, LV_OPA_TRANSP, 0);
+                                lv_obj_set_style_border_width(text_cont, 0, 0);
+                                lv_obj_set_style_pad_all(text_cont, 0, 0);
+                                lv_obj_set_style_pad_row(text_cont, 2, 0);
+                                lv_obj_set_flex_flow(text_cont, LV_FLEX_FLOW_COLUMN);
+                                lv_obj_clear_flag(text_cont, LV_OBJ_FLAG_CLICKABLE);   // don't steal the row's clicks
+
+                                lv_obj_t *ssid_lbl = lv_label_create(text_cont);
                                 if (!ssid_lbl) break;
-                                char name_buf[128];
-                                const char *band = (records[i].primary <= 14) ? "2.4GHz" : "5GHz";
-                                if (records[i].ssid[0] != 0) {
-                                    snprintf(name_buf, sizeof(name_buf), "%s (%s, %02X:%02X:%02X:%02X:%02X:%02X)", 
-                                             (const char *)records[i].ssid, band,
-                                             records[i].bssid[0], records[i].bssid[1], records[i].bssid[2],
-                                             records[i].bssid[3], records[i].bssid[4], records[i].bssid[5]);
-                                } else {
-                                    snprintf(name_buf, sizeof(name_buf), "%02X:%02X:%02X:%02X:%02X:%02X (%s)",
-                                             records[i].bssid[0], records[i].bssid[1], records[i].bssid[2],
-                                             records[i].bssid[3], records[i].bssid[4], records[i].bssid[5], band);
-                                }
-                                lv_label_set_text(ssid_lbl, name_buf);
-                                lv_label_set_long_mode(ssid_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                                lv_label_set_text(ssid_lbl, records[i].ssid[0] ? (const char *)records[i].ssid : "(Hidden)");
+                                lv_label_set_long_mode(ssid_lbl, LV_LABEL_LONG_DOT);
+                                lv_obj_set_width(ssid_lbl, lv_pct(100));
                                 lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_14, 0);
                                 lv_obj_set_style_text_color(ssid_lbl, ui_text_color(), 0);
-                                lv_obj_align(ssid_lbl, LV_ALIGN_LEFT_MID, 0, 5);  // 5px down for better alignment
-                                lv_obj_set_width(ssid_lbl, lv_pct(85));
+
+                                lv_obj_t *info_lbl = lv_label_create(text_cont);
+                                if (!info_lbl) break;
+                                lv_label_set_recolor(info_lbl, true);
+                                lv_label_set_long_mode(info_lbl, LV_LABEL_LONG_WRAP);
+                                lv_obj_set_width(info_lbl, lv_pct(100));
+                                {
+                                    const char *band     = (records[i].primary <= 14) ? "2.4G" : "5G";
+                                    const char *band_col = (records[i].primary <= 14) ? "#FFAA33" : "#CC66FF";
+                                    const char *rssi_col = records[i].rssi > -50 ? "#55DD55"
+                                                         : (records[i].rssi > -70 ? "#FFAA00" : "#FF5555");
+                                    char info_buf[176];
+                                    snprintf(info_buf, sizeof(info_buf),
+                                        "#5599FF %02X:%02X:%02X:%02X:%02X:%02X#  #5599FF CH%d#  %s %s#  %s %s#  %s %ddBm#",
+                                        records[i].bssid[0], records[i].bssid[1], records[i].bssid[2],
+                                        records[i].bssid[3], records[i].bssid[4], records[i].bssid[5],
+                                        records[i].primary,
+                                        band_col, band,
+                                        wifi_auth_color(records[i].authmode), wifi_auth_short(records[i].authmode),
+                                        rssi_col, records[i].rssi);
+                                    lv_label_set_text(info_lbl, info_buf);
+                                }
+                                lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_12, 0);
+                                lv_obj_set_style_text_color(info_lbl, lv_color_make(136, 136, 136), 0);
+
+                                // Third line: vendor (OUI) now; the background
+                                // inspect task appends MFP + uptime once it sniffs
+                                // a beacon from this AP.
+                                lv_obj_t *detail_lbl = lv_label_create(text_cont);
+                                if (detail_lbl) {
+                                    lv_label_set_long_mode(detail_lbl, LV_LABEL_LONG_DOT);
+                                    lv_obj_set_width(detail_lbl, lv_pct(100));
+                                    uint8_t oui3[3] = { records[i].bssid[0], records[i].bssid[1], records[i].bssid[2] };
+                                    const char *vendor = oui_lookup(oui3);
+                                    lv_label_set_text(detail_lbl, vendor ? vendor : "");
+                                    lv_obj_set_style_text_font(detail_lbl, &lv_font_montserrat_12, 0);
+                                    lv_obj_set_style_text_color(detail_lbl, lv_color_make(110, 110, 110), 0);
+                                    if (inspect_count < SCAN_RESULTS_MAX_DISPLAY) {
+                                        inspect_labels[inspect_count] = detail_lbl;
+                                        memcpy(inspect_bssid[inspect_count], records[i].bssid, 6);
+                                        inspect_chan[inspect_count] = records[i].primary;
+                                        inspect_count++;
+                                    }
+                                }
 
                                 if ((i & 7) == 7) {
                                     vTaskDelay(pdMS_TO_TICKS(1));
                                 }
                             }
+                            // Kick off background beacon inspection (MFP + uptime).
+                            inspect_start();
                         }
 
                         lv_mem_free(records);
