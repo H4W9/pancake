@@ -594,6 +594,7 @@ static void inspect_task(void *arg)
     // Keep sweeping the list, re-sniffing any AP that hasn't yielded a beacon
     // yet, until every AP is resolved (or the screen is left). MFP shows "?"
     // until that AP's beacon lands, then updates live to req/opt/no + uptime.
+    int sweeps = 0;
     while (inspect_active) {
         int unresolved = 0;
         for (int i = 0; i < inspect_count && inspect_active; i++) {
@@ -645,10 +646,17 @@ static void inspect_task(void *arg)
             }
             vTaskDelay(pdMS_TO_TICKS(20));
         }
-        if (!inspect_active || unresolved == 0) break;   // done (or cancelled)
+        sweeps++;
+        // Done when every AP has yielded a beacon, or after a few sweeps for APs
+        // that never beacon on our hearing (they keep their "MFP:?"), or on cancel.
+        if (!inspect_active || unresolved == 0 || sweeps >= 5) break;
         vTaskDelay(pdMS_TO_TICKS(500));                  // brief pause before the next sweep
     }
     if (inspect_active) esp_wifi_set_promiscuous(false);
+    // Natural completion: clear the "passive sniff" flag so the status LED leaves
+    // teal and shows the green "done" state (feature_led_update reads this). On a
+    // cancel it is already false, so this is a harmless no-op there.
+    inspect_active = false;
     inspect_task_handle = NULL;
     vTaskDelete(NULL);
 }
