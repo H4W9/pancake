@@ -243,6 +243,14 @@ static bool          g_clock_24h      = true;     // NVS-backed (12/24h status c
 static bool          g_clock_show     = true;     // NVS-backed (show clock in header)
 static uint8_t       g_tz_index       = 0;        // NVS-backed timezone index (0 = UTC)
 static lv_obj_t     *clock_label      = NULL;     // status-bar clock (main header)
+// Timezone table + time helpers are defined in the DS3231 block far below, but
+// the Time settings UI (above it) needs them — declare them here.
+typedef struct { const char *name; const char *posix; } tz_option_t;
+#define TZ_COUNT 30
+static const tz_option_t TZ_OPTIONS[TZ_COUNT];    // definition (with initializer) is in the DS3231 block
+static void   time_apply_tz(uint8_t index);
+static time_t utc_epoch(int y, int mo, int d, int h, int mi, int s);
+static bool   ds3231_set_tm(const struct tm *t);
 static lv_obj_t *wd_rssi_val_label   = NULL;  // Wardrive Settings slider value label
 
 static inline lv_color_t ui_bg_color(void) {
@@ -18466,8 +18474,8 @@ static void battery_monitor_task(void *arg)
 // agree on local time. The clock is always stored/kept in UTC (RTC/GPS/NTP); the
 // zone is applied only for display via setenv("TZ")+tzset(), and the POSIX string
 // encodes the DST rules so daylight saving switches automatically — no separate
-// DST toggle needed.
-typedef struct { const char *name; const char *posix; } tz_option_t;
+// DST toggle needed. (tz_option_t + TZ_COUNT are declared near the clock globals
+// far above so the Time settings UI can use them; this is the definition.)
 static const tz_option_t TZ_OPTIONS[] = {
     {"UTC",         "UTC0"},
     {"Hawaii",      "HST10"},
@@ -18500,7 +18508,8 @@ static const tz_option_t TZ_OPTIONS[] = {
     {"UTC+13",      "UTC-13"},
     {"UTC+14",      "UTC-14"},
 };
-#define TZ_COUNT ((int)(sizeof(TZ_OPTIONS) / sizeof(TZ_OPTIONS[0])))
+_Static_assert(sizeof(TZ_OPTIONS) / sizeof(TZ_OPTIONS[0]) == TZ_COUNT,
+               "TZ_OPTIONS count must match TZ_COUNT");
 
 static void time_apply_tz(uint8_t index)
 {
