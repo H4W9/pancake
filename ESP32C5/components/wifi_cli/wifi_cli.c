@@ -133,7 +133,10 @@ static esp_err_t init_led(void) {
         .strip_gpio_num = NEOPIXEL_GPIO,
         .max_leds = LED_COUNT,
         .led_model = LED_MODEL_WS2812,
-        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+        // This board's NeoPixel is RGB-ordered (verified on hardware: GRB made
+        // red show as green / cyan as magenta — an R/G swap). Use RGB so the
+        // status colors are correct.
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_RGB,
         .flags.invert_out = false,
     };
 
