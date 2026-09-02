@@ -235,6 +235,8 @@ static uint8_t  wd_mem_cap_mb        = 4;     // max PSRAM (MB) the wardrive buf
 static uint16_t antisurv_sens_m      = 100;   // anti-surv "following" alert distance (m)
 static bool     wd_home_upload       = false; // auto-upload on home network (default OFF)
 static bool     g_sound_enabled       = true;  // buzzer UI sounds (boot/clicks/menus)
+static bool     g_finder_sound        = true;  // proximity/blip sounds for BT Locator + Radar ONLY
+                                                // (independent of g_sound_enabled; one shared toggle)
 // RTC / clock state (DS3231 + GPS/NTP time). See the DS3231 block for the driver.
 static bool          g_rtc_present    = false;
 static volatile bool g_time_valid     = false;
@@ -243,6 +245,8 @@ static bool          g_clock_24h      = true;     // NVS-backed (12/24h status c
 static bool          g_clock_show     = true;     // NVS-backed (show clock in header)
 static uint8_t       g_tz_index       = 0;        // NVS-backed timezone index (0 = UTC)
 static lv_obj_t     *clock_label      = NULL;     // status-bar clock (main header)
+static lv_obj_t     *time_live_label  = NULL;     // Time settings: big live clock label
+static lv_timer_t   *time_live_timer  = NULL;     // Time settings: 1 Hz refresh timer
 // Timezone table + time helpers are defined in the DS3231 block far below, but
 // the Time settings UI (above it) needs them — declare them here.
 typedef struct { const char *name; const char *posix; } tz_option_t;
@@ -346,6 +350,7 @@ static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel 
 #define NVS_KEY_CLK_24H     "clk_24h"
 #define NVS_KEY_CLK_SHOW    "clk_show"
 #define NVS_KEY_TZ          "tz_index"
+#define NVS_KEY_FINDSND     "finder_snd"
 
 // ============================================================================
 // Theme-aware style helpers
@@ -457,6 +462,10 @@ static volatile bool scan_done_ui_flag = false;
 // leaves this false, so a completing scan never hijacks their screen. Cleared on
 // any nav-away by reset_function_page_children().
 static volatile bool scan_results_wanted = false;
+// True only while the WiFi Scan & Attack screen is up. Gates the status LED
+// (scanning / passive sniff / done) so it turns OFF the instant we leave, even
+// if a background scan is still finishing. Cleared by reset_function_page_children().
+static volatile bool scan_attack_screen_active = false;
 #define SCAN_RESULTS_MAX_DISPLAY 32
 
 // Short security label + recolor-markup color for a scan result's auth mode
@@ -1113,6 +1122,40 @@ static bool        spec_active        = false;
 static uint32_t    spec_last_scan     = 0;
 static uint16_t    spec_noise         = 0xACE1;
 
+// ---- WiFi AP Radar (local beacon-RSSI locator + radar scope) ----------------
+// Locks the radio to the selected AP's channel and sniffs that BSSID's beacons
+// (backend ported from projectZero's ap_locator), plotting the live RSSI as a
+// blip on a rotating radar scope (UI inspired by Tab5's AP Radar) and beeping a
+// hot/cold blip via the shared finder sound.
+#define RADAR_W 236
+#define RADAR_H 236
+#define RADAR_RSSI_CENTER (-40)
+#define RADAR_RSSI_EDGE   (-92)
+static lv_obj_t   *radar_canvas       = NULL;
+static lv_color_t *radar_buf          = NULL;   // RGB565 canvas buffer (PSRAM)
+static lv_obj_t   *radar_info_label   = NULL;
+static lv_obj_t   *radar_rssi_label   = NULL;
+static lv_obj_t   *radar_bcn_label    = NULL;
+static lv_timer_t *radar_timer        = NULL;
+static volatile bool radar_active     = false;  // screen up
+static volatile bool radar_locator_active = false;  // promiscuous sniff running
+static TaskHandle_t  radar_task_handle = NULL;
+static volatile int  radar_last_rssi  = -100;
+static volatile bool radar_beacon_seen = false;
+static volatile uint32_t radar_beacon_total = 0;
+static volatile int64_t  radar_last_seen_us = 0;
+static uint8_t     radar_target_bssid[6] = {0};
+static char        radar_target_ssid[33] = {0};
+static uint8_t     radar_target_channel = 1;
+static uint8_t     radar_prev_primary  = 1;
+static wifi_second_chan_t radar_prev_secondary = WIFI_SECOND_CHAN_NONE;
+static bool        radar_has_prev_channel = false;
+static int         radar_sweep_angle  = 0;      // degrees
+static float       radar_blip_frac    = 1.0f;   // 0=center(near) .. 1=edge(far)
+static uint32_t    radar_beep_acc     = 0;      // ms since last blip beep
+static uint32_t    radar_prev_bcn_snapshot = 0; // for beacons/sec
+static uint32_t    radar_last_bcn_rate = 0;
+
 static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
 static int wdp_ducb_channel_count = 0;
 static double wdp_ducb_discounted_total = 0.0;
@@ -1371,6 +1414,7 @@ static lv_obj_t *bt_locator_status_label = NULL;
 static lv_obj_t *bt_locator_rssi_label = NULL;
 static lv_obj_t *bt_locator_mac_label = NULL;
 static lv_obj_t *bt_locator_exit_btn = NULL;
+static lv_obj_t *bt_locator_snd_btn = NULL;   // shared finder-sound toggle (tracking view)
 static volatile bool bt_locator_ui_active = false;
 static volatile bool bt_locator_tracking_active = false;
 static volatile bool bt_locator_needs_ui_update = false;
@@ -1571,6 +1615,8 @@ static void screenshot_save_task(void *arg);
 // Forward decl — reset_function_page_children() (below) tears down WhisperPair.
 static void wp_teardown(void);
 
+static void radar_stop_locator(void);   // defined with the AP Radar block below
+
 // Reset all child pointers when function_page is deleted
 static void reset_function_page_children(void) {
     scan_status_label = NULL;
@@ -1651,6 +1697,7 @@ static void reset_function_page_children(void) {
     bt_locator_rssi_label = NULL;
     bt_locator_mac_label = NULL;
     bt_locator_exit_btn = NULL;
+    bt_locator_snd_btn = NULL;
     gw_content = NULL;
     gw_list = NULL;
     gw_status_label = NULL;
@@ -1673,6 +1720,8 @@ static void reset_function_page_children(void) {
     // Any nav-away cancels the intent to show the WiFi Scan & Attack results
     // screen, so a scan that finishes right after we leave is ignored.
     scan_results_wanted = false;
+    // Leaving the scan screen: drop the LED gate so it goes dark immediately.
+    scan_attack_screen_active = false;
     // Stop the scan-results beacon inspection and hand the radio to the next screen.
     inspect_stop();
     // Spectrum Analyzer: stop the render timer and free its PSRAM buffers.
@@ -1684,6 +1733,21 @@ static void reset_function_page_children(void) {
     if (spec_col_persist) { free(spec_col_persist); spec_col_persist = NULL; }
     spec_canvas = NULL;
     spec_info_label = NULL;
+    // WiFi AP Radar: stop the locator sniff + render timer, restore the channel,
+    // free the PSRAM canvas on any nav away (title-bar back/home included).
+    if (radar_active || radar_locator_active) {
+        radar_stop_locator();
+    }
+    if (radar_timer) { lv_timer_del(radar_timer); radar_timer = NULL; }
+    if (radar_buf) { heap_caps_free(radar_buf); radar_buf = NULL; }
+    radar_canvas = NULL;
+    radar_info_label = NULL;
+    radar_rssi_label = NULL;
+    radar_bcn_label = NULL;
+    radar_active = false;
+    // Time settings: kill the live-clock refresh timer on any nav away.
+    if (time_live_timer) { lv_timer_del(time_live_timer); time_live_timer = NULL; }
+    time_live_label = NULL;
     // BLE HoneyPair: stop advertising on any nav away (title back button included)
     if (hp_screen_active) {
         honeypair_stop();
@@ -2003,6 +2067,11 @@ static void wp_result_cb(wp_result_t result, const char *detail, const uint8_t m
 // BLE peripheral mode switch (re-inits NimBLE if the registered service table
 // must change between HoneyPair and BlueDuck).
 static bool ensure_ble_periph_mode(bool for_blueduck);
+
+// WiFi AP Radar functions (radar_stop_locator declared earlier, above reset_*)
+static void show_ap_radar_screen(int scan_idx);
+static void radar_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
+static void radar_monitor_task(void *pvParameters);
 
 // Deauth Monitor functions
 static void show_deauth_monitor_screen(void);
@@ -2571,6 +2640,7 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_CLK_24H, &u8v) == ESP_OK)    g_clock_24h = (u8v != 0);
         if (nvs_get_u8(h, NVS_KEY_CLK_SHOW, &u8v) == ESP_OK)   g_clock_show = (u8v != 0);
         if (nvs_get_u8(h, NVS_KEY_TZ, &u8v) == ESP_OK)         g_tz_index = u8v;
+        if (nvs_get_u8(h, NVS_KEY_FINDSND, &u8v) == ESP_OK)    g_finder_sound = (u8v != 0);
         nvs_close(h);
         ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d",
                  (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms,
@@ -2629,6 +2699,7 @@ static void nvs_writer_task(void *arg)
             case 13: nvs_set_u8(h, NVS_KEY_CLK_24H, req.a ? 1 : 0); break;
             case 14: nvs_set_u8(h, NVS_KEY_CLK_SHOW, req.a ? 1 : 0); break;
             case 15: nvs_set_u8(h, NVS_KEY_TZ, (uint8_t)req.a); break;
+            case 16: nvs_set_u8(h, NVS_KEY_FINDSND, req.a ? 1 : 0); break;
             default: nvs_close(h); continue;
         }
         nvs_commit(h);
@@ -2661,6 +2732,7 @@ static void nvs_settings_save_sound(bool enabled)                   { nvs_save_e
 static void nvs_settings_save_clk_24h(bool enabled)                 { nvs_save_enqueue(13, enabled ? 1 : 0, 0); }
 static void nvs_settings_save_clk_show(bool enabled)                { nvs_save_enqueue(14, enabled ? 1 : 0, 0); }
 static void nvs_settings_save_tz(uint8_t idx)                       { nvs_save_enqueue(15, idx, 0); }
+static void nvs_settings_save_finder_sound(bool enabled)           { nvs_save_enqueue(16, enabled ? 1 : 0, 0); }
 
 // ============================================================================
 // UI Sound Effects — passive buzzer on GPIO6 driven by LEDC square-wave tones.
@@ -2690,17 +2762,50 @@ static const sfx_note_t SND_BOOT[]       = {
     {900, 10, 30},   {700, 10, 30}, {850, 10, 60}, {170, 230, 70},
     {210, 320, 90},  {240, 360, 0}, {0, 0, 0}
 };
+// Finder "hot/cold" tones — pitch rises with proximity (level 1 = cold/far,
+// level 5 = hot/near). Used by BT Locator (proximity beeps) and Radar (blips).
+// Played via sfx_play_finder(), gated by g_finder_sound (NOT g_sound_enabled).
+static const sfx_note_t SND_FIND_L1[] = { {520, 40, 0}, {0, 0, 0} };
+static const sfx_note_t SND_FIND_L2[] = { {700, 38, 0}, {0, 0, 0} };
+static const sfx_note_t SND_FIND_L3[] = { {950, 34, 0}, {0, 0, 0} };
+static const sfx_note_t SND_FIND_L4[] = { {1250, 30, 0}, {0, 0, 0} };
+static const sfx_note_t SND_FIND_L5[] = { {1650, 26, 0}, {0, 0, 0} };
+static const sfx_note_t *finder_tone_for_level(int lvl) {
+    switch (lvl) {
+        case 1:  return SND_FIND_L1;
+        case 2:  return SND_FIND_L2;
+        case 3:  return SND_FIND_L3;
+        case 4:  return SND_FIND_L4;
+        default: return SND_FIND_L5;
+    }
+}
+// Map an RSSI (dBm) to proximity level 1 (far/cold) .. 5 (near/hot).
+static int finder_level_from_rssi(int rssi) {
+    int lvl = (rssi + 95) / 12;   // -95→0, -35→5
+    if (lvl < 1) lvl = 1;
+    if (lvl > 5) lvl = 5;
+    return lvl;
+}
+// Beep repeat interval (ms) for a proximity level — closer = faster.
+static uint32_t finder_interval_for_level(int lvl) {
+    static const uint32_t iv[6] = { 1100, 1100, 800, 550, 350, 180 };  // [0] unused
+    if (lvl < 1) lvl = 1;
+    if (lvl > 5) lvl = 5;
+    return iv[lvl];
+}
 
 // Sequence state — owned exclusively by the esp_timer callback context.
 enum { SFX_IDLE, SFX_NOTE, SFX_PAUSE };
 static const sfx_note_t *sfx_seq        = NULL;
 static int               sfx_step       = 0;
 static uint8_t           sfx_phase      = SFX_IDLE;
+static bool              sfx_seq_finder = false;   // gate of the sequence now playing
 static esp_timer_handle_t sfx_note_timer = NULL;
 static bool              sfx_buzz_ready = false;
 // Event queue — shared (producers: LVGL/main task; consumer: timer task).
 #define SFX_Q 6
 static const sfx_note_t *sfx_queue[SFX_Q];
+static bool              sfx_queue_finder[SFX_Q];  // per-entry gate (finder vs global)
 static volatile uint8_t  sfx_qhead = 0, sfx_qtail = 0;
 static portMUX_TYPE      sfx_qmux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -2728,29 +2833,46 @@ static bool sfx_begin_step(void) {
     return true;
 }
 
-// Pull the next queued sound and start it; go idle if the queue is empty.
+// A queued sound is muted if its gate is off: finder entries follow g_finder_sound,
+// everything else follows g_sound_enabled. The two are fully independent.
+static inline bool sfx_muted(bool finder) {
+    return finder ? !g_finder_sound : !g_sound_enabled;
+}
+
+// Pull the next queued sound and start it; go idle if the queue is empty. Skips
+// entries whose gate turned off after they were queued.
 static void sfx_pull_next(void) {
-    const sfx_note_t *s = NULL;
-    portENTER_CRITICAL(&sfx_qmux);
-    if (sfx_qtail != sfx_qhead) { s = sfx_queue[sfx_qtail]; sfx_qtail = (sfx_qtail + 1) % SFX_Q; }
-    portEXIT_CRITICAL(&sfx_qmux);
-    if (!s) { sfx_seq = NULL; sfx_phase = SFX_IDLE; return; }
-    sfx_seq = s;
-    sfx_step = 0;
-    if (!sfx_begin_step()) { sfx_seq = NULL; sfx_phase = SFX_IDLE; sfx_pull_next(); }
+    for (;;) {
+        const sfx_note_t *s = NULL;
+        bool fin = false;
+        portENTER_CRITICAL(&sfx_qmux);
+        if (sfx_qtail != sfx_qhead) {
+            s   = sfx_queue[sfx_qtail];
+            fin = sfx_queue_finder[sfx_qtail];
+            sfx_qtail = (sfx_qtail + 1) % SFX_Q;
+        }
+        portEXIT_CRITICAL(&sfx_qmux);
+        if (!s) { sfx_seq = NULL; sfx_phase = SFX_IDLE; return; }
+        if (sfx_muted(fin)) continue;            // gate off now — drop and try next
+        sfx_seq = s;
+        sfx_seq_finder = fin;
+        sfx_step = 0;
+        if (sfx_begin_step()) return;            // started it
+        // degenerate (empty) sequence — keep pulling
+    }
 }
 
 // One-shot fired: advance the sequence. Runs in the esp_timer task, the sole
 // owner of sfx_seq/step/phase, so no locking is needed for that state.
 static void sfx_timer_cb(void *arg) {
     (void)arg;
-    if (!g_sound_enabled) {
-        buzz_off();
-        sfx_seq = NULL; sfx_phase = SFX_IDLE;
-        portENTER_CRITICAL(&sfx_qmux); sfx_qtail = sfx_qhead; portEXIT_CRITICAL(&sfx_qmux);
-        return;
-    }
     if (sfx_seq) {
+        if (sfx_muted(sfx_seq_finder)) {         // this sound's gate went off mid-play
+            buzz_off();
+            sfx_seq = NULL; sfx_phase = SFX_IDLE;
+            sfx_pull_next();
+            return;
+        }
         const sfx_note_t *n = &sfx_seq[sfx_step];
         if (sfx_phase == SFX_NOTE) {
             buzz_off();                          // hardware-timed note end
@@ -2767,13 +2889,13 @@ static void sfx_timer_cb(void *arg) {
     sfx_pull_next();
 }
 
-// Queue a sound (safe from any task). Kicks the sequencer if it's idle.
-static void sfx_play(const sfx_note_t *seq) {
-    if (!g_sound_enabled || !seq || !sfx_buzz_ready) return;
+// Enqueue a note table with its gate flag and kick the sequencer if idle.
+static void sfx_enqueue(const sfx_note_t *seq, bool finder) {
     portENTER_CRITICAL(&sfx_qmux);
     uint8_t next = (sfx_qhead + 1) % SFX_Q;
     if (next == sfx_qtail) sfx_qtail = (sfx_qtail + 1) % SFX_Q;   // drop oldest
     sfx_queue[sfx_qhead] = seq;
+    sfx_queue_finder[sfx_qhead] = finder;
     sfx_qhead = next;
     portEXIT_CRITICAL(&sfx_qmux);
     // If the sequencer is idle, kick it. If it's mid-note the timer is active and
@@ -2782,6 +2904,51 @@ static void sfx_play(const sfx_note_t *seq) {
     if (!esp_timer_is_active(sfx_note_timer)) {
         esp_timer_start_once(sfx_note_timer, 1);
     }
+}
+
+// Queue a UI sound (safe from any task). Gated by the global sound setting.
+static void sfx_play(const sfx_note_t *seq) {
+    if (!g_sound_enabled || !seq || !sfx_buzz_ready) return;
+    sfx_enqueue(seq, false);
+}
+
+// Queue a finder sound (BT Locator / Radar). Gated by g_finder_sound only, so it
+// still sounds when global UI sound is off, and stays silent when the shared
+// finder toggle is off even if global sound is on.
+static void sfx_play_finder(const sfx_note_t *seq) {
+    if (!g_finder_sound || !seq || !sfx_buzz_ready) return;
+    sfx_enqueue(seq, true);
+}
+
+// Shared "finder sound" on-screen toggle, used by BT Locator and Radar. Flips
+// g_finder_sound (one setting for both screens), persists it, and updates its
+// own label. The button's first child is the label.
+static void finder_sound_toggle_cb(lv_event_t *e) {
+    g_finder_sound = !g_finder_sound;
+    nvs_settings_save_finder_sound(g_finder_sound);
+    lv_obj_t *btn = lv_event_get_target(e);
+    lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+    if (lbl) lv_label_set_text_fmt(lbl, LV_SYMBOL_AUDIO " %s", g_finder_sound ? "On" : "Off");
+    lv_obj_set_style_bg_color(btn, g_finder_sound ? lv_color_make(0, 150, 90)
+                                                  : lv_color_make(90, 90, 90), 0);
+    if (g_finder_sound) sfx_play_finder(SND_FIND_L3);   // confirm via the finder path
+}
+
+// Create the toggle button on `parent`; caller aligns it. Returns the button.
+static lv_obj_t *make_finder_sound_toggle(lv_obj_t *parent) {
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, 92, 30);
+    lv_obj_set_style_radius(btn, 6, 0);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_set_style_bg_color(btn, g_finder_sound ? lv_color_make(0, 150, 90)
+                                                  : lv_color_make(90, 90, 90), 0);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text_fmt(lbl, LV_SYMBOL_AUDIO " %s", g_finder_sound ? "On" : "Off");
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+    lv_obj_center(lbl);
+    lv_obj_add_event_cb(btn, finder_sound_toggle_cb, LV_EVENT_CLICKED, NULL);
+    return btn;
 }
 
 // Global touch feedback: soft click on every press (typing keys, buttons, tiles).
@@ -3805,9 +3972,11 @@ static void create_home_ui(void)
     lv_obj_set_style_radius(title_bar, 0, 0);
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Header: "LAB5" on the left, clock in the middle, battery on the right.
+    // Header: magenta "LAB5 | JanOS" on the left (matches Tab5's #FF2FA3 recolor),
+    // clock in the middle, battery on the right.
     lv_obj_t *title_label = lv_label_create(title_bar);
-    lv_label_set_text(title_label, "LAB5");
+    lv_label_set_recolor(title_label, true);
+    lv_label_set_text(title_label, "#FF2FA3 LAB5# | JanOS");
     lv_obj_set_style_text_color(title_label, ui_text_color(), 0);
     lv_obj_set_style_text_font(title_label, &lv_font_montserrat_16, 0);
     lv_obj_align(title_label, LV_ALIGN_LEFT_MID, 8, 0);
@@ -5235,8 +5404,14 @@ static void display_refresh_task(void *pvParameters)
                     if (bt_locator_rssi_label) {
                         if (bt_tracking_found) {
                             char rssi_text[32];
+                            int lvl = finder_level_from_rssi(bt_tracking_rssi);
                             snprintf(rssi_text, sizeof(rssi_text), "RSSI: %d", bt_tracking_rssi);
                             lv_label_set_text(bt_locator_rssi_label, rssi_text);
+                            // Hot (near) = green, warm = amber, cold (far) = red
+                            lv_color_t c = (lvl >= 4) ? lv_color_make(0, 220, 0)
+                                         : (lvl == 3) ? lv_color_make(255, 170, 0)
+                                                      : lv_color_make(255, 80, 80);
+                            lv_obj_set_style_text_color(bt_locator_rssi_label, c, 0);
                         }
                     }
                 } else {
@@ -12027,6 +12202,301 @@ static void show_spectrum_screen(void) {
     spec_timer = lv_timer_create(spec_timer_cb, 100, NULL);
 }
 
+// ============================================================================
+// WiFi AP Radar — local beacon-RSSI locator + rotating radar scope
+// ============================================================================
+
+// RSSI (dBm) -> blip distance fraction: 0 at center (near) .. 1 at edge (far).
+static float radar_rssi_to_frac(int rssi) {
+    if (rssi >= RADAR_RSSI_CENTER) return 0.0f;
+    if (rssi <= RADAR_RSSI_EDGE)   return 1.0f;
+    return (float)(RADAR_RSSI_CENTER - rssi) / (float)(RADAR_RSSI_CENTER - RADAR_RSSI_EDGE);
+}
+static lv_color_t radar_rssi_color(int rssi) {
+    if (rssi > -50) return lv_color_make(0, 220, 0);
+    if (rssi > -70) return lv_color_make(255, 170, 0);
+    return lv_color_make(255, 80, 80);
+}
+
+// Direct pixel helpers into the radar RGB565 canvas buffer.
+static inline void radar_px(int x, int y, lv_color_t col) {
+    if ((unsigned)x < RADAR_W && (unsigned)y < RADAR_H)
+        radar_buf[y * RADAR_W + x] = col;
+}
+static void radar_fill(lv_color_t col) {
+    int n = RADAR_W * RADAR_H;
+    for (int i = 0; i < n; i++) radar_buf[i] = col;
+}
+static void radar_line(int x0, int y0, int x1, int y1, lv_color_t col) {
+    int dx = abs(x1 - x0), dy = -abs(y1 - y0);
+    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        radar_px(x0, y0, col);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+// Midpoint circle outline.
+static void radar_circle(int cx, int cy, int r, lv_color_t col) {
+    if (r <= 0) return;
+    int x = r, y = 0, err = 1 - r;
+    while (x >= y) {
+        radar_px(cx + x, cy + y, col); radar_px(cx + y, cy + x, col);
+        radar_px(cx - y, cy + x, col); radar_px(cx - x, cy + y, col);
+        radar_px(cx - x, cy - y, col); radar_px(cx - y, cy - x, col);
+        radar_px(cx + y, cy - x, col); radar_px(cx + x, cy - y, col);
+        y++;
+        if (err < 0) err += 2 * y + 1;
+        else { x--; err += 2 * (y - x) + 1; }
+    }
+}
+// Filled disc (for the blip).
+static void radar_disc(int cx, int cy, int r, lv_color_t col) {
+    for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++)
+            if (dx * dx + dy * dy <= r * r) radar_px(cx + dx, cy + dy, col);
+}
+
+static void radar_render(void) {
+    if (!radar_buf || !radar_canvas) return;
+    const int cx = RADAR_W / 2, cy = RADAR_H / 2;
+    int max_r = (RADAR_W < RADAR_H ? RADAR_W : RADAR_H) / 2 - 6;
+    if (max_r < 20) max_r = 20;
+
+    lv_color_t bg    = lv_color_make(6, 20, 14);
+    lv_color_t grid  = lv_color_make(30, 77, 58);
+    lv_color_t axis  = lv_color_make(46, 107, 82);
+    lv_color_t sweep = lv_color_make(51, 255, 153);
+
+    radar_fill(bg);
+    for (int ring = 1; ring <= 4; ring++)
+        radar_circle(cx, cy, max_r * ring / 4, grid);
+    radar_line(cx - max_r, cy, cx + max_r, cy, axis);
+    radar_line(cx, cy - max_r, cx, cy + max_r, axis);
+
+    // Sweep line (lv_trigo_sin/cos are Q15: -32767..32767).
+    int16_t a = (int16_t)radar_sweep_angle;
+    int sx = cx + (max_r * lv_trigo_sin(a)) / 32767;
+    int sy = cy - (max_r * lv_trigo_cos(a)) / 32767;
+    radar_line(cx, cy, sx, sy, sweep);
+
+    // Blip: fixed bearing straight up, distance = RSSI fraction.
+    int blip_r = (int)(radar_blip_frac * max_r);
+    int bx = cx, by = cy - blip_r;
+    lv_color_t bc = radar_rssi_color(radar_last_rssi);
+    if (radar_beacon_seen || (esp_timer_get_time() - radar_last_seen_us) < 3000000LL)
+        radar_disc(bx, by, 6, bc);
+
+    lv_obj_invalidate(radar_canvas);
+}
+
+// Promiscuous RX: keep only beacons (mgmt subtype 8) from the target BSSID and
+// latch their RSSI. Ported from projectZero's ap_locator callback.
+static void radar_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!radar_locator_active || type != WIFI_PKT_MGMT) return;
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+    if (len < 24) return;
+    if ((frame[0] & 0xFC) != 0x80) return;                     // beacon frame
+    if (memcmp(&frame[10], radar_target_bssid, 6) != 0) return; // addr2 == BSSID
+    radar_last_rssi = (int)pkt->rx_ctrl.rssi;
+    radar_last_seen_us = esp_timer_get_time();
+    radar_beacon_seen = true;
+    radar_beacon_total++;
+}
+
+// Background task: once a second, compute beacons/sec and flag the label refresh.
+static void radar_monitor_task(void *pvParameters) {
+    (void)pvParameters;
+    uint32_t last_total = 0;
+    while (radar_locator_active) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (!radar_locator_active) break;
+        uint32_t total = radar_beacon_total;
+        radar_last_bcn_rate = total - last_total;
+        last_total = total;
+    }
+    radar_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Stop the sniff, restore the previous channel, disable promiscuous, wait for the
+// monitor task to exit. Safe to call more than once.
+static void radar_stop_locator(void) {
+    if (!radar_locator_active && radar_task_handle == NULL) return;
+    radar_locator_active = false;
+    for (int i = 0; i < 40 && radar_task_handle != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(10));
+    esp_wifi_set_promiscuous(false);
+    if (radar_has_prev_channel)
+        esp_wifi_set_channel(radar_prev_primary, radar_prev_secondary);
+}
+
+static void radar_timer_cb(lv_timer_t *t) {
+    (void)t;
+    if (!radar_active || !radar_canvas) return;
+
+    radar_sweep_angle = (radar_sweep_angle + 12) % 360;
+
+    // Ease the blip toward the latest reading (or drift to the edge if lost).
+    bool fresh = (esp_timer_get_time() - radar_last_seen_us) < 3000000LL;
+    float target = fresh ? radar_rssi_to_frac(radar_last_rssi) : 1.0f;
+    radar_blip_frac += (target - radar_blip_frac) * 0.35f;
+
+    // Labels
+    if (radar_rssi_label) {
+        if (fresh) {
+            lv_label_set_text_fmt(radar_rssi_label, "%d dBm", radar_last_rssi);
+            lv_obj_set_style_text_color(radar_rssi_label, radar_rssi_color(radar_last_rssi), 0);
+        } else {
+            lv_label_set_text(radar_rssi_label, "-- dBm");
+            lv_obj_set_style_text_color(radar_rssi_label, lv_color_make(150, 150, 150), 0);
+        }
+    }
+    if (radar_bcn_label)
+        lv_label_set_text_fmt(radar_bcn_label, "%u bcn/s", (unsigned)radar_last_bcn_rate);
+
+    // Hot/cold blip beep (gated by the shared finder-sound toggle).
+    radar_beep_acc += 60;
+    if (fresh && g_finder_sound) {
+        int lvl = finder_level_from_rssi(radar_last_rssi);
+        if (radar_beep_acc >= finder_interval_for_level(lvl)) {
+            sfx_play_finder(finder_tone_for_level(lvl));
+            radar_beep_acc = 0;
+        }
+    } else {
+        radar_beep_acc = 0;
+    }
+
+    radar_render();
+}
+
+static void radar_back_btn_cb(lv_event_t *e) {
+    (void)e;
+    nav_to_menu_flag = true;   // reset_function_page_children() does the teardown
+}
+
+static void show_ap_radar_screen(int scan_idx) {
+    // Resolve the selected AP from the scanner results.
+    const wifi_ap_record_t *records = wifi_scanner_get_results_ptr();
+    const uint16_t *count_ptr = wifi_scanner_get_count_ptr();
+    uint16_t total = count_ptr ? *count_ptr : 0;
+    if (!records || scan_idx < 0 || scan_idx >= (int)total) {
+        show_stub_screen("Radar");
+        return;
+    }
+    const wifi_ap_record_t *ap = &records[scan_idx];
+    memcpy(radar_target_bssid, ap->bssid, 6);
+    strncpy(radar_target_ssid, (const char *)ap->ssid, sizeof(radar_target_ssid) - 1);
+    radar_target_ssid[sizeof(radar_target_ssid) - 1] = '\0';
+    radar_target_channel = ap->primary;
+    radar_last_rssi = ap->rssi;
+    radar_beacon_seen = false;
+    radar_beacon_total = 0;
+    radar_last_bcn_rate = 0;
+    radar_last_seen_us = 0;
+    radar_sweep_angle = 0;
+    radar_blip_frac = radar_rssi_to_frac(ap->rssi);
+    radar_beep_acc = 0;
+
+    create_function_page_base("AP Radar");
+    ensure_wifi_mode();
+
+    radar_buf = (lv_color_t *)heap_caps_malloc(
+        (size_t)RADAR_W * RADAR_H * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    if (!radar_buf) {
+        lv_obj_t *err = lv_label_create(function_page);
+        lv_label_set_text(err, "Radar: out of memory");
+        lv_obj_set_style_text_color(err, ui_text_color(), 0);
+        lv_obj_center(err);
+        return;
+    }
+
+    // Radar scope canvas on the left.
+    radar_canvas = lv_canvas_create(function_page);
+    lv_canvas_set_buffer(radar_canvas, radar_buf, RADAR_W, RADAR_H, LV_IMG_CF_TRUE_COLOR);
+    lv_obj_align(radar_canvas, LV_ALIGN_TOP_LEFT, 8, 40);
+
+    // Right-hand info column.
+    const int col_x = 8 + RADAR_W + 12;
+    char mac[18];
+    snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             radar_target_bssid[0], radar_target_bssid[1], radar_target_bssid[2],
+             radar_target_bssid[3], radar_target_bssid[4], radar_target_bssid[5]);
+
+    lv_obj_t *ssid_lbl = lv_label_create(function_page);
+    lv_label_set_long_mode(ssid_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(ssid_lbl, LCD_H_RES - col_x - 8);
+    lv_label_set_text(ssid_lbl, radar_target_ssid[0] ? radar_target_ssid : "(hidden)");
+    lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ssid_lbl, ui_text_color(), 0);
+    lv_obj_align(ssid_lbl, LV_ALIGN_TOP_LEFT, col_x, 44);
+
+    radar_info_label = lv_label_create(function_page);
+    lv_label_set_text_fmt(radar_info_label, "%s\nCh %u", mac, radar_target_channel);
+    lv_obj_set_style_text_font(radar_info_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(radar_info_label, lv_color_make(150, 150, 150), 0);
+    lv_obj_align(radar_info_label, LV_ALIGN_TOP_LEFT, col_x, 70);
+
+    radar_rssi_label = lv_label_create(function_page);
+    lv_label_set_text_fmt(radar_rssi_label, "%d dBm", radar_last_rssi);
+    lv_obj_set_style_text_font(radar_rssi_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(radar_rssi_label, radar_rssi_color(radar_last_rssi), 0);
+    lv_obj_align(radar_rssi_label, LV_ALIGN_TOP_LEFT, col_x, 108);
+
+    radar_bcn_label = lv_label_create(function_page);
+    lv_label_set_text(radar_bcn_label, "0 bcn/s");
+    lv_obj_set_style_text_font(radar_bcn_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(radar_bcn_label, ui_text_color(), 0);
+    lv_obj_align(radar_bcn_label, LV_ALIGN_TOP_LEFT, col_x, 140);
+
+    // Shared finder-sound toggle.
+    lv_obj_t *snd = make_finder_sound_toggle(function_page);
+    lv_obj_align(snd, LV_ALIGN_TOP_LEFT, col_x, 172);
+
+    // Back button.
+    lv_obj_t *back = lv_btn_create(function_page);
+    lv_obj_set_size(back, 92, 40);
+    lv_obj_set_style_bg_color(back, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_radius(back, 8, 0);
+    lv_obj_set_style_border_width(back, 0, 0);
+    lv_obj_align(back, LV_ALIGN_TOP_LEFT, col_x, 214);
+    lv_obj_t *back_lbl = lv_label_create(back);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back, radar_back_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    // Lock the radio to the target channel and start the beacon sniff.
+    uint8_t pri = 1;
+    wifi_second_chan_t sec = WIFI_SECOND_CHAN_NONE;
+    if (esp_wifi_get_channel(&pri, &sec) == ESP_OK) {
+        radar_prev_primary = pri;
+        radar_prev_secondary = sec;
+        radar_has_prev_channel = true;
+    } else {
+        radar_has_prev_channel = false;
+    }
+    wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(radar_promiscuous_cb);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(radar_target_channel, WIFI_SECOND_CHAN_NONE);
+
+    radar_active = true;
+    radar_locator_active = true;
+    if (xTaskCreate(radar_monitor_task, "radar_mon", 3072, NULL, 4, &radar_task_handle) != pdPASS) {
+        radar_task_handle = NULL;   // labels still update from the LVGL timer
+    }
+
+    radar_render();
+    radar_timer = lv_timer_create(radar_timer_cb, 60, NULL);
+}
+
 // Main tile event callback - routes to appropriate screen
 static void main_tile_event_cb(lv_event_t *e)
 {
@@ -12140,6 +12610,7 @@ static void attack_tile_event_cb(lv_event_t *e)
                strcmp(attack_name, "Rogue AP") == 0 ||
                strcmp(attack_name, "WPA-SEC Upload") == 0 ||
                strcmp(attack_name, "WiGLE Upload") == 0 ||
+               strcmp(attack_name, "Radar") == 0 ||
                strcmp(attack_name, "Nmap") == 0) {
         // These attacks require exactly one selected network
         int selected_indices[SCAN_RESULTS_MAX_DISPLAY];
@@ -12183,6 +12654,9 @@ static void attack_tile_event_cb(lv_event_t *e)
             lv_obj_set_style_text_color(ok_lbl, ui_text_color(), 0);
             lv_obj_center(ok_lbl);
             lv_obj_add_event_cb(ok_btn, close_popup_overlay_cb, LV_EVENT_CLICKED, NULL);
+        } else if (strcmp(attack_name, "Radar") == 0) {
+            // Radar is passive (no association) — go straight to the scope.
+            show_ap_radar_screen(selected_indices[0]);
         } else {
             // Exactly one network selected - proceed to WiFi Connect screen
             if (strcmp(attack_name, "ARP Poison") == 0) {
@@ -12279,6 +12753,9 @@ static void show_wifi_scan_attack_screen(void)
     }
     
     create_function_page_base(g_redteam_mode ? "WiFi Scan & Attack" : "WiFi Scan & Test");
+    // Gate the status LED to this screen (set AFTER create_function_page_base,
+    // which clears it via reset_function_page_children).
+    scan_attack_screen_active = true;
 
     // Create centered scanning container with icon and text
     lv_obj_t *scan_container = lv_obj_create(function_page);
@@ -14192,7 +14669,7 @@ static void show_rogue_ap_page(void)
     
     create_function_page_base("Rogue AP");
     wifi_attacks_refresh_sd_html_list();
-    
+
     rogue_ap_content = lv_obj_create(function_page);
     lv_obj_set_size(rogue_ap_content, lv_pct(100), LCD_V_RES - 30);
     lv_obj_align(rogue_ap_content, LV_ALIGN_BOTTOM_MID, 0, 0);
@@ -15393,7 +15870,7 @@ static void show_attack_tiles_screen(void)
         create_small_tile(attack_tiles, LV_SYMBOL_WARNING, "Evil Twin", COLOR_MATERIAL_ORANGE, attack_tile_event_cb, "Evil Twin");
         create_small_tile(attack_tiles, LV_SYMBOL_POWER, "SAE", COLOR_MATERIAL_PINK, attack_tile_event_cb, "SAE Overflow");
         create_small_tile(attack_tiles, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, attack_tile_event_cb, "Handshaker");
-        create_small_tile(attack_tiles, LV_SYMBOL_SHUFFLE, "ARP Poison", COLOR_MATERIAL_TEAL, attack_tile_event_cb, "ARP Poison");
+        create_small_tile(attack_tiles, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_TEAL, attack_tile_event_cb, "ARP Poison");
         create_small_tile(attack_tiles, LV_SYMBOL_LOOP, "MITM", lv_color_make(121, 85, 72), attack_tile_event_cb, "MITM");
         create_small_tile(attack_tiles, LV_SYMBOL_WIFI, "Rogue AP", COLOR_MATERIAL_INDIGO, attack_tile_event_cb, "Rogue AP");
     }
@@ -15404,6 +15881,8 @@ static void show_attack_tiles_screen(void)
     // Nmap: connect to the selected network (STA), then scan its LAN
     create_small_tile(attack_tiles, LV_SYMBOL_LIST, "Nmap", COLOR_MATERIAL_INDIGO, attack_tile_event_cb, "Nmap");
     create_small_tile(attack_tiles, LV_SYMBOL_EYE_OPEN, "Observer", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "Sniffer");
+    // Radar: passive single-AP RSSI locator (recon) — always available.
+    create_small_tile(attack_tiles, LV_SYMBOL_GPS, "Radar", COLOR_MATERIAL_BLUE, attack_tile_event_cb, "Radar");
 
     // Horizontal separator line above Selected Networks
     lv_obj_t *separator = lv_obj_create(function_page);
@@ -16669,21 +17148,48 @@ static void show_about_screen(void)
 }
 
 // ---- Time settings ---------------------------------------------------------
-static void time_fmt_toggle_cb(lv_event_t *e)
+// (time_live_label / time_live_timer are declared near the clock globals so the
+// page-teardown in reset_function_page_children can reach them.)
+
+// Format the current local time into buf (respects the 12/24h setting).
+static void time_format_now(char *buf, size_t n)
 {
-    (void)e;
-    g_clock_24h = !g_clock_24h;
+    if (!g_time_valid) { snprintf(buf, n, "time not set"); return; }
+    time_t now = time(NULL);
+    struct tm t;
+    localtime_r(&now, &t);
+    if (g_clock_24h) {
+        snprintf(buf, n, "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+    } else {
+        int h12 = t.tm_hour % 12; if (h12 == 0) h12 = 12;
+        snprintf(buf, n, "%d:%02d:%02d %s", h12, t.tm_min, t.tm_sec, t.tm_hour < 12 ? "AM" : "PM");
+    }
+}
+static void time_live_update(void)
+{
+    if (!time_live_label || !lv_obj_is_valid(time_live_label)) return;
+    char b[64];
+    time_format_now(b, sizeof(b));
+    lv_label_set_text(time_live_label, b);
+}
+static void time_live_timer_cb(lv_timer_t *t) { (void)t; time_live_update(); }
+
+// Time format is now a dropdown (0 = 24-hour, 1 = 12-hour).
+static void time_fmt_dd_cb(lv_event_t *e)
+{
+    uint16_t sel = lv_dropdown_get_selected(lv_event_get_target(e));
+    g_clock_24h = (sel == 0);
     nvs_settings_save_clk_24h(g_clock_24h);
     update_status_clock();
-    show_time_settings_screen();
+    time_live_update();               // reflect the new format immediately
 }
-static void clock_show_toggle_cb(lv_event_t *e)
+// Header clock is now a switch.
+static void clock_show_switch_cb(lv_event_t *e)
 {
-    (void)e;
-    g_clock_show = !g_clock_show;
+    lv_obj_t *sw = lv_event_get_target(e);
+    g_clock_show = lv_obj_has_state(sw, LV_STATE_CHECKED);
     nvs_settings_save_clk_show(g_clock_show);
     update_status_clock();
-    show_time_settings_screen();
 }
 static void time_settings_btn(lv_obj_t *parent, const char *txt, lv_event_cb_t cb)
 {
@@ -16753,9 +17259,37 @@ static void show_time_manual_screen(void)
     struct tm t;
     localtime_r(&now, &t);
 
+    // Header + per-column captions above the rollers.
+    lv_obj_t *hdr = lv_label_create(function_page);
+    lv_label_set_text(hdr, "Set date & time (local)");
+    lv_obj_set_style_text_font(hdr, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hdr, ui_accent_color(), 0);
+    lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 34);
+
+    lv_obj_t *caps = lv_obj_create(function_page);
+    lv_obj_set_size(caps, lv_pct(100), 20);
+    lv_obj_align(caps, LV_ALIGN_TOP_MID, 0, 56);
+    lv_obj_set_style_bg_opa(caps, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(caps, 0, 0);
+    lv_obj_set_style_pad_ver(caps, 0, 0);
+    lv_obj_set_style_pad_hor(caps, 4, 0);
+    lv_obj_set_style_pad_column(caps, 4, 0);
+    lv_obj_set_flex_flow(caps, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(caps, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(caps, LV_OBJ_FLAG_SCROLLABLE);
+    static const char *cap_txt[5] = { "Year", "Mon", "Day", "Hour", "Min" };
+    for (int i = 0; i < 5; i++) {
+        lv_obj_t *c = lv_label_create(caps);
+        lv_label_set_text(c, cap_txt[i]);
+        lv_obj_set_style_text_font(c, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(c, lv_color_make(150, 150, 150), 0);
+        lv_obj_set_flex_grow(c, 1);
+        lv_obj_set_style_text_align(c, LV_TEXT_ALIGN_CENTER, 0);
+    }
+
     lv_obj_t *row = lv_obj_create(function_page);
-    lv_obj_set_size(row, lv_pct(100), LCD_V_RES - 30 - 62);
-    lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_size(row, lv_pct(100), LCD_V_RES - 30 - 62 - 46);
+    lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 78);
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(row, 0, 0);
     lv_obj_set_style_pad_all(row, 4, 0);
@@ -16834,26 +17368,15 @@ static void show_time_settings_screen(void)
     lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_AUTO);
 
-    // Current local time (per selected timezone; DST applied by the zone).
+    // Current local time — live, ticks every second (zone applied, DST automatic).
     char line[64];
-    if (g_time_valid) {
-        time_t now = time(NULL);
-        struct tm t;
-        localtime_r(&now, &t);
-        if (g_clock_24h) {
-            snprintf(line, sizeof(line), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
-        } else {
-            int h12 = t.tm_hour % 12; if (h12 == 0) h12 = 12;
-            snprintf(line, sizeof(line), "%d:%02d:%02d %s", h12, t.tm_min, t.tm_sec,
-                     t.tm_hour < 12 ? "AM" : "PM");
-        }
-    } else {
-        snprintf(line, sizeof(line), "time not set");
-    }
-    lv_obj_t *big = lv_label_create(panel);
-    lv_label_set_text(big, line);
-    lv_obj_set_style_text_font(big, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(big, ui_accent_color(), 0);
+    time_format_now(line, sizeof(line));
+    time_live_label = lv_label_create(panel);
+    lv_label_set_text(time_live_label, line);
+    lv_obj_set_style_text_font(time_live_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(time_live_label, ui_accent_color(), 0);
+    if (time_live_timer) lv_timer_del(time_live_timer);
+    time_live_timer = lv_timer_create(time_live_timer_cb, 1000, NULL);
 
     // Timezone label + dropdown
     lv_obj_t *tz_hdr = lv_label_create(panel);
@@ -16893,11 +17416,40 @@ static void show_time_settings_screen(void)
     lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(note, lv_color_make(150, 150, 150), 0);
 
-    // Toggles
-    time_settings_btn(panel, g_clock_24h ? "Format: 24-hour" : "Format: 12-hour (AM/PM)",
-                      time_fmt_toggle_cb);
-    time_settings_btn(panel, g_clock_show ? "Header clock: Shown" : "Header clock: Hidden",
-                      clock_show_toggle_cb);
+    // Time format: dropdown (24-hour / 12-hour).
+    lv_obj_t *fmt_hdr = lv_label_create(panel);
+    lv_label_set_text(fmt_hdr, "Time format:");
+    lv_obj_set_style_text_font(fmt_hdr, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(fmt_hdr, ui_text_color(), 0);
+
+    lv_obj_t *fmt_dd = lv_dropdown_create(panel);
+    lv_obj_set_width(fmt_dd, lv_pct(100));
+    lv_dropdown_set_options(fmt_dd, "24-hour\n12-hour (AM/PM)");
+    lv_dropdown_set_selected(fmt_dd, g_clock_24h ? 0 : 1);
+    lv_obj_add_event_cb(fmt_dd, time_fmt_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Header clock: switch (label + switch on one row).
+    lv_obj_t *clk_row = lv_obj_create(panel);
+    lv_obj_set_width(clk_row, lv_pct(100));
+    lv_obj_set_height(clk_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(clk_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(clk_row, 0, 0);
+    lv_obj_set_style_pad_all(clk_row, 0, 0);
+    lv_obj_set_flex_flow(clk_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(clk_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(clk_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *clk_lbl = lv_label_create(clk_row);
+    lv_label_set_text(clk_lbl, "Header clock");
+    lv_obj_set_style_text_font(clk_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(clk_lbl, ui_text_color(), 0);
+
+    lv_obj_t *clk_sw = lv_switch_create(clk_row);
+    if (g_clock_show) lv_obj_add_state(clk_sw, LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(clk_sw, ui_accent_color(), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_add_event_cb(clk_sw, clock_show_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Set time manually stays a button.
     time_settings_btn(panel, LV_SYMBOL_EDIT " Set time manually", time_manual_open_cb);
 }
 
@@ -17040,7 +17592,12 @@ static void show_bt_locator_screen(void)
     lv_obj_set_style_text_font(bt_locator_mac_label, &lv_font_montserrat_16, 0);
     lv_obj_align(bt_locator_mac_label, LV_ALIGN_CENTER, 0, 20);
     lv_obj_add_flag(bt_locator_mac_label, LV_OBJ_FLAG_HIDDEN);
-    
+
+    // Shared finder-sound toggle (proximity beeps). Hidden until a device is picked.
+    bt_locator_snd_btn = make_finder_sound_toggle(bt_locator_content);
+    lv_obj_align(bt_locator_snd_btn, LV_ALIGN_TOP_RIGHT, -4, 4);
+    lv_obj_add_flag(bt_locator_snd_btn, LV_OBJ_FLAG_HIDDEN);
+
     // Red Exit button at bottom (like AirTag scanner)
     bt_locator_exit_btn = lv_btn_create(function_page);
     lv_obj_set_size(bt_locator_exit_btn, 120, 55);
@@ -19467,13 +20024,27 @@ static void bt_locator_tracking_task(void *pvParameters)
             break;
         }
         
-        // Scan for 10 seconds, updating RSSI display periodically
+        // Scan for 10 seconds, updating RSSI display periodically and emitting a
+        // hot/cold proximity beep whose rate + pitch rise as the signal gets stronger.
+        uint32_t beep_acc = 0;   // ms since last beep
         for (int i = 0; i < 100 && bt_locator_tracking_active && bt_locator_ui_active; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
-            
+            beep_acc += 100;
+
             // Update UI every 500ms if device found
             if (i % 5 == 0 && bt_tracking_found) {
                 bt_locator_needs_ui_update = true;
+            }
+
+            // Proximity beep (gated by the shared finder-sound toggle)
+            if (bt_tracking_found && g_finder_sound) {
+                int lvl = finder_level_from_rssi(bt_tracking_rssi);
+                if (beep_acc >= finder_interval_for_level(lvl)) {
+                    sfx_play_finder(finder_tone_for_level(lvl));
+                    beep_acc = 0;
+                }
+            } else {
+                beep_acc = 0;   // no target seen this cycle — hold off
             }
         }
         
@@ -19530,8 +20101,9 @@ static void bt_locator_exit_cb(lv_event_t *e)
     bt_locator_rssi_label = NULL;
     bt_locator_mac_label = NULL;
     bt_locator_exit_btn = NULL;
+    bt_locator_snd_btn = NULL;
     bt_locator_content = NULL;
-    
+
     // Switch back to WiFi mode
     if (current_radio_mode == RADIO_MODE_BLE) {
         bt_nimble_deinit();
@@ -19592,7 +20164,10 @@ static void bt_locator_device_selected_cb(lv_event_t *e)
         lv_label_set_text(bt_locator_mac_label, mac_text);
         lv_obj_clear_flag(bt_locator_mac_label, LV_OBJ_FLAG_HIDDEN);
     }
-    
+    if (bt_locator_snd_btn) {
+        lv_obj_clear_flag(bt_locator_snd_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+
     // Hide status label and header when tracking
     if (bt_locator_status_label) {
         lv_obj_add_flag(bt_locator_status_label, LV_OBJ_FLAG_HIDDEN);
@@ -20054,9 +20629,17 @@ static void feature_led_update(void)
     else if (ble_scan_ui_active || bt_scan_active ||
              airtag_scan_ui_active || bt_locator_tracking_active)
                                                         { r = 40; g = 0;  b = 80; } // purple — Bluetooth scanning
-    // ── WiFi AP scanning (blue) ──────────────────────────────────────────
-    else if (wifi_scanner_is_scanning())                { r = 0;  g = 0;  b = 80; } // blue — scanning for APs
+    // ── WiFi Scan & Attack screen: scanning → passive sniff → done ───────
+    // All gated on the screen flag so the LED goes dark the instant we leave,
+    // even if a background scan is still finishing.
+    else if (scan_attack_screen_active && wifi_scanner_is_scanning())
+                                                        { r = 0;  g = 0;  b = 80; } // blue — active AP scan
+    else if (scan_attack_screen_active && inspect_active)
+                                                        { r = 0;  g = 60; b = 60; } // teal — passive results sniff
+    else if (scan_attack_screen_active)                 { r = 0;  g = 50; b = 0;  } // green — scan done, results up
     // ── Idle (off) ───────────────────────────────────────────────────────
+    // (No ungated wifi_scanner_is_scanning() branch: a background scan finishing
+    //  after we leave the screen must not relight the LED.)
     else                                                { r = 0;  g = 0;  b = 0;  }
 
     if (r != last_r || g != last_g || b != last_b) {
