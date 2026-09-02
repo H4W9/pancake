@@ -512,15 +512,21 @@ static void inspect_beacon_cb(void *buf, wifi_promiscuous_pkt_type_t type)
         if (id == 48 && len >= 2) {                         // RSN IE
             int q = 0;
             do {
-                if ((int)len < q + 2) break; q += 2;        // version
-                if ((int)len < q + 4) break; q += 4;        // group cipher
-                if ((int)len < q + 2) break;
-                uint16_t pw = (uint16_t)d[q] | ((uint16_t)d[q + 1] << 8); q += 2;
-                if ((int)len < q + pw * 4) break; q += pw * 4;
-                if ((int)len < q + 2) break;
-                uint16_t akm = (uint16_t)d[q] | ((uint16_t)d[q + 1] << 8); q += 2;
-                if ((int)len < q + akm * 4) break; q += akm * 4;
-                if ((int)len < q + 2) break;
+                if ((int)len < q + 2) break;                // version
+                q += 2;
+                if ((int)len < q + 4) break;                // group cipher
+                q += 4;
+                if ((int)len < q + 2) break;                // pairwise count
+                uint16_t pw = (uint16_t)d[q] | ((uint16_t)d[q + 1] << 8);
+                q += 2;
+                if ((int)len < q + pw * 4) break;
+                q += pw * 4;
+                if ((int)len < q + 2) break;                // AKM count
+                uint16_t akm = (uint16_t)d[q] | ((uint16_t)d[q + 1] << 8);
+                q += 2;
+                if ((int)len < q + akm * 4) break;
+                q += akm * 4;
+                if ((int)len < q + 2) break;                // RSN capabilities
                 uint16_t cap = (uint16_t)d[q] | ((uint16_t)d[q + 1] << 8);
                 mfpr = (cap & (1u << 6)) != 0;
                 mfpc = (cap & (1u << 7)) != 0;
