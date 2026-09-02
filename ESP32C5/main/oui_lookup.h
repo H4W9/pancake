@@ -3,11 +3,11 @@
 #include <stdbool.h>
 #include "esp_err.h"
 
-/* Binary file format: magic "OUI1" + uint32_t count (LE) + N × 32-byte entries.
- * Each entry: uint8_t oui[3] (big-endian, standard notation) + char name[29].
- * Entries must be sorted ascending by oui for binary search.
- * Generate with tools/oui_convert.py from IEEE OUI CSV. */
-#define OUI_DEFAULT_PATH  "/sdcard/lab/ouilist.bin"
+/* On-disk format = ProjectZero's oui_wifi.bin: a header-less array of 64-byte
+ * records, each { uint8_t oui[3]; uint8_t name_len; char name[60] }, sorted
+ * ascending by oui for binary search. (This is the file ProjectZero ships in
+ * binaries-esp32c5/oui_wifi.bin.) */
+#define OUI_DEFAULT_PATH  "/sdcard/lab/oui_wifi.bin"
 
 /* Load OUI database from bin_path into PSRAM.
  * Returns ESP_OK on success, ESP_ERR_NOT_FOUND if file absent. */

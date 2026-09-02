@@ -4096,7 +4096,14 @@ void app_main(void)
         sd_cache_load_all();
         xSemaphoreGive(sd_spi_mutex);
     }
-    
+
+    // Load the OUI vendor database now that the SD is mounted. The lazy path in
+    // ensure_sd_mounted() only runs when the card wasn't already mounted, so the
+    // boot mount must load it here or vendor lookups always return NULL.
+    if (!oui_lookup_is_loaded()) {
+        oui_lookup_init(OUI_DEFAULT_PATH);
+    }
+
     // Hide popup
     hide_sd_loading_popup();
     

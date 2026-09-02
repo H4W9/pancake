@@ -6,7 +6,8 @@
 
 static const char *TAG = "oui_lookup";
 
-#define OUI_ENTRY_SIZE 32  /* oui[3] + name[29] */
+#define OUI_ENTRY_SIZE      32  /* in-RAM: oui[3] + name[29] (name truncated for display) */
+#define OUI_SRC_RECORD_SIZE 64  /* on-disk (oui_wifi.bin): oui[3] + name_len[1] + name[60] */
 
 typedef struct __attribute__((packed)) {
     uint8_t oui[3];
@@ -28,33 +29,53 @@ esp_err_t oui_lookup_init(const char *bin_path)
         return ESP_ERR_NOT_FOUND;
     }
 
-    char magic[4];
-    uint32_t count = 0;
-    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "OUI1", 4) != 0 ||
-        fread(&count, 4, 1, f) != 1 || count == 0) {
-        ESP_LOGE(TAG, "Bad header in %s", bin_path);
+    // Size the file: header-less array of 64-byte records.
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return ESP_FAIL; }
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize < OUI_SRC_RECORD_SIZE) {
+        ESP_LOGE(TAG, "Too small / bad OUI file: %s (%ld bytes)", bin_path, fsize);
         fclose(f);
         return ESP_ERR_INVALID_ARG;
     }
+    uint32_t count = (uint32_t)(fsize / OUI_SRC_RECORD_SIZE);
 
-    size_t bytes = (size_t)count * OUI_ENTRY_SIZE;
-    s_table = (oui_entry_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
-    if (!s_table) {
-        ESP_LOGE(TAG, "PSRAM alloc failed (%u bytes)", (unsigned)bytes);
+    // Slurp the whole file into a temporary PSRAM buffer, then repack the
+    // length-prefixed 64-byte records into our compact 32-byte in-RAM entries.
+    uint8_t *raw = (uint8_t *)heap_caps_malloc((size_t)fsize, MALLOC_CAP_SPIRAM);
+    s_table = (oui_entry_t *)heap_caps_malloc((size_t)count * OUI_ENTRY_SIZE, MALLOC_CAP_SPIRAM);
+    if (!raw || !s_table) {
+        ESP_LOGE(TAG, "PSRAM alloc failed (raw=%p table=%p)", (void *)raw, (void *)s_table);
+        if (raw) free(raw);
+        if (s_table) { free(s_table); s_table = NULL; }
         fclose(f);
         return ESP_ERR_NO_MEM;
     }
-
-    if (fread(s_table, OUI_ENTRY_SIZE, count, f) != count) {
-        ESP_LOGE(TAG, "Short read from %s", bin_path);
+    size_t got = fread(raw, 1, (size_t)fsize, f);
+    fclose(f);
+    if (got != (size_t)fsize) {
+        ESP_LOGE(TAG, "Short read from %s (%u/%ld)", bin_path, (unsigned)got, fsize);
+        free(raw);
         free(s_table);
         s_table = NULL;
-        fclose(f);
         return ESP_FAIL;
     }
-    fclose(f);
+
+    const size_t name_cap = sizeof(s_table[0].name) - 1;   // 28 usable chars
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *rec = raw + (size_t)i * OUI_SRC_RECORD_SIZE;
+        s_table[i].oui[0] = rec[0];
+        s_table[i].oui[1] = rec[1];
+        s_table[i].oui[2] = rec[2];
+        uint8_t nlen = rec[3];
+        if (nlen > name_cap) nlen = (uint8_t)name_cap;
+        memcpy(s_table[i].name, &rec[4], nlen);
+        s_table[i].name[nlen] = '\0';
+    }
+    free(raw);
+
     s_count = count;
-    ESP_LOGI(TAG, "Loaded %u OUI entries from %s", count, bin_path);
+    ESP_LOGI(TAG, "Loaded %u OUI entries from %s", (unsigned)count, bin_path);
     return ESP_OK;
 }
 
