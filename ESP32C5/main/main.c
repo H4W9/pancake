@@ -1978,6 +1978,7 @@ static void show_mitm_page(void);
 // Rogue GITM (Capture Gateway) — routed STA↔SoftAP NAPT gateway + pcap capture.
 // (gitm_stop is forward-declared earlier, above reset_function_page_children.)
 static void show_gitm_page(void);
+static bool upload_wait_for_sta_ip(int timeout_ms);   // shared STA DHCP wait (defined below)
 static void stop_arp_ban(void);
 
 // WPA-SEC upload helpers
@@ -14892,18 +14893,21 @@ static void show_gitm_page(void)
         return;
     }
 
-    // Wait briefly for the STA uplink to still hold an IPv4 after the mode switch.
-    esp_netif_ip_info_t sta_ip = {0};
-    for (int i = 0; i < 20; i++) {
-        if (esp_netif_get_ip_info(sta_netif, &sta_ip) == ESP_OK && sta_ip.ip.addr != 0) break;
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    if (sta_ip.ip.addr == 0) {
-        lv_label_set_text(gitm_status_label, "No uplink IP — reconnect and retry");
+    // Wait for the STA uplink to actually hold an IPv4. The connect screen proceeds
+    // on association (STA_CONNECTED), which fires before DHCP finishes, and the
+    // APSTA switch can re-run DHCP — so wait up to 12s, the same helper WiGLE /
+    // WPA-SEC / Nmap use. Blocking, but the status line shows why.
+    lv_label_set_text(gitm_status_label, "Waiting for uplink IP...");
+    lv_obj_set_style_text_color(gitm_status_label, COLOR_MATERIAL_ORANGE, 0);
+    lv_refr_now(NULL);
+    if (!upload_wait_for_sta_ip(12000)) {
+        lv_label_set_text(gitm_status_label, "No uplink IP - check network/password");
         lv_obj_set_style_text_color(gitm_status_label, COLOR_MATERIAL_RED, 0);
         esp_wifi_set_mode(WIFI_MODE_STA);
         return;
     }
+    esp_netif_ip_info_t sta_ip = {0};
+    esp_netif_get_ip_info(sta_netif, &sta_ip);   // for the log line below
 
     // Mirror the uplink SSID/password on our SoftAP and route via NAPT.
     capture_gateway_config_t cfg = {
@@ -14939,7 +14943,7 @@ static void show_gitm_page(void)
     if (gitm_info_label) {
         if (victims > 0)
             lv_label_set_text_fmt(gitm_info_label,
-                "Rogue overlay ON — deauthing %d AP(s) on ch %u. Clients of the mirrored SSID roam onto us; all are routed (NAPT) + recorded.",
+                "Rogue overlay ON - deauthing %d AP(s) on ch %u. Clients of the mirrored SSID roam onto us; all are routed (NAPT) + recorded.",
                 victims, wifi_connect_channel);
         else
             lv_label_set_text(gitm_info_label,
