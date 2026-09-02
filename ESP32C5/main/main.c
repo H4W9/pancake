@@ -866,7 +866,8 @@ typedef struct {
     wifi_auth_mode_t authmode;
     int rssi;
     bool captured_m1, captured_m2, captured_m3, captured_m4;
-    bool complete;
+    bool complete;   // crackable pair captured: (M1&&M2) || (M2&&M3)  [Porkchop criterion]
+    bool full;       // all four EAPOL messages captured (M1..M4)
     bool beacon_captured;
     bool has_existing_file;
     int64_t last_deauth_us;
@@ -7603,6 +7604,7 @@ static int hs_add_or_update_ap(const uint8_t *bssid, const char *ssid, uint8_t c
     hs_ap_targets[idx].captured_m3 = false;
     hs_ap_targets[idx].captured_m4 = false;
     hs_ap_targets[idx].complete = false;
+    hs_ap_targets[idx].full = false;
     hs_ap_targets[idx].beacon_captured = false;
     hs_ap_targets[idx].last_deauth_us = 0;
     hs_ap_targets[idx].last_seen_us = esp_timer_get_time();
@@ -7935,10 +7937,21 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
         pcap_serializer_append_frame(frame, len, pkt->rx_ctrl.timestamp);
         hccapx_serializer_add_frame(data_frame);
 
-        if (ap->captured_m1 && ap->captured_m2 && ap->captured_m3 && ap->captured_m4) {
+        // Crackable as soon as we have a valid pair: M2 (client SNonce+MIC) with
+        // an ANonce message (M1 or M3). Requiring all four (Marauder/projectZero
+        // style) misses handshakes whose M4 is never seen. All-four is still
+        // tracked as `full` for the quality indicator. (Mirrors Porkchop's
+        // hasValidPair() completion.)
+        bool valid_pair = (ap->captured_m1 && ap->captured_m2) ||
+                          (ap->captured_m2 && ap->captured_m3);
+        ap->full = ap->captured_m1 && ap->captured_m2 && ap->captured_m3 && ap->captured_m4;
+        if (valid_pair && !ap->complete) {
             ap->complete = true;
             hs_ui_update_flag = true;
-            ESP_LOGI(TAG, "Handshake captured for '%s' - all 4 EAPOL messages!", ap->ssid);
+            ESP_LOGI(TAG, "Handshake captured for '%s' - valid EAPOL pair%s!",
+                     ap->ssid, ap->full ? " (full M1-M4)" : "");
+        } else if (ap->full) {
+            hs_ui_update_flag = true;
         }
     }
 }
@@ -8168,13 +8181,12 @@ static void handshake_attack_task_selected(void) {
     if (hs_ap_targets) memset(hs_ap_targets, 0, HS_MAX_APS * sizeof(hs_ap_target_t));
     if (hs_clients) memset(hs_clients, 0, HS_MAX_CLIENTS * sizeof(hs_client_entry_t));
 
+    // Targeted mode: the user explicitly selected these networks, so always
+    // (re)attack them — do NOT auto-skip ones that already have a PCAP on the SD
+    // (that skip is why a targeted run finished instantly once a network had been
+    // captured before). The auto-skip still applies in global/sniffer mode.
     for (int i = 0; i < handshake_target_count && i < HS_MAX_APS; i++) {
         wifi_ap_record_t *ap = &handshake_targets[i];
-        if (ap->ssid[0] != '\0' && check_handshake_file_exists((const char *)ap->ssid)) {
-            handshake_captured[i] = true;
-            ESP_LOGI(TAG, "[HS] Skipping '%s' - PCAP already exists", ap->ssid);
-            continue;
-        }
         int idx = hs_add_or_update_ap(ap->bssid, (const char *)ap->ssid,
                                        ap->primary,
                                        ap->authmode, ap->rssi);
