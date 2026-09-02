@@ -50,6 +50,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/time.h>
+#include "esp_netif_sntp.h"
 #include "esp_rom_sys.h"
 #include "esp_task_wdt.h"
 #include "nvs_flash.h"
@@ -233,6 +235,14 @@ static uint8_t  wd_mem_cap_mb        = 4;     // max PSRAM (MB) the wardrive buf
 static uint16_t antisurv_sens_m      = 100;   // anti-surv "following" alert distance (m)
 static bool     wd_home_upload       = false; // auto-upload on home network (default OFF)
 static bool     g_sound_enabled       = true;  // buzzer UI sounds (boot/clicks/menus)
+// RTC / clock state (DS3231 + GPS/NTP time). See the DS3231 block for the driver.
+static bool          g_rtc_present    = false;
+static volatile bool g_time_valid     = false;
+static char          g_time_source[8] = "none";  // "none" | "RTC" | "GPS" | "NTP"
+static bool          g_clock_24h      = true;     // NVS-backed (12/24h status clock)
+static bool          g_clock_show     = true;     // NVS-backed (show clock in header)
+static uint8_t       g_tz_index       = 0;        // NVS-backed timezone index (0 = UTC)
+static lv_obj_t     *clock_label      = NULL;     // status-bar clock (main header)
 static lv_obj_t *wd_rssi_val_label   = NULL;  // Wardrive Settings slider value label
 
 static inline lv_color_t ui_bg_color(void) {
@@ -325,6 +335,9 @@ static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel 
 #define NVS_KEY_ANTISURV_M  "antisurv_m"
 #define NVS_KEY_WD_HOMEUP   "wd_homeup"
 #define NVS_KEY_SOUND       "sound_en"
+#define NVS_KEY_CLK_24H     "clk_24h"
+#define NVS_KEY_CLK_SHOW    "clk_show"
+#define NVS_KEY_TZ          "tz_index"
 
 // ============================================================================
 // Theme-aware style helpers
@@ -399,6 +412,10 @@ static void screenshot_btn_event_cb(lv_event_t *e);
 static esp_err_t init_max17048(void);
 static uint8_t read_max17048_percent(void);
 static void battery_monitor_task(void *arg);
+// RTC / system time (DS3231 + GPS/NTP)
+static void time_init(void);
+static void update_status_clock(void);
+static void time_apply_utc_tm(const struct tm *utc, const char *source, bool write_rtc);
 static esp_err_t save_snapshot_bmp(lv_img_dsc_t *shot, const char *filepath);
 static int find_next_screenshot_index(void);
 static esp_err_t ensure_screenshot_dir(void);
@@ -543,46 +560,67 @@ static void inspect_beacon_cb(void *buf, wifi_promiscuous_pkt_type_t type)
 static void inspect_task(void *arg)
 {
     (void)arg;
-    for (int i = 0; i < inspect_count && inspect_active; i++) {
-        memset((void *)&g_inspect, 0, sizeof(g_inspect));
-        memcpy((void *)g_inspect.bssid, inspect_bssid[i], 6);
-        esp_wifi_set_channel(inspect_chan[i], WIFI_SECOND_CHAN_NONE);
-        esp_wifi_set_promiscuous_rx_cb(inspect_beacon_cb);
-        esp_wifi_set_promiscuous(true);
-        g_inspect.active = true;
-        for (int w = 0; w < 24 && inspect_active && g_inspect.beacons_seen == 0; w++) {
-            vTaskDelay(pdMS_TO_TICKS(50));   // up to ~1.2 s per AP
-        }
-        g_inspect.active = false;
-        if (!inspect_active) break;          // cancelled: leave the radio to the next owner
-        esp_wifi_set_promiscuous(false);
+    bool resolved[SCAN_RESULTS_MAX_DISPLAY];
+    memset(resolved, 0, sizeof(resolved));
 
-        // Build the detail line: vendor (OUI) + MFP + uptime.
-        const uint8_t *b = inspect_bssid[i];
-        uint8_t oui3[3] = { b[0], b[1], b[2] };
-        const char *vendor = oui_lookup(oui3);
-        char detail[110];
-        if (g_inspect.beacons_seen == 0) {
-            snprintf(detail, sizeof(detail), "%.24s", vendor ? vendor : "unknown vendor");
-        } else {
-            uint64_t s = g_inspect.tsf_us / 1000000ULL;
-            const char *mfp = g_inspect.mfp_required ? "req" : (g_inspect.mfp_capable ? "opt" : "no");
-            snprintf(detail, sizeof(detail), "%.24s   MFP:%s   up %llud %02u:%02u",
-                     vendor ? vendor : "unknown", mfp,
-                     (unsigned long long)(s / 86400ULL),
-                     (unsigned)((s % 86400ULL) / 3600ULL),
-                     (unsigned)((s % 3600ULL) / 60ULL));
-        }
+    // Keep sweeping the list, re-sniffing any AP that hasn't yielded a beacon
+    // yet, until every AP is resolved (or the screen is left). MFP shows "?"
+    // until that AP's beacon lands, then updates live to req/opt/no + uptime.
+    while (inspect_active) {
+        int unresolved = 0;
+        for (int i = 0; i < inspect_count && inspect_active; i++) {
+            if (resolved[i]) continue;
 
-        if (inspect_active && lvgl_mutex &&
-            xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            if (inspect_active && lv_obj_is_valid(inspect_labels[i])) {
-                lv_label_set_text(inspect_labels[i], detail);
+            memset((void *)&g_inspect, 0, sizeof(g_inspect));
+            memcpy((void *)g_inspect.bssid, inspect_bssid[i], 6);
+            esp_wifi_set_channel(inspect_chan[i], WIFI_SECOND_CHAN_NONE);
+            esp_wifi_set_promiscuous_rx_cb(inspect_beacon_cb);
+            esp_wifi_set_promiscuous(true);
+            g_inspect.active = true;
+            for (int w = 0; w < 16 && inspect_active && g_inspect.beacons_seen == 0; w++) {
+                vTaskDelay(pdMS_TO_TICKS(50));   // up to ~0.8 s per AP per sweep
             }
-            xSemaphoreGive(lvgl_mutex);
+            g_inspect.active = false;
+            if (!inspect_active) break;          // cancelled: leave the radio to the next owner
+            esp_wifi_set_promiscuous(false);
+
+            const uint8_t *b = inspect_bssid[i];
+            uint8_t oui3[3] = { b[0], b[1], b[2] };
+            const char *vendor = oui_lookup(oui3);
+            char detail[140];
+            if (g_inspect.beacons_seen == 0) {
+                // Not seen yet — keep the "?" and retry on the next sweep.
+                snprintf(detail, sizeof(detail), "%.20s  |  MFP:#888888 ?#",
+                         vendor ? vendor : "unknown");
+                unresolved++;
+            } else {
+                uint64_t s = g_inspect.tsf_us / 1000000ULL;
+                // MFP color: required = green (deauth-immune), optional = amber,
+                // none = red (deauth-able). req/opt = "on", no = "off".
+                const char *mfp = g_inspect.mfp_required ? "req" : (g_inspect.mfp_capable ? "opt" : "no");
+                const char *mfp_col = g_inspect.mfp_required ? "#55DD55"
+                                    : (g_inspect.mfp_capable ? "#FFAA00" : "#FF5555");
+                snprintf(detail, sizeof(detail), "%.20s  |  MFP:%s %s#  |  up %llud %02u:%02u",
+                         vendor ? vendor : "unknown", mfp_col, mfp,
+                         (unsigned long long)(s / 86400ULL),
+                         (unsigned)((s % 86400ULL) / 3600ULL),
+                         (unsigned)((s % 3600ULL) / 60ULL));
+                resolved[i] = true;
+            }
+
+            if (inspect_active && lvgl_mutex &&
+                xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                if (inspect_active && lv_obj_is_valid(inspect_labels[i])) {
+                    lv_label_set_text(inspect_labels[i], detail);
+                }
+                xSemaphoreGive(lvgl_mutex);
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        if (!inspect_active || unresolved == 0) break;   // done (or cancelled)
+        vTaskDelay(pdMS_TO_TICKS(500));                  // brief pause before the next sweep
     }
+    if (inspect_active) esp_wifi_set_promiscuous(false);
     inspect_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -673,6 +711,7 @@ void sd_cache_add_handshake_name(const char *name);
 
 static lv_obj_t *scan_status_label = NULL;
 static lv_obj_t *scan_list = NULL;
+static lv_obj_t *scan_next_btn = NULL;  // "Next" btn on the scan results; disabled until >=1 AP selected
 static lv_obj_t *deauth_list = NULL;
 static lv_obj_t *deauth_prompt_label = NULL;
 static lv_obj_t *deauth_fps_label = NULL;
@@ -1503,6 +1542,7 @@ static void attack_tile_event_cb(lv_event_t *e);
 static void update_sniffer_button_ui(void);
 static void show_settings_screen(void);
 static void show_about_screen(void);
+static void show_time_settings_screen(void);
 static void show_spectrum_screen(void);
 static void settings_tile_event_cb(lv_event_t *e);
 // Scrollable tiles container of the settings screen + a pending scroll offset
@@ -1513,6 +1553,7 @@ static lv_coord_t settings_pending_scroll_y = 0;
 static void show_wardrive_settings_screen(void);
 static void home_btn_event_cb(lv_event_t *e);
 static void wifi_scan_next_btn_cb(lv_event_t *e);
+static void wifi_scan_rescan_btn_cb(lv_event_t *e);
 static void deauth_quit_event_cb(lv_event_t *e);
 static void deauth_rescan_timer_stop(void);
 static void set_screenshot_buttons_disabled(bool disabled);
@@ -1526,6 +1567,7 @@ static void wp_teardown(void);
 static void reset_function_page_children(void) {
     scan_status_label = NULL;
     scan_list = NULL;
+    scan_next_btn = NULL;
     deauth_list = NULL;
     deauth_prompt_label = NULL;
     deauth_fps_label = NULL;
@@ -1994,12 +2036,28 @@ static void wifi_scan_done_cb(void *arg, esp_event_base_t event_base, int32_t ev
     lv_async_call(sniffer_ui_async_cb, NULL);
 }
 
+// Enable/gray the scan "Next" button based on whether any AP is selected.
+static void scan_update_next_state(void)
+{
+    if (!scan_next_btn || !lv_obj_is_valid(scan_next_btn)) return;
+    int idx[SCAN_RESULTS_MAX_DISPLAY];
+    bool any = wifi_scanner_get_selected(idx, SCAN_RESULTS_MAX_DISPLAY) > 0;
+    if (any) {
+        lv_obj_clear_state(scan_next_btn, LV_STATE_DISABLED);
+        lv_obj_add_flag(scan_next_btn, LV_OBJ_FLAG_CLICKABLE);
+    } else {
+        lv_obj_add_state(scan_next_btn, LV_STATE_DISABLED);
+        lv_obj_clear_flag(scan_next_btn, LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
 static void scan_checkbox_event_cb(lv_event_t *e)
 {
     lv_obj_t *cb = lv_event_get_target(e);
     int index = (int)(intptr_t)lv_event_get_user_data(e);
     bool checked = lv_obj_has_state(cb, LV_STATE_CHECKED);
     wifi_scanner_select_network(index, checked);
+    scan_update_next_state();
 }
 
 static int dual_vprintf(const char *fmt, va_list ap)
@@ -2502,6 +2560,9 @@ static void nvs_settings_load(void)
         if (nvs_get_u16(h, NVS_KEY_ANTISURV_M, &u16v) == ESP_OK && u16v > 0) antisurv_sens_m = u16v;
         if (nvs_get_u8(h, NVS_KEY_WD_HOMEUP, &u8v) == ESP_OK)  wd_home_upload = (u8v != 0);
         if (nvs_get_u8(h, NVS_KEY_SOUND, &u8v) == ESP_OK)      g_sound_enabled = (u8v != 0);
+        if (nvs_get_u8(h, NVS_KEY_CLK_24H, &u8v) == ESP_OK)    g_clock_24h = (u8v != 0);
+        if (nvs_get_u8(h, NVS_KEY_CLK_SHOW, &u8v) == ESP_OK)   g_clock_show = (u8v != 0);
+        if (nvs_get_u8(h, NVS_KEY_TZ, &u8v) == ESP_OK)         g_tz_index = u8v;
         nvs_close(h);
         ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d",
                  (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms,
@@ -2557,6 +2618,9 @@ static void nvs_writer_task(void *arg)
             case 10: nvs_set_u16(h, NVS_KEY_ANTISURV_M, (uint16_t)req.a); break;
             case 11: nvs_set_u8(h, NVS_KEY_WD_HOMEUP, req.a ? 1 : 0); break;
             case 12: nvs_set_u8(h, NVS_KEY_SOUND, req.a ? 1 : 0); break;
+            case 13: nvs_set_u8(h, NVS_KEY_CLK_24H, req.a ? 1 : 0); break;
+            case 14: nvs_set_u8(h, NVS_KEY_CLK_SHOW, req.a ? 1 : 0); break;
+            case 15: nvs_set_u8(h, NVS_KEY_TZ, (uint8_t)req.a); break;
             default: nvs_close(h); continue;
         }
         nvs_commit(h);
@@ -2586,6 +2650,9 @@ static void nvs_settings_save_wd_memcap(uint8_t mb)                  { nvs_save_
 static void nvs_settings_save_antisurv_m(uint16_t m)                { nvs_save_enqueue(10, m, 0); }
 static void nvs_settings_save_home_upload(bool enabled)             { nvs_save_enqueue(11, enabled ? 1 : 0, 0); }
 static void nvs_settings_save_sound(bool enabled)                   { nvs_save_enqueue(12, enabled ? 1 : 0, 0); }
+static void nvs_settings_save_clk_24h(bool enabled)                 { nvs_save_enqueue(13, enabled ? 1 : 0, 0); }
+static void nvs_settings_save_clk_show(bool enabled)                { nvs_save_enqueue(14, enabled ? 1 : 0, 0); }
+static void nvs_settings_save_tz(uint8_t idx)                       { nvs_save_enqueue(15, idx, 0); }
 
 // ============================================================================
 // UI Sound Effects — passive buzzer on GPIO6 driven by LEDC square-wave tones.
@@ -3730,12 +3797,21 @@ static void create_home_ui(void)
     lv_obj_set_style_radius(title_bar, 0, 0);
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);
 
+    // Header: "LAB5" on the left, clock in the middle, battery on the right.
     lv_obj_t *title_label = lv_label_create(title_bar);
-    lv_label_set_text(title_label, "Laboratorium");
+    lv_label_set_text(title_label, "LAB5");
     lv_obj_set_style_text_color(title_label, ui_text_color(), 0);
-    lv_obj_center(title_label);
+    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_16, 0);
+    lv_obj_align(title_label, LV_ALIGN_LEFT_MID, 8, 0);
     lv_obj_add_flag(title_label, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(title_label, screenshot_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    clock_label = lv_label_create(title_bar);
+    lv_label_set_text(clock_label, "--:--");
+    lv_obj_set_style_text_color(clock_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(clock_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(clock_label, LV_ALIGN_CENTER, 0, 0);
+    update_status_clock();
 
     battery_label = lv_label_create(title_bar);
     main_battery_label = battery_label;   // persistent; rebind to it on return to menu
@@ -4132,6 +4208,9 @@ void app_main(void)
     } else {
         ESP_LOGE(TAG, "Failed to allocate battery task stack from PSRAM");
     }
+
+    // DS3231 RTC + system clock (seed from RTC now; GPS/NTP correct it later).
+    time_init();
 
     // Now it's safe to make noise: play the boot chime.
     sfx_play(SND_BOOT);
@@ -4844,9 +4923,9 @@ static void display_refresh_task(void *pvParameters)
                                     const char *band_col = (records[i].primary <= 14) ? "#FFAA33" : "#CC66FF";
                                     const char *rssi_col = records[i].rssi > -50 ? "#55DD55"
                                                          : (records[i].rssi > -70 ? "#FFAA00" : "#FF5555");
-                                    char info_buf[176];
+                                    char info_buf[200];
                                     snprintf(info_buf, sizeof(info_buf),
-                                        "#5599FF %02X:%02X:%02X:%02X:%02X:%02X#  #5599FF CH%d#  %s %s#  %s %s#  %s %ddBm#",
+                                        "#5599FF %02X:%02X:%02X:%02X:%02X:%02X#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %ddBm#",
                                         records[i].bssid[0], records[i].bssid[1], records[i].bssid[2],
                                         records[i].bssid[3], records[i].bssid[4], records[i].bssid[5],
                                         records[i].primary,
@@ -4863,11 +4942,14 @@ static void display_refresh_task(void *pvParameters)
                                 // a beacon from this AP.
                                 lv_obj_t *detail_lbl = lv_label_create(text_cont);
                                 if (detail_lbl) {
+                                    lv_label_set_recolor(detail_lbl, true);   // MFP is color-coded
                                     lv_label_set_long_mode(detail_lbl, LV_LABEL_LONG_DOT);
                                     lv_obj_set_width(detail_lbl, lv_pct(100));
                                     uint8_t oui3[3] = { records[i].bssid[0], records[i].bssid[1], records[i].bssid[2] };
                                     const char *vendor = oui_lookup(oui3);
-                                    lv_label_set_text(detail_lbl, vendor ? vendor : "");
+                                    char d0[64];
+                                    snprintf(d0, sizeof(d0), "%.20s  |  MFP:#888888 ?#", vendor ? vendor : "unknown");
+                                    lv_label_set_text(detail_lbl, d0);
                                     lv_obj_set_style_text_font(detail_lbl, &lv_font_montserrat_12, 0);
                                     lv_obj_set_style_text_color(detail_lbl, lv_color_make(110, 110, 110), 0);
                                     if (inspect_count < SCAN_RESULTS_MAX_DISPLAY) {
@@ -4900,12 +4982,31 @@ static void display_refresh_task(void *pvParameters)
                 lv_obj_set_size(scan_list, lv_pct(100), LCD_V_RES - 30 - 50);
                 lv_obj_align(scan_list, LV_ALIGN_TOP_MID, 0, 30);
                 
-                // Add "Next" button at the bottom - Material Blue
+                // Bottom row: Rescan (left) + Next (right), Tab5-style.
+                lv_obj_t *rescan_btn = lv_btn_create(function_page);
+                lv_obj_set_size(rescan_btn, lv_pct(36), 45);
+                lv_obj_align(rescan_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+                lv_obj_set_style_bg_color(rescan_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+                lv_obj_set_style_bg_color(rescan_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
+                lv_obj_set_style_border_width(rescan_btn, 0, 0);
+                lv_obj_set_style_radius(rescan_btn, 8, 0);
+                lv_obj_t *rescan_lbl = lv_label_create(rescan_btn);
+                lv_label_set_text(rescan_lbl, LV_SYMBOL_REFRESH " Rescan");
+                lv_obj_set_style_text_color(rescan_lbl, ui_text_color(), 0);
+                lv_obj_set_style_text_font(rescan_lbl, &lv_font_montserrat_16, 0);
+                lv_obj_center(rescan_lbl);
+                lv_obj_add_event_cb(rescan_btn, wifi_scan_rescan_btn_cb, LV_EVENT_CLICKED, NULL);
+
+                // Add "Next" button at the bottom right - Material Blue
                 lv_obj_t *next_btn = lv_btn_create(function_page);
-                lv_obj_set_size(next_btn, lv_pct(100), 45);
-                lv_obj_align(next_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+                lv_obj_set_size(next_btn, lv_pct(62), 45);
+                lv_obj_align(next_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
                 lv_obj_set_style_bg_color(next_btn, ui_accent_color(), LV_STATE_DEFAULT);  // Material Blue
                 lv_obj_set_style_bg_color(next_btn, lv_color_lighten(ui_accent_color(), 30), LV_STATE_PRESSED);
+                // Grayed-out look while disabled (no AP selected yet).
+                lv_obj_set_style_bg_color(next_btn, lv_color_make(70, 70, 70), LV_STATE_DISABLED);
+                lv_obj_set_style_text_color(next_btn, lv_color_make(150, 150, 150), LV_STATE_DISABLED);
+                lv_obj_set_style_shadow_opa(next_btn, LV_OPA_0, LV_STATE_DISABLED);
                 lv_obj_set_style_border_width(next_btn, 0, 0);
                 lv_obj_set_style_radius(next_btn, 8, 0);
                 lv_obj_set_style_shadow_width(next_btn, 6, 0);
@@ -4917,6 +5018,8 @@ static void display_refresh_task(void *pvParameters)
                 lv_obj_set_style_text_font(next_lbl, &lv_font_montserrat_16, 0);
                 lv_obj_center(next_lbl);
                 lv_obj_add_event_cb(next_btn, wifi_scan_next_btn_cb, LV_EVENT_CLICKED, NULL);
+                scan_next_btn = next_btn;
+                scan_update_next_state();   // disabled until >=1 AP is selected
                 
                 }  // End of else block for !blackout_ui_active
             }
@@ -5280,6 +5383,16 @@ static void display_refresh_task(void *pvParameters)
                 if (led_now - led_last_us > 50000) {
                     led_last_us = led_now;
                     feature_led_update();
+                }
+            }
+
+            // Status-bar clock (throttled ~1 Hz).
+            {
+                static int64_t clock_last_us = 0;
+                int64_t clock_now = esp_timer_get_time();
+                if (clock_now - clock_last_us > 1000000) {
+                    clock_last_us = clock_now;
+                    update_status_clock();
                 }
             }
 
@@ -12135,7 +12248,17 @@ static void show_main_tiles(void)
 static void wifi_scan_next_btn_cb(lv_event_t *e)
 {
     (void)e;
+    // Ignore taps while disabled (no AP selected).
+    int idx[SCAN_RESULTS_MAX_DISPLAY];
+    if (wifi_scanner_get_selected(idx, SCAN_RESULTS_MAX_DISPLAY) <= 0) return;
     show_attack_tiles_screen();
+}
+
+// Rescan: re-run the WiFi scan and rebuild the results list (Tab5-style).
+static void wifi_scan_rescan_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    show_wifi_scan_attack_screen();
 }
 
 // WiFi Scan & Attack screen - scan and show network list with checkboxes
@@ -16194,6 +16317,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         if (g_sound_enabled) sfx_play(SND_CONFIRM);   // confirm only when turning on
         if (settings_tiles) settings_pending_scroll_y = lv_obj_get_scroll_y(settings_tiles);
         show_settings_screen();   // re-render so the tile reflects the new state
+    } else if (strcmp(tile_name, "Time") == 0) {
+        show_time_settings_screen();
     } else if (strcmp(tile_name, "About") == 0) {
         show_about_screen();
     }
@@ -16285,6 +16410,7 @@ static void show_wardrive_settings_screen(void)
     lv_obj_set_style_bg_color(form, ui_bg_color(), 0);
     lv_obj_set_style_border_width(form, 0, 0);
     lv_obj_set_style_pad_all(form, 10, 0);
+    lv_obj_set_style_pad_right(form, 20, 0);   // extra room so rows clear the scrollbar
     lv_obj_set_style_pad_row(form, 8, 0);
     lv_obj_set_flex_flow(form, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(form, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
@@ -16449,6 +16575,9 @@ static void show_settings_screen(void)
                 settings_tile_event_cb, "Sound");
 
     // About - Blue Grey: firmware info (kept last)
+    // Time / clock - Teal
+    create_tile(tiles, LV_SYMBOL_BELL, "Time", COLOR_MATERIAL_TEAL, settings_tile_event_cb, "Time");
+
     create_tile(tiles, LV_SYMBOL_LIST, "About", COLOR_MATERIAL_INDIGO, settings_tile_event_cb, "About");
 
     // Restore scroll position after an in-place rebuild (e.g. toggling a tile)
@@ -16529,6 +16658,239 @@ static void show_about_screen(void)
         lv_obj_set_style_text_font(m, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(m, lv_color_make(150, 150, 150), 0);
     }
+}
+
+// ---- Time settings ---------------------------------------------------------
+static void time_fmt_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    g_clock_24h = !g_clock_24h;
+    nvs_settings_save_clk_24h(g_clock_24h);
+    update_status_clock();
+    show_time_settings_screen();
+}
+static void clock_show_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    g_clock_show = !g_clock_show;
+    nvs_settings_save_clk_show(g_clock_show);
+    update_status_clock();
+    show_time_settings_screen();
+}
+static void time_settings_btn(lv_obj_t *parent, const char *txt, lv_event_cb_t cb)
+{
+    lv_obj_t *b = lv_btn_create(parent);
+    lv_obj_set_width(b, lv_pct(100));
+    lv_obj_set_style_bg_color(b, ui_accent_color(), 0);
+    lv_obj_set_style_radius(b, 8, 0);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_color(l, lv_color_white(), 0);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+}
+// Manual time set (rollers). The entered value is LOCAL wall time in the
+// selected zone; mktime() (TZ-aware) converts it to the UTC epoch we store.
+static lv_obj_t *time_roll_year = NULL, *time_roll_mon = NULL, *time_roll_day = NULL,
+                *time_roll_hour = NULL, *time_roll_min = NULL;
+
+static void time_manual_set_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!time_roll_year) { show_time_settings_screen(); return; }
+    struct tm t;
+    memset(&t, 0, sizeof(t));
+    t.tm_year = 2024 + (int)lv_roller_get_selected(time_roll_year) - 1900;
+    t.tm_mon  = (int)lv_roller_get_selected(time_roll_mon);
+    t.tm_mday = (int)lv_roller_get_selected(time_roll_day) + 1;
+    t.tm_hour = (int)lv_roller_get_selected(time_roll_hour);
+    t.tm_min  = (int)lv_roller_get_selected(time_roll_min);
+    t.tm_sec  = 0;
+    t.tm_isdst = -1;                     // let the selected zone decide DST
+    time_t epoch = mktime(&t);           // local (TZ) -> UTC epoch
+    if (epoch >= 1704067200) {
+        struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        g_time_valid = true;
+        strncpy(g_time_source, "Manual", sizeof(g_time_source) - 1);
+        g_time_source[sizeof(g_time_source) - 1] = '\0';
+        if (g_rtc_present) { struct tm u; gmtime_r(&epoch, &u); ds3231_set_tm(&u); }
+    }
+    time_roll_year = time_roll_mon = time_roll_day = time_roll_hour = time_roll_min = NULL;
+    update_status_clock();
+    show_time_settings_screen();
+}
+
+static void time_manual_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    time_roll_year = time_roll_mon = time_roll_day = time_roll_hour = time_roll_min = NULL;
+    show_time_settings_screen();
+}
+
+static lv_obj_t *time_make_roller(lv_obj_t *parent, const char *opts, uint16_t sel)
+{
+    lv_obj_t *r = lv_roller_create(parent);
+    lv_roller_set_options(r, opts, LV_ROLLER_MODE_NORMAL);
+    lv_roller_set_visible_row_count(r, 3);
+    lv_obj_set_flex_grow(r, 1);
+    lv_roller_set_selected(r, sel, LV_ANIM_OFF);
+    return r;
+}
+
+static void show_time_manual_screen(void)
+{
+    create_function_page_base("Set Time");
+    time_t now = g_time_valid ? time(NULL) : 1704067200;   // default 2024-01-01 if unset
+    struct tm t;
+    localtime_r(&now, &t);
+
+    lv_obj_t *row = lv_obj_create(function_page);
+    lv_obj_set_size(row, lv_pct(100), LCD_V_RES - 30 - 62);
+    lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 4, 0);
+    lv_obj_set_style_pad_column(row, 4, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    char years[96]; int yo = 0;
+    for (int y = 2024; y <= 2035; y++) yo += snprintf(years + yo, sizeof(years) - yo, "%s%d", y > 2024 ? "\n" : "", y);
+    char mons[48]; int mo = 0;
+    for (int m = 1; m <= 12; m++) mo += snprintf(mons + mo, sizeof(mons) - mo, "%s%02d", m > 1 ? "\n" : "", m);
+    char days[128]; int dyo = 0;
+    for (int d = 1; d <= 31; d++) dyo += snprintf(days + dyo, sizeof(days) - dyo, "%s%02d", d > 1 ? "\n" : "", d);
+    char hrs[128]; int ho = 0;
+    for (int h = 0; h <= 23; h++) ho += snprintf(hrs + ho, sizeof(hrs) - ho, "%s%02d", h > 0 ? "\n" : "", h);
+    char mins[256]; int mio = 0;
+    for (int m = 0; m <= 59; m++) mio += snprintf(mins + mio, sizeof(mins) - mio, "%s%02d", m > 0 ? "\n" : "", m);
+
+    int yr = t.tm_year + 1900; if (yr < 2024) yr = 2024; if (yr > 2035) yr = 2035;
+    time_roll_year = time_make_roller(row, years, (uint16_t)(yr - 2024));
+    time_roll_mon  = time_make_roller(row, mons,  (uint16_t)t.tm_mon);
+    time_roll_day  = time_make_roller(row, days,  (uint16_t)(t.tm_mday - 1));
+    time_roll_hour = time_make_roller(row, hrs,   (uint16_t)t.tm_hour);
+    time_roll_min  = time_make_roller(row, mins,  (uint16_t)t.tm_min);
+
+    lv_obj_t *cancel = lv_btn_create(function_page);
+    lv_obj_set_size(cancel, 130, 44);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 8, -8);
+    lv_obj_set_style_bg_color(cancel, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_radius(cancel, 8, 0);
+    lv_obj_t *cl = lv_label_create(cancel);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_set_style_text_color(cl, ui_text_color(), 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel, time_manual_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *set = lv_btn_create(function_page);
+    lv_obj_set_size(set, 130, 44);
+    lv_obj_align(set, LV_ALIGN_BOTTOM_RIGHT, -8, -8);
+    lv_obj_set_style_bg_color(set, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(set, 8, 0);
+    lv_obj_t *sl = lv_label_create(set);
+    lv_label_set_text(sl, "Set");
+    lv_obj_set_style_text_color(sl, lv_color_white(), 0);
+    lv_obj_center(sl);
+    lv_obj_add_event_cb(set, time_manual_set_cb, LV_EVENT_CLICKED, NULL);
+}
+
+static void time_manual_open_cb(lv_event_t *e) { (void)e; show_time_manual_screen(); }
+
+static void time_tz_dd_cb(lv_event_t *e)
+{
+    uint8_t idx = (uint8_t)lv_dropdown_get_selected(lv_event_get_target(e));
+    if (idx >= TZ_COUNT) idx = 0;
+    g_tz_index = idx;
+    nvs_settings_save_tz(idx);
+    time_apply_tz(idx);
+    update_status_clock();
+}
+
+static void show_time_settings_screen(void)
+{
+    create_function_page_base("Time Settings");
+
+    lv_obj_t *panel = lv_obj_create(function_page);
+    lv_obj_set_size(panel, lv_pct(96), LCD_V_RES - 30 - 12);
+    lv_obj_align(panel, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(panel, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(panel, ui_accent_color(), 0);
+    lv_obj_set_style_border_width(panel, 1, 0);
+    lv_obj_set_style_radius(panel, 8, 0);
+    lv_obj_set_style_pad_all(panel, 12, 0);
+    lv_obj_set_style_pad_row(panel, 8, 0);
+    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_AUTO);
+
+    // Current local time (per selected timezone; DST applied by the zone).
+    char line[64];
+    if (g_time_valid) {
+        time_t now = time(NULL);
+        struct tm t;
+        localtime_r(&now, &t);
+        if (g_clock_24h) {
+            snprintf(line, sizeof(line), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+        } else {
+            int h12 = t.tm_hour % 12; if (h12 == 0) h12 = 12;
+            snprintf(line, sizeof(line), "%d:%02d:%02d %s", h12, t.tm_min, t.tm_sec,
+                     t.tm_hour < 12 ? "AM" : "PM");
+        }
+    } else {
+        snprintf(line, sizeof(line), "time not set");
+    }
+    lv_obj_t *big = lv_label_create(panel);
+    lv_label_set_text(big, line);
+    lv_obj_set_style_text_font(big, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(big, ui_accent_color(), 0);
+
+    // Timezone label + dropdown
+    lv_obj_t *tz_hdr = lv_label_create(panel);
+    lv_label_set_text(tz_hdr, "Timezone (DST automatic):");
+    lv_obj_set_style_text_font(tz_hdr, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(tz_hdr, ui_text_color(), 0);
+
+    lv_obj_t *tz_dd = lv_dropdown_create(panel);
+    lv_obj_set_width(tz_dd, lv_pct(100));
+    {
+        char opts[512];
+        int off = 0;
+        for (int i = 0; i < TZ_COUNT; i++)
+            off += snprintf(opts + off, sizeof(opts) - off, "%s%s", i ? "\n" : "", TZ_OPTIONS[i].name);
+        lv_dropdown_set_options(tz_dd, opts);
+    }
+    lv_dropdown_set_selected(tz_dd, g_tz_index < TZ_COUNT ? g_tz_index : 0);
+    lv_obj_add_event_cb(tz_dd, time_tz_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Status rows
+    char row[64];
+    snprintf(row, sizeof(row), "Source: %s", g_time_source);
+    lv_obj_t *src = lv_label_create(panel);
+    lv_label_set_text(src, row);
+    lv_obj_set_style_text_font(src, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(src, ui_text_color(), 0);
+
+    lv_obj_t *rtc = lv_label_create(panel);
+    lv_label_set_text(rtc, g_rtc_present ? "RTC (DS3231): present" : "RTC (DS3231): not found");
+    lv_obj_set_style_text_font(rtc, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(rtc, g_rtc_present ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_ORANGE, 0);
+
+    lv_obj_t *note = lv_label_create(panel);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, lv_pct(100));
+    lv_label_set_text(note, "Auto-syncs from a GPS fix or WiFi (NTP); the DS3231 keeps time across reboots.");
+    lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(note, lv_color_make(150, 150, 150), 0);
+
+    // Toggles
+    time_settings_btn(panel, g_clock_24h ? "Format: 24-hour" : "Format: 12-hour (AM/PM)",
+                      time_fmt_toggle_cb);
+    time_settings_btn(panel, g_clock_show ? "Header clock: Shown" : "Header clock: Hidden",
+                      clock_show_toggle_cb);
+    time_settings_btn(panel, LV_SYMBOL_EDIT " Set time manually", time_manual_open_cb);
 }
 
 // WiFi Monitor screen
@@ -17876,6 +18238,38 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 			return true;
 		}
 	}
+	// Parse GPRMC/GNRMC for UTC date+time to seed the system clock (and DS3231).
+	else if (strncmp(nmea_sentence, "$GPRMC", 6) == 0 || strncmp(nmea_sentence, "$GNRMC", 6) == 0) {
+		char sentence[256];
+		strncpy(sentence, nmea_sentence, sizeof(sentence) - 1);
+		sentence[sizeof(sentence) - 1] = '\0';
+		// Split on ',' preserving empty fields (strtok would collapse them).
+		char *fields[13] = {0};
+		int nf = 0;
+		char *p = sentence;
+		fields[nf++] = p;
+		while (*p && nf < 13) { if (*p == ',') { *p = '\0'; fields[nf++] = p + 1; } p++; }
+		// f1 = hhmmss(.sss), f2 = status A/V, f9 = date ddmmyy
+		if (nf >= 10 && fields[2] && fields[2][0] == 'A' &&
+		    fields[1] && strlen(fields[1]) >= 6 && fields[9] && strlen(fields[9]) >= 6) {
+			struct tm t;
+			memset(&t, 0, sizeof(t));
+			t.tm_hour = (fields[1][0]-'0')*10 + (fields[1][1]-'0');
+			t.tm_min  = (fields[1][2]-'0')*10 + (fields[1][3]-'0');
+			t.tm_sec  = (fields[1][4]-'0')*10 + (fields[1][5]-'0');
+			t.tm_mday = (fields[9][0]-'0')*10 + (fields[9][1]-'0');
+			t.tm_mon  = (fields[9][2]-'0')*10 + (fields[9][3]-'0') - 1;
+			t.tm_year = (fields[9][4]-'0')*10 + (fields[9][5]-'0') + 100;  // 20yy
+			// Seed once, then only re-correct on drift > 2 s.
+			time_t gps_e = utc_epoch(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+			                         t.tm_hour, t.tm_min, t.tm_sec);
+			time_t now = time(NULL);
+			if (!g_time_valid || labs((long)(now - gps_e)) > 2) {
+				time_apply_utc_tm(&t, "GPS", true);
+			}
+			return true;
+		}
+	}
 	return false;
 }
 
@@ -17985,7 +18379,13 @@ static uint8_t read_max17048_percent(void)
     return samples[n / 2];
 }
 
-// Returns cell voltage in volts, or 0.0 if unavailable
+// Returns cell voltage in millivolts, or 0 if unavailable (VCELL LSB = 78.125 µV).
+static uint16_t read_max17048_mv(void)
+{
+    uint16_t raw = 0;
+    if (max17048_read_reg(MAX17048_REG_VCELL, &raw) != ESP_OK) return 0;
+    return (uint16_t)((uint32_t)raw * 5 / 64);   // raw * 0.078125 mV/LSB
+}
 
 static void battery_monitor_task(void *arg)
 {
@@ -18015,22 +18415,23 @@ static void battery_monitor_task(void *arg)
         // Show the last known percentage rather than "--" once we have one.
         pct = last_good_pct;
 
+        uint16_t mv = read_max17048_mv();   // cell voltage, 0 if unavailable
+        const char *icon = (pct == 255) ? LV_SYMBOL_BATTERY_EMPTY
+                         : (pct >= 75)  ? LV_SYMBOL_BATTERY_FULL
+                         : (pct >= 50)  ? LV_SYMBOL_BATTERY_3
+                         : (pct >= 25)  ? LV_SYMBOL_BATTERY_2
+                         : (pct >= 10)  ? LV_SYMBOL_BATTERY_1
+                                        : LV_SYMBOL_BATTERY_EMPTY;
         if (pct == 255) {
-            // Never got a reading yet (gauge still settling at power-on)
-            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_EMPTY " --");
-        } else if (pct >= 75) {
-            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_FULL " %d%%", pct);
-        } else if (pct >= 50) {
-            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_3 " %d%%", pct);
-        } else if (pct >= 25) {
-            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_2 " %d%%", pct);
-        } else if (pct >= 10) {
-            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_1 " %d%%", pct);
+            snprintf(voltage_str, sizeof(voltage_str), "%s --", icon);
+        } else if (mv > 0) {
+            snprintf(voltage_str, sizeof(voltage_str), "%s %u.%02uV %d%%",
+                     icon, (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10), pct);
         } else {
-            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_EMPTY " %d%%", pct);
+            snprintf(voltage_str, sizeof(voltage_str), "%s %d%%", icon, pct);
         }
 
-        ESP_LOGI(TAG, "Battery: %d%%", pct);
+        ESP_LOGI(TAG, "Battery: %d%% %umV", pct, mv);
 
         // Save to global buffer so new screens can show it immediately
         strncpy(last_voltage_str, voltage_str, sizeof(last_voltage_str) - 1);
@@ -18050,6 +18451,236 @@ static void battery_monitor_task(void *arg)
     }
 }
 #endif  // MAX17048 battery fuel gauge
+
+// ============================================================================
+// DS3231 Real-Time Clock (I2C 0x68, shared bus with touch + fuel gauge).
+// Standard BCD registers 0x00-0x06 in 24-hour mode + status reg 0x0F (OSF).
+// Only these standard registers are used, so it stays compatible with any other
+// firmware that reads/writes the same DS3231 (e.g. Porkchop) — we never touch
+// the alarm or the on-module AT24 EEPROM. All times are handled as UTC.
+// ============================================================================
+#define DS3231_ADDR 0x68
+
+// Timezone table (POSIX TZ strings, DST-aware). Copied verbatim from Porkchop so
+// both firmwares on the shared hardware pick the SAME zone by the SAME index and
+// agree on local time. The clock is always stored/kept in UTC (RTC/GPS/NTP); the
+// zone is applied only for display via setenv("TZ")+tzset(), and the POSIX string
+// encodes the DST rules so daylight saving switches automatically — no separate
+// DST toggle needed.
+typedef struct { const char *name; const char *posix; } tz_option_t;
+static const tz_option_t TZ_OPTIONS[] = {
+    {"UTC",         "UTC0"},
+    {"Hawaii",      "HST10"},
+    {"Alaska",      "AKST9AKDT,M3.2.0/2,M11.1.0/2"},
+    {"Pacific",     "PST8PDT,M3.2.0/2,M11.1.0/2"},
+    {"Mountain",    "MST7MDT,M3.2.0/2,M11.1.0/2"},
+    {"Central",     "CST6CDT,M3.2.0/2,M11.1.0/2"},
+    {"Eastern",     "EST5EDT,M3.2.0/2,M11.1.0/2"},
+    {"Atlantic",    "AST4ADT,M3.2.0/2,M11.1.0/2"},
+    {"Newfound",    "NST3:30NDT,M3.2.0/2,M11.1.0/2"},
+    {"UTC-3",       "UTC3"},
+    {"UTC-2",       "UTC2"},
+    {"UTC-1",       "UTC1"},
+    {"UK",          "GMT0BST,M3.5.0/1,M10.5.0/2"},
+    {"Central EU",  "CET-1CEST,M3.5.0/2,M10.5.0/3"},
+    {"Eastern EU",  "EET-2EEST,M3.5.0/3,M10.5.0/4"},
+    {"UTC+3",       "UTC-3"},
+    {"Iran",        "IRST-3:30"},
+    {"Gulf",        "GST-4"},
+    {"UTC+5",       "UTC-5"},
+    {"India",       "IST-5:30"},
+    {"UTC+6",       "UTC-6"},
+    {"UTC+7",       "UTC-7"},
+    {"China",       "CST-8"},
+    {"Japan",       "JST-9"},
+    {"Darwin",      "ACST-9:30"},
+    {"Sydney",      "AEST-10AEDT,M10.1.0/2,M4.1.0/3"},
+    {"UTC+11",      "UTC-11"},
+    {"New Zealand", "NZST-12NZDT,M9.5.0/2,M4.1.0/3"},
+    {"UTC+13",      "UTC-13"},
+    {"UTC+14",      "UTC-14"},
+};
+#define TZ_COUNT ((int)(sizeof(TZ_OPTIONS) / sizeof(TZ_OPTIONS[0])))
+
+static void time_apply_tz(uint8_t index)
+{
+    if (index >= TZ_COUNT) index = 0;
+    setenv("TZ", TZ_OPTIONS[index].posix, 1);
+    tzset();
+}
+
+// Build a UTC time_t from civil UTC fields, independent of the current TZ
+// (Howard Hinnant's algorithm). mktime() can't be used for UTC inputs once TZ is
+// a non-UTC zone, so this is used for RTC/GPS (which are UTC).
+static time_t utc_epoch(int y, int mo, int d, int h, int mi, int s)
+{
+    y -= (mo <= 2);
+    long era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153u * (mo + (mo > 2 ? -3u : 9u)) + 2u) / 5u + (unsigned)d - 1u;
+    unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    long days = era * 146097L + (long)doe - 719468L;
+    return (time_t)days * 86400L + (long)h * 3600L + (long)mi * 60L + s;
+}
+
+static inline uint8_t bcd2dec(uint8_t b) { return (uint8_t)((b >> 4) * 10 + (b & 0x0F)); }
+static inline uint8_t dec2bcd(uint8_t d) { return (uint8_t)(((d / 10) << 4) | (d % 10)); }
+
+static esp_err_t ds3231_read(uint8_t reg, uint8_t *buf, size_t len)
+{
+    if (!i2c_mutex || xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (DS3231_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg, true);
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (DS3231_ADDR << 1) | I2C_MASTER_READ, true);
+    for (size_t i = 0; i < len; i++)
+        i2c_master_read_byte(cmd, &buf[i], (i + 1 < len) ? I2C_MASTER_ACK : I2C_MASTER_NACK);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    xSemaphoreGive(i2c_mutex);
+    return ret;
+}
+
+static esp_err_t ds3231_write(uint8_t reg, const uint8_t *buf, size_t len)
+{
+    if (!i2c_mutex || xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (DS3231_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg, true);
+    for (size_t i = 0; i < len; i++) i2c_master_write_byte(cmd, buf[i], true);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    xSemaphoreGive(i2c_mutex);
+    return ret;
+}
+
+static bool ds3231_probe(void)
+{
+    uint8_t s;
+    return ds3231_read(0x0F, &s, 1) == ESP_OK;   // status register
+}
+
+// Oscillator Stop Flag: set when the RTC lost power / time is unreliable.
+static bool ds3231_lost_power(void)
+{
+    uint8_t s = 0;
+    if (ds3231_read(0x0F, &s, 1) != ESP_OK) return true;
+    return (s & 0x80) != 0;
+}
+
+static bool ds3231_get_tm(struct tm *out)
+{
+    uint8_t b[7];
+    if (ds3231_read(0x00, b, 7) != ESP_OK) return false;
+    memset(out, 0, sizeof(*out));
+    out->tm_sec  = bcd2dec(b[0] & 0x7F);
+    out->tm_min  = bcd2dec(b[1] & 0x7F);
+    out->tm_hour = bcd2dec(b[2] & 0x3F);            // 24-hour mode
+    out->tm_mday = bcd2dec(b[4] & 0x3F);
+    out->tm_mon  = bcd2dec(b[5] & 0x1F) - 1;        // 0-11
+    out->tm_year = bcd2dec(b[6]) + 100;             // years since 1900 (assume 20xx)
+    out->tm_isdst = 0;
+    return true;
+}
+
+static bool ds3231_set_tm(const struct tm *t)
+{
+    uint8_t b[7];
+    b[0] = dec2bcd((uint8_t)t->tm_sec);
+    b[1] = dec2bcd((uint8_t)t->tm_min);
+    b[2] = dec2bcd((uint8_t)t->tm_hour);            // bit6=0 -> 24-hour mode
+    b[3] = (uint8_t)(t->tm_wday + 1);   // DS3231 DOW 1..7 (matches Porkchop's convention)
+    b[4] = dec2bcd((uint8_t)t->tm_mday);
+    b[5] = dec2bcd((uint8_t)(t->tm_mon + 1));       // century bit left 0
+    int yr = t->tm_year + 1900;
+    b[6] = dec2bcd((uint8_t)(yr % 100));
+    if (ds3231_write(0x00, b, 7) != ESP_OK) return false;
+    // Clear the Oscillator Stop Flag now that we hold a valid time.
+    uint8_t s = 0;
+    if (ds3231_read(0x0F, &s, 1) == ESP_OK && (s & 0x80)) {
+        s &= ~0x80;
+        ds3231_write(0x0F, &s, 1);
+    }
+    return true;
+}
+
+// Set the ESP system clock (UTC) from a struct tm and update the RTC + source.
+static void time_apply_utc_tm(const struct tm *utc, const char *source, bool write_rtc)
+{
+    time_t epoch = utc_epoch(utc->tm_year + 1900, utc->tm_mon + 1, utc->tm_mday,
+                             utc->tm_hour, utc->tm_min, utc->tm_sec);
+    if (epoch < 1704067200) return; // sanity: before 2024-01-01 => ignore
+    struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+    g_time_valid = true;
+    if (source) { strncpy(g_time_source, source, sizeof(g_time_source) - 1); g_time_source[sizeof(g_time_source)-1] = '\0'; }
+    if (write_rtc && g_rtc_present) ds3231_set_tm(utc);
+}
+
+// SNTP sync callback (fires when a WiFi STA connection reaches an NTP server).
+static void time_sntp_sync_cb(struct timeval *tv)
+{
+    (void)tv;
+    g_time_valid = true;
+    strncpy(g_time_source, "NTP", sizeof(g_time_source) - 1);
+    if (g_rtc_present) {
+        time_t now = time(NULL);
+        struct tm utc;
+        gmtime_r(&now, &utc);
+        ds3231_set_tm(&utc);
+    }
+}
+
+// Probe the RTC and seed the system clock at boot. The saved timezone is applied
+// for display; UTC is stored/kept internally. Also arms passive SNTP so the clock
+// corrects itself whenever the device later has WiFi internet (writes the RTC).
+static void time_init(void)
+{
+    time_apply_tz(g_tz_index);   // display timezone (UTC still stored/kept internally)
+
+    g_rtc_present = ds3231_probe();
+    if (g_rtc_present && !ds3231_lost_power()) {
+        struct tm t;
+        if (ds3231_get_tm(&t) && (t.tm_year + 1900) >= 2024) {
+            time_apply_utc_tm(&t, "RTC", false);
+            ESP_LOGI(TAG, "System clock seeded from DS3231 RTC");
+        }
+    }
+    ESP_LOGI(TAG, "DS3231 %s", g_rtc_present ? "present" : "not found");
+
+    // Passive SNTP: harmless until an interface has internet; syncs then.
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    cfg.start = true;
+    cfg.sync_cb = time_sntp_sync_cb;
+    esp_netif_sntp_init(&cfg);
+}
+
+// Format the current time for the status bar (UTC). 24h = "HH:MM"; 12h adds AM/PM.
+static void update_status_clock(void)
+{
+    if (!clock_label || !lv_obj_is_valid(clock_label)) return;
+    if (!g_clock_show) { lv_obj_add_flag(clock_label, LV_OBJ_FLAG_HIDDEN); return; }
+    lv_obj_clear_flag(clock_label, LV_OBJ_FLAG_HIDDEN);
+    if (!g_time_valid) { lv_label_set_text(clock_label, "--:--"); return; }
+    time_t now = time(NULL);
+    struct tm t;
+    localtime_r(&now, &t);   // UTC (TZ=UTC0)
+    char buf[16];
+    if (g_clock_24h) {
+        snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+    } else {
+        int h12 = t.tm_hour % 12; if (h12 == 0) h12 = 12;
+        snprintf(buf, sizeof(buf), "%d:%02d %s", h12, t.tm_min, t.tm_hour < 12 ? "AM" : "PM");
+    }
+    lv_label_set_text(clock_label, buf);
+}
 
 static void evil_twin_start_btn_cb(lv_event_t *e)
 {
@@ -19360,7 +19991,11 @@ static void show_gatt_walker_screen(void)
 static void lookout_led_set(uint8_t r, uint8_t g, uint8_t b)
 {
     if (!g_led_strip) return;
-    led_strip_set_pixel(g_led_strip, 0, r, g, b);
+    // The led_strip driver emits G-R-B on the wire, but this board's NeoPixel is
+    // physically RGB-ordered — verified on hardware (red showed as green). Swap
+    // R and G here so the wire carries the intended color. Sole LED writer, so
+    // this one swap corrects every status color.
+    led_strip_set_pixel(g_led_strip, 0, g, r, b);
     led_strip_refresh(g_led_strip);
 }
 
@@ -19404,6 +20039,8 @@ static void feature_led_update(void)
     else if (sniffer_task_active || sniffer_dog_active) { r = 0;  g = 80; b = 0;  } // green — listening
     // ── Wardriving (cyan) ────────────────────────────────────────────────
     else if (wardrive_active)                           { r = 0;  g = 50; b = 50; } // cyan — geo-mapping
+    // ── Nmap LAN scan (azure) ────────────────────────────────────────────
+    else if (nmap_scan_is_active())                     { r = 0;  g = 40; b = 80; } // azure — LAN scanning
     // ── BLE / AirTag / BT locator scanning (purple) ──────────────────────
     else if (ble_scan_ui_active || bt_scan_active ||
              airtag_scan_ui_active || bt_locator_tracking_active)

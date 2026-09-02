@@ -12,7 +12,7 @@ extern "C" {
 #endif
 
 // Version
-#define JANOS_VERSION "0.5.7"
+#define JANOS_VERSION "0.5.8"
 
 // Git short commit SHA. The CI "Stamp commit SHA" step sed-replaces this value
 // with the real short SHA before building; stays "dev" for local builds.
