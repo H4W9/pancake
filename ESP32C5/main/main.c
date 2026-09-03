@@ -251,13 +251,21 @@ static lv_obj_t     *time_live_label  = NULL;     // Time settings: big live clo
 static lv_timer_t   *time_live_timer  = NULL;     // Time settings: 1 Hz refresh timer
 // Rogue GITM (Capture Gateway) UI/state — declared here so page teardown in
 // reset_function_page_children can reach them (defined logic is far below).
-static lv_obj_t     *gitm_status_label = NULL;
-static lv_obj_t     *gitm_info_label   = NULL;
-static lv_obj_t     *gitm_stats_label  = NULL;
-static lv_obj_t     *gitm_file_label   = NULL;
+// Live view mirrors Tab5's Step-3 session view (state chip, AP/uplink/NAPT header,
+// open-AP warning, client MAC list, capture pkts/size, recorder health).
+static lv_obj_t     *gitm_status_label = NULL;   // shared hint / error line
+static lv_obj_t     *gitm_state_chip   = NULL;   // IDLE/CONNECTING/STARTING/RUNNING
+static lv_obj_t     *gitm_live_hdr     = NULL;   // AP / uplink / NAPT-DNS block
+static lv_obj_t     *gitm_warn_lbl     = NULL;   // open-AP warning
+static lv_obj_t     *gitm_clients_hdr  = NULL;   // "Clients (N)"
+static lv_obj_t     *gitm_clients_list = NULL;   // MAC rows
+static lv_obj_t     *gitm_cap_label    = NULL;   // pcap name / pkts / size
+static lv_obj_t     *gitm_rec_label    = NULL;   // recorder health
 static lv_timer_t   *gitm_timer        = NULL;
 static volatile bool gitm_active       = false;
 static char          gitm_pcap_path[64] = "";
+static char          gitm_client_sig[8 * 18 + 8] = "";  // change-detect the client set
+static int           gitm_state         = 0;     // gitm_state_t (see the GITM block)
 // Rogue GITM AP config (Tab5 Step 2): the SoftAP the victims join. Editable so it
 // can differ from the uplink (a distinct name is visible; an exact copy = mirror).
 static char          gitm_ap_ssid[33]  = "";
@@ -1781,9 +1789,13 @@ static void reset_function_page_children(void) {
     // Rogue GITM: tear down the capture gateway + pcap + SoftAP on any nav away.
     if (gitm_active) gitm_stop();
     gitm_status_label = NULL;
-    gitm_info_label = NULL;
-    gitm_stats_label = NULL;
-    gitm_file_label = NULL;
+    gitm_state_chip = NULL;
+    gitm_live_hdr = NULL;
+    gitm_warn_lbl = NULL;
+    gitm_clients_hdr = NULL;
+    gitm_clients_list = NULL;
+    gitm_cap_label = NULL;
+    gitm_rec_label = NULL;
     gitm_cfg_ssid_ta = NULL;
     gitm_cfg_pw_ta = NULL;
     gitm_cfg_sec_dd = NULL;
@@ -14807,7 +14819,8 @@ static void gitm_stop(void)
     gitm_capture_stop();
     capture_gateway_stop();
     esp_wifi_set_mode(WIFI_MODE_STA);   // keep the STA uplink, drop the SoftAP
-    gitm_status_label = gitm_info_label = gitm_stats_label = gitm_file_label = NULL;
+    gitm_status_label = gitm_state_chip = gitm_live_hdr = gitm_warn_lbl = NULL;
+    gitm_clients_hdr = gitm_clients_list = gitm_cap_label = gitm_rec_label = NULL;
     ESP_LOGI(TAG, "Rogue GITM: stopped");
 }
 
@@ -14818,28 +14831,134 @@ static void gitm_stop_btn_cb(lv_event_t *e)
     nav_to_menu_flag = true;
 }
 
+// ---- Tab5-style session state chip ----
+enum { GITM_ST_IDLE = 0, GITM_ST_CONNECTING, GITM_ST_STARTING, GITM_ST_RUNNING,
+       GITM_ST_STOPPED, GITM_ST_ERROR };
+static const char *gitm_state_name(int st) {
+    switch (st) {
+        case GITM_ST_CONNECTING: return "CONNECTING";
+        case GITM_ST_STARTING:   return "STARTING";
+        case GITM_ST_RUNNING:    return "RUNNING";
+        case GITM_ST_STOPPED:    return "STOPPED";
+        case GITM_ST_ERROR:      return "ERROR";
+        default:                 return "IDLE";
+    }
+}
+static lv_color_t gitm_state_color(int st) {
+    switch (st) {
+        case GITM_ST_RUNNING:    return COLOR_MATERIAL_GREEN;
+        case GITM_ST_CONNECTING:
+        case GITM_ST_STARTING:   return COLOR_MATERIAL_AMBER;
+        case GITM_ST_ERROR:      return COLOR_MATERIAL_RED;
+        default:                 return lv_color_make(136, 136, 136);
+    }
+}
+static void gitm_set_state(int st) {
+    gitm_state = st;
+    if (gitm_state_chip && lv_obj_is_valid(gitm_state_chip)) {
+        lv_label_set_text(gitm_state_chip, gitm_state_name(st));
+        lv_obj_set_style_text_color(gitm_state_chip, gitm_state_color(st), 0);
+    }
+}
+
+// Rebuild the client MAC list only when the set changes (mirrors Tab5's approach).
+static void gitm_render_clients(void) {
+    if (!gitm_clients_list || !lv_obj_is_valid(gitm_clients_list)) return;
+    wifi_sta_list_t list;
+    if (esp_wifi_ap_get_sta_list(&list) != ESP_OK) return;
+    int n = list.num; if (n > 8) n = 8;
+    if (gitm_clients_hdr) lv_label_set_text_fmt(gitm_clients_hdr, "Clients (%d)", list.num);
+
+    char sig[8 * 18 + 8];
+    size_t pos = 0;
+    for (int i = 0; i < n && pos < sizeof(sig) - 20; i++) {
+        const uint8_t *m = list.sta[i].mac;
+        pos += snprintf(sig + pos, sizeof(sig) - pos, "%02X%02X%02X%02X%02X%02X|",
+                        m[0], m[1], m[2], m[3], m[4], m[5]);
+    }
+    sig[pos] = '\0';
+
+    if (strcmp(sig, gitm_client_sig) == 0) {                 // same set — just refresh RSSI
+        uint32_t c = lv_obj_get_child_cnt(gitm_clients_list);
+        for (int i = 0; i < n && (uint32_t)i < c; i++) {
+            lv_obj_t *row = lv_obj_get_child(gitm_clients_list, i);
+            const uint8_t *m = list.sta[i].mac;
+            if (row) lv_label_set_text_fmt(row, "%02X:%02X:%02X:%02X:%02X:%02X   %d dBm",
+                                           m[0], m[1], m[2], m[3], m[4], m[5], list.sta[i].rssi);
+        }
+        return;
+    }
+    snprintf(gitm_client_sig, sizeof(gitm_client_sig), "%s", sig);
+    lv_obj_clean(gitm_clients_list);
+    if (n == 0) {
+        lv_obj_t *e = lv_label_create(gitm_clients_list);
+        lv_label_set_text(e, "No client has joined yet.");
+        lv_obj_set_style_text_font(e, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(e, lv_color_make(150, 150, 150), 0);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        const uint8_t *m = list.sta[i].mac;
+        lv_obj_t *row = lv_label_create(gitm_clients_list);
+        lv_label_set_text_fmt(row, "%02X:%02X:%02X:%02X:%02X:%02X   %d dBm",
+                              m[0], m[1], m[2], m[3], m[4], m[5], list.sta[i].rssi);
+        lv_obj_set_style_text_font(row, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(row, lv_color_make(221, 221, 221), 0);
+    }
+}
+
 static void gitm_timer_cb(lv_timer_t *t)
 {
     (void)t;
     if (!gitm_active) return;
     capture_gateway_status_t st;
     capture_gateway_get_status(&st);
+    if (!st.active) return;   // gateway not up (start failed) — keep the error hint
 
-    wifi_sta_list_t list;
-    uint8_t clients = (esp_wifi_ap_get_sta_list(&list) == ESP_OK) ? list.num : 0;
-
-    if (gitm_status_label) {
-        lv_label_set_text_fmt(gitm_status_label, "%s   NAPT %s   DNS %s",
-                              st.upstream_ready ? "Uplink UP" : "Uplink DOWN",
-                              st.napt_enabled ? "on" : "off",
-                              st.dns_proxy ? "on" : "off");
-        lv_obj_set_style_text_color(gitm_status_label,
-                                    st.upstream_ready ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+    // AP / uplink / NAPT-DNS block (Tab5 live_hdr layout).
+    if (gitm_live_hdr) {
+        char dns[20] = "-";
+        if (st.upstream_dns.ip.type == ESP_IPADDR_TYPE_V4 && st.upstream_dns.ip.u_addr.ip4.addr)
+            snprintf(dns, sizeof(dns), IPSTR, IP2STR(&st.upstream_dns.ip.u_addr.ip4));
+        char upip[20] = "";
+        if (st.upstream_ip.ip.addr) snprintf(upip, sizeof(upip), IPSTR, IP2STR(&st.upstream_ip.ip));
+        lv_label_set_text_fmt(gitm_live_hdr,
+            "AP       %s  %s  ch %u\n"
+            "Uplink   %s  %s\n"
+            "NAPT %s   DNS %s%s",
+            st.ssid[0] ? st.ssid : gitm_ap_ssid, st.open_network ? "open" : "wpa2", st.channel,
+            st.upstream_ssid[0] ? st.upstream_ssid : "-",
+            st.upstream_ready ? (upip[0] ? upip : "connected") : "DOWN - no Internet",
+            st.napt_enabled ? "on" : "off", dns, st.dns_proxy ? " (proxy)" : "");
+        lv_obj_set_style_text_color(gitm_live_hdr,
+            st.upstream_ready ? lv_color_make(221, 221, 221) : COLOR_MATERIAL_AMBER, 0);
     }
-    if (gitm_stats_label) {
-        lv_label_set_text_fmt(gitm_stats_label, "Clients: %u   Frames: %lu   Drops: %lu",
-                              clients, (unsigned long)mitm_frame_count,
-                              (unsigned long)mitm_drop_count);
+
+    if (gitm_warn_lbl) {
+        if (st.open_network)
+            lv_label_set_text(gitm_warn_lbl, LV_SYMBOL_WARNING " Open AP - anyone in range can join and be recorded.");
+        else
+            lv_label_set_text(gitm_warn_lbl, "");
+    }
+
+    gitm_render_clients();
+
+    if (gitm_cap_label) {
+        const char *base = strrchr(gitm_pcap_path, '/');
+        lv_label_set_text_fmt(gitm_cap_label, "%s\n%lu pkt captured",
+                              base ? base + 1 : (gitm_pcap_path[0] ? gitm_pcap_path : "(pending)"),
+                              (unsigned long)mitm_frame_count);
+    }
+
+    if (gitm_rec_label) {
+        if (mitm_drop_count > 0) {
+            lv_label_set_text_fmt(gitm_rec_label, LV_SYMBOL_WARNING " recorder  DEGRADED - %lu dropped",
+                                  (unsigned long)mitm_drop_count);
+            lv_obj_set_style_text_color(gitm_rec_label, COLOR_MATERIAL_RED, 0);
+        } else {
+            lv_label_set_text(gitm_rec_label, LV_SYMBOL_OK " recorder  no loss");
+            lv_obj_set_style_text_color(gitm_rec_label, COLOR_MATERIAL_GREEN, 0);
+        }
     }
 }
 
@@ -14994,86 +15113,127 @@ static void show_gitm_page(void)
     }
     esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
 
-    // --- UI ---
+    // --- Tab5-style session view (Step 3) ---
     lv_obj_t *content = lv_obj_create(function_page);
     lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
     lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(content, ui_bg_color(), 0);
+    lv_obj_set_style_bg_color(content, lv_color_hex(0x0A1A1A), 0);
     lv_obj_set_style_border_width(content, 0, 0);
     lv_obj_set_style_pad_all(content, 8, 0);
-    lv_obj_set_style_pad_gap(content, 6, 0);
+    lv_obj_set_style_pad_row(content, 5, 0);
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(content, LV_DIR_VER);
 
-    lv_obj_t *title = lv_label_create(content);
-    lv_label_set_text_fmt(title, LV_SYMBOL_LOOP " AP: %s  (%s, ch %u)",
-                          gitm_ap_ssid[0] ? gitm_ap_ssid : "(hidden)",
-                          gitm_ap_open ? "open" : "WPA2", wifi_connect_channel);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(title, lv_color_make(0, 150, 136), 0);
+    // Header row: "Gate-in-the-Middle" + state chip.
+    lv_obj_t *hrow = lv_obj_create(content);
+    lv_obj_set_size(hrow, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(hrow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(hrow, 0, 0);
+    lv_obj_set_style_pad_all(hrow, 0, 0);
+    lv_obj_set_flex_flow(hrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(hrow, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(hrow, LV_OBJ_FLAG_SCROLLABLE);
 
-    gitm_info_label = lv_label_create(content);
-    lv_label_set_long_mode(gitm_info_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(gitm_info_label, lv_pct(100));
-    lv_label_set_text(gitm_info_label,
-                      "Victims joining the mirror get Internet via our uplink; all traffic is routed (NAPT) and recorded.");
-    lv_obj_set_style_text_font(gitm_info_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(gitm_info_label, lv_color_make(150, 150, 150), 0);
+    lv_obj_t *htitle = lv_label_create(hrow);
+    lv_label_set_text(htitle, LV_SYMBOL_LOOP " Gate-in-the-Middle");
+    lv_obj_set_style_text_font(htitle, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(htitle, COLOR_MATERIAL_TEAL, 0);
 
+    gitm_state_chip = lv_label_create(hrow);
+    lv_label_set_text(gitm_state_chip, "IDLE");
+    lv_obj_set_style_text_font(gitm_state_chip, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gitm_state_chip, lv_color_make(136, 136, 136), 0);
+    lv_obj_set_style_bg_color(gitm_state_chip, lv_color_hex(0x102020), 0);
+    lv_obj_set_style_bg_opa(gitm_state_chip, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_hor(gitm_state_chip, 8, 0);
+    lv_obj_set_style_pad_ver(gitm_state_chip, 4, 0);
+    lv_obj_set_style_radius(gitm_state_chip, 6, 0);
+
+    // Shared hint / error line.
     gitm_status_label = lv_label_create(content);
+    lv_label_set_long_mode(gitm_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(gitm_status_label, lv_pct(100));
     lv_label_set_text(gitm_status_label, "Starting gateway...");
-    lv_obj_set_style_text_font(gitm_status_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(gitm_status_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(gitm_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(gitm_status_label, COLOR_MATERIAL_AMBER, 0);
 
-    gitm_stats_label = lv_label_create(content);
-    lv_label_set_text(gitm_stats_label, "Clients: 0   Frames: 0   Drops: 0");
-    lv_obj_set_style_text_font(gitm_stats_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(gitm_stats_label, ui_text_color(), 0);
+    // AP / uplink / NAPT-DNS block.
+    gitm_live_hdr = lv_label_create(content);
+    lv_label_set_text(gitm_live_hdr, "AP       ...\nUplink   ...\nNAPT ...");
+    lv_obj_set_style_text_font(gitm_live_hdr, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gitm_live_hdr, lv_color_make(221, 221, 221), 0);
 
-    gitm_file_label = lv_label_create(content);
-    lv_label_set_text(gitm_file_label, "");
-    lv_obj_set_style_text_font(gitm_file_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(gitm_file_label, lv_color_make(150, 150, 150), 0);
+    gitm_warn_lbl = lv_label_create(content);
+    lv_label_set_long_mode(gitm_warn_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(gitm_warn_lbl, lv_pct(100));
+    lv_label_set_text(gitm_warn_lbl, "");
+    lv_obj_set_style_text_font(gitm_warn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(gitm_warn_lbl, COLOR_MATERIAL_AMBER, 0);
+
+    gitm_clients_hdr = lv_label_create(content);
+    lv_label_set_text(gitm_clients_hdr, "Clients (0)");
+    lv_obj_set_style_text_font(gitm_clients_hdr, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gitm_clients_hdr, COLOR_MATERIAL_TEAL, 0);
+
+    gitm_clients_list = lv_obj_create(content);
+    lv_obj_set_size(gitm_clients_list, lv_pct(100), 74);
+    lv_obj_set_style_bg_color(gitm_clients_list, lv_color_hex(0x061212), 0);
+    lv_obj_set_style_border_color(gitm_clients_list, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_border_width(gitm_clients_list, 1, 0);
+    lv_obj_set_style_radius(gitm_clients_list, 6, 0);
+    lv_obj_set_style_pad_all(gitm_clients_list, 5, 0);
+    lv_obj_set_style_pad_row(gitm_clients_list, 3, 0);
+    lv_obj_set_flex_flow(gitm_clients_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(gitm_clients_list, LV_DIR_VER);
+
+    gitm_cap_label = lv_label_create(content);
+    lv_label_set_text(gitm_cap_label, "(pending)\n0 pkt captured");
+    lv_obj_set_style_text_font(gitm_cap_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(gitm_cap_label, lv_color_make(180, 180, 180), 0);
+
+    gitm_rec_label = lv_label_create(content);
+    lv_label_set_text(gitm_rec_label, LV_SYMBOL_OK " recorder  no loss");
+    lv_obj_set_style_text_font(gitm_rec_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(gitm_rec_label, COLOR_MATERIAL_GREEN, 0);
 
     lv_obj_t *stop_btn = lv_btn_create(content);
-    lv_obj_set_size(stop_btn, 150, 44);
+    lv_obj_set_size(stop_btn, lv_pct(100), 40);
     lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_radius(stop_btn, 8, 0);
     lv_obj_set_style_border_width(stop_btn, 0, 0);
     lv_obj_t *stop_lbl = lv_label_create(stop_btn);
-    lv_label_set_text(stop_lbl, "Stop & Exit");
+    lv_label_set_text(stop_lbl, LV_SYMBOL_STOP " Stop & Exit");
     lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
     lv_obj_center(stop_lbl);
     lv_obj_add_event_cb(stop_btn, gitm_stop_btn_cb, LV_EVENT_CLICKED, NULL);
 
+    gitm_set_state(GITM_ST_CONNECTING);
     lv_refr_now(NULL);
 
     if (!ap_netif || !sta_netif) {
         lv_label_set_text(gitm_status_label, "AP/STA netif unavailable");
-        lv_obj_set_style_text_color(gitm_status_label, COLOR_MATERIAL_RED, 0);
+        gitm_set_state(GITM_ST_ERROR);
         esp_wifi_set_mode(WIFI_MODE_STA);
         return;
     }
 
-    // Wait for the STA uplink to actually hold an IPv4. The connect screen proceeds
-    // on association (STA_CONNECTED), which fires before DHCP finishes, and the
-    // APSTA switch can re-run DHCP — so wait up to 12s, the same helper WiGLE /
-    // WPA-SEC / Nmap use. Blocking, but the status line shows why.
+    // Wait for the STA uplink to actually hold an IPv4 (association fires before
+    // DHCP; the APSTA switch can re-run it). Same 12s helper as WiGLE/WPA-SEC/Nmap.
     lv_label_set_text(gitm_status_label, "Waiting for uplink IP...");
-    lv_obj_set_style_text_color(gitm_status_label, COLOR_MATERIAL_ORANGE, 0);
     lv_refr_now(NULL);
     if (!upload_wait_for_sta_ip(12000)) {
         lv_label_set_text(gitm_status_label, "No uplink IP - check network/password");
-        lv_obj_set_style_text_color(gitm_status_label, COLOR_MATERIAL_RED, 0);
+        gitm_set_state(GITM_ST_ERROR);
         esp_wifi_set_mode(WIFI_MODE_STA);
         return;
     }
-    esp_netif_ip_info_t sta_ip = {0};
-    esp_netif_get_ip_info(sta_netif, &sta_ip);   // for the log line below
 
-    // Bring up our SoftAP with the configured name/security and route via NAPT.
-    // (Same name as the uplink = a mirror; a distinct name = a plain honeypot GW.)
+    gitm_set_state(GITM_ST_STARTING);
+    lv_label_set_text(gitm_status_label, "Bringing up gateway...");
+    lv_refr_now(NULL);
+
+    // SoftAP with the configured name/security, routed via NAPT.
     capture_gateway_config_t cfg = {
         .ssid        = gitm_ap_ssid,
         .password    = (gitm_ap_open || gitm_ap_pass[0] == '\0') ? NULL : gitm_ap_pass,
@@ -15083,41 +15243,29 @@ static void show_gitm_page(void)
     esp_err_t err = capture_gateway_start(ap_netif, sta_netif, &cfg);
     if (err != ESP_OK) {
         lv_label_set_text_fmt(gitm_status_label, "Gateway start failed: %s", esp_err_to_name(err));
-        lv_obj_set_style_text_color(gitm_status_label, COLOR_MATERIAL_RED, 0);
+        gitm_set_state(GITM_ST_ERROR);
         esp_wifi_set_mode(WIFI_MODE_STA);
         return;
     }
 
-    if (gitm_capture_start(ap_netif)) {
-        char fb[80];
-        const char *base = strrchr(gitm_pcap_path, '/');
-        snprintf(fb, sizeof(fb), "Recording: %s", base ? base + 1 : gitm_pcap_path);
-        lv_label_set_text(gitm_file_label, fb);
-    } else {
-        lv_label_set_text(gitm_file_label, "PCAP capture failed (gateway still routing)");
-    }
+    gitm_capture_start(ap_netif);   // pcap tap on the AP netif; cap_label filled by the timer
 
     gitm_active = true;
-    lv_label_set_text(gitm_status_label, "Gateway active");
-    lv_obj_set_style_text_color(gitm_status_label, COLOR_MATERIAL_GREEN, 0);
-
-    // Rogue overlay: deauth any OTHER selected victims on our channel so their
-    // clients roam onto the mirror. Skips the uplink BSSID (self-kill guard).
     int victims = gitm_deauth_start();
-    if (gitm_info_label) {
-        if (victims > 0)
-            lv_label_set_text_fmt(gitm_info_label,
-                "Rogue overlay ON - deauthing %d AP(s) on ch %u. Clients of the mirrored SSID roam onto us; all are routed (NAPT) + recorded.",
-                victims, wifi_connect_channel);
-        else
-            lv_label_set_text(gitm_info_label,
-                "SoftAP-only (no other same-channel victims selected). Clients joining the mirror are routed (NAPT) + recorded.");
-    }
+    if (victims > 0)
+        lv_label_set_text_fmt(gitm_status_label,
+            "Rogue overlay: deauthing %d AP(s) on ch %u - matching-SSID clients roam onto us.",
+            victims, wifi_connect_channel);
+    else
+        lv_label_set_text(gitm_status_label,
+            "Gateway live. Clients that join the AP are routed (NAPT) + recorded.");
+    lv_obj_set_style_text_color(gitm_status_label, lv_color_make(150, 150, 150), 0);
+    gitm_set_state(GITM_ST_RUNNING);
 
     gitm_timer = lv_timer_create(gitm_timer_cb, 1000, NULL);
-    ESP_LOGI(TAG, "Rogue GITM active: AP='%s' (%s) ch=%u victims=%d uplink=" IPSTR,
-             gitm_ap_ssid, gitm_ap_open ? "open" : "wpa2", wifi_connect_channel,
-             victims, IP2STR(&sta_ip.ip));
+    gitm_timer_cb(NULL);   // populate the live view immediately
+    ESP_LOGI(TAG, "Rogue GITM active: AP='%s' (%s) ch=%u victims=%d",
+             gitm_ap_ssid, gitm_ap_open ? "open" : "wpa2", wifi_connect_channel, victims);
 }
 
 static void rogue_ap_exit_cb(lv_event_t *e)
