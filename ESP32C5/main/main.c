@@ -258,6 +258,15 @@ static lv_obj_t     *gitm_file_label   = NULL;
 static lv_timer_t   *gitm_timer        = NULL;
 static volatile bool gitm_active       = false;
 static char          gitm_pcap_path[64] = "";
+// Rogue GITM AP config (Tab5 Step 2): the SoftAP the victims join. Editable so it
+// can differ from the uplink (a distinct name is visible; an exact copy = mirror).
+static char          gitm_ap_ssid[33]  = "";
+static char          gitm_ap_pass[64]  = "";
+static bool          gitm_ap_open      = false;   // true = open AP (no password)
+static lv_obj_t     *gitm_cfg_ssid_ta  = NULL;
+static lv_obj_t     *gitm_cfg_pw_ta    = NULL;
+static lv_obj_t     *gitm_cfg_sec_dd   = NULL;
+static lv_obj_t     *gitm_cfg_kb       = NULL;
 // Timezone table + time helpers are defined in the DS3231 block far below, but
 // the Time settings UI (above it) needs them — declare them here.
 typedef struct { const char *name; const char *posix; } tz_option_t;
@@ -1775,6 +1784,10 @@ static void reset_function_page_children(void) {
     gitm_info_label = NULL;
     gitm_stats_label = NULL;
     gitm_file_label = NULL;
+    gitm_cfg_ssid_ta = NULL;
+    gitm_cfg_pw_ta = NULL;
+    gitm_cfg_sec_dd = NULL;
+    gitm_cfg_kb = NULL;
     // BLE HoneyPair: stop advertising on any nav away (title back button included)
     if (hp_screen_active) {
         honeypair_stop();
@@ -1986,6 +1999,7 @@ static void show_mitm_page(void);
 // Rogue GITM (Capture Gateway) — routed STA↔SoftAP NAPT gateway + pcap capture.
 // (gitm_stop is forward-declared earlier, above reset_function_page_children.)
 static void show_gitm_page(void);
+static void show_gitm_config_page(void);              // Tab5-style Step 2: name the AP + security
 static bool upload_wait_for_sta_ip(int timeout_ms);   // shared STA DHCP wait (defined below)
 static void stop_arp_ban(void);
 
@@ -13153,7 +13167,7 @@ static void wifi_connect_next_btn_cb(lv_event_t *e)
             show_wigle_upload_page();
             break;
         case PENDING_ATTACK_GITM:
-            show_gitm_page();
+            show_gitm_config_page();   // name the AP / security, then the live gateway
             break;
         default:
             break;
@@ -14829,15 +14843,155 @@ static void gitm_timer_cb(lv_timer_t *t)
     }
 }
 
+// ---- Rogue GITM Step 2: configure the SoftAP (Tab5-style) ------------------
+static void gitm_cfg_ta_event_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = lv_event_get_target(e);
+    if (gitm_cfg_kb) {
+        lv_keyboard_set_textarea(gitm_cfg_kb, ta);
+        lv_keyboard_set_mode(gitm_cfg_kb,
+            ta == gitm_cfg_pw_ta ? LV_KEYBOARD_MODE_TEXT_UPPER : LV_KEYBOARD_MODE_TEXT_LOWER);
+        lv_obj_clear_flag(gitm_cfg_kb, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+static void gitm_cfg_kb_event_cb(lv_event_t *e)
+{
+    (void)e;
+    if (gitm_cfg_kb) lv_obj_add_flag(gitm_cfg_kb, LV_OBJ_FLAG_HIDDEN);
+}
+static void gitm_cfg_sec_cb(lv_event_t *e)
+{
+    // 0 = WPA2, 1 = Open. Hide the password field when Open.
+    uint16_t sel = lv_dropdown_get_selected(lv_event_get_target(e));
+    if (gitm_cfg_pw_ta) {
+        if (sel == 1) lv_obj_add_flag(gitm_cfg_pw_ta, LV_OBJ_FLAG_HIDDEN);
+        else          lv_obj_clear_flag(gitm_cfg_pw_ta, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+static void gitm_cfg_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!gitm_cfg_ssid_ta) return;
+    const char *ssid = lv_textarea_get_text(gitm_cfg_ssid_ta);
+    bool open = (gitm_cfg_sec_dd && lv_dropdown_get_selected(gitm_cfg_sec_dd) == 1);
+    const char *pw = (gitm_cfg_pw_ta && !open) ? lv_textarea_get_text(gitm_cfg_pw_ta) : "";
+
+    if (!ssid || strlen(ssid) < 1 || strlen(ssid) > 32) {
+        if (gitm_cfg_ssid_ta) lv_textarea_set_placeholder_text(gitm_cfg_ssid_ta, "SSID 1-32 chars!");
+        return;
+    }
+    if (!open && (strlen(pw) < 8 || strlen(pw) > 63)) {
+        if (gitm_cfg_pw_ta) lv_textarea_set_placeholder_text(gitm_cfg_pw_ta, "WPA2 needs 8-63 chars");
+        return;
+    }
+    strncpy(gitm_ap_ssid, ssid, sizeof(gitm_ap_ssid) - 1); gitm_ap_ssid[sizeof(gitm_ap_ssid) - 1] = '\0';
+    strncpy(gitm_ap_pass, pw, sizeof(gitm_ap_pass) - 1);   gitm_ap_pass[sizeof(gitm_ap_pass) - 1] = '\0';
+    gitm_ap_open = open;
+    gitm_cfg_ssid_ta = gitm_cfg_pw_ta = gitm_cfg_sec_dd = gitm_cfg_kb = NULL;
+    show_gitm_page();
+}
+
+static void show_gitm_config_page(void)
+{
+    create_function_page_base("Rogue GITM Setup");
+    gitm_cfg_ssid_ta = gitm_cfg_pw_ta = gitm_cfg_sec_dd = gitm_cfg_kb = NULL;
+
+    lv_obj_t *info = lv_label_create(function_page);
+    lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(info, lv_pct(92));
+    lv_label_set_text_fmt(info, "Uplink: %s (ch %u). Set the AP victims will join - use a distinct name to see it, or the same SSID to mirror.",
+                          wifi_connect_ssid[0] ? wifi_connect_ssid : "(hidden)", wifi_connect_channel);
+    lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(info, lv_color_make(150, 150, 150), 0);
+    lv_obj_align(info, LV_ALIGN_TOP_MID, 0, 34);
+
+    lv_obj_t *ssid_lbl = lv_label_create(function_page);
+    lv_label_set_text(ssid_lbl, "AP name (SSID):");
+    lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ssid_lbl, ui_text_color(), 0);
+    lv_obj_align(ssid_lbl, LV_ALIGN_TOP_LEFT, 16, 78);
+
+    gitm_cfg_ssid_ta = lv_textarea_create(function_page);
+    lv_textarea_set_one_line(gitm_cfg_ssid_ta, true);
+    lv_textarea_set_text(gitm_cfg_ssid_ta, wifi_connect_ssid);   // default = uplink SSID
+    lv_obj_set_width(gitm_cfg_ssid_ta, lv_pct(92));
+    lv_obj_align(gitm_cfg_ssid_ta, LV_ALIGN_TOP_MID, 0, 98);
+    lv_obj_add_event_cb(gitm_cfg_ssid_ta, gitm_cfg_ta_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *sec_lbl = lv_label_create(function_page);
+    lv_label_set_text(sec_lbl, "Security:");
+    lv_obj_set_style_text_font(sec_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sec_lbl, ui_text_color(), 0);
+    lv_obj_align(sec_lbl, LV_ALIGN_TOP_LEFT, 16, 146);
+
+    gitm_cfg_sec_dd = lv_dropdown_create(function_page);
+    lv_dropdown_set_options(gitm_cfg_sec_dd, "WPA2\nOpen");
+    lv_dropdown_set_selected(gitm_cfg_sec_dd, wifi_connect_password[0] ? 0 : 1);
+    lv_obj_set_width(gitm_cfg_sec_dd, 140);
+    lv_obj_align(gitm_cfg_sec_dd, LV_ALIGN_TOP_LEFT, 110, 142);
+    lv_obj_add_event_cb(gitm_cfg_sec_dd, gitm_cfg_sec_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    gitm_cfg_pw_ta = lv_textarea_create(function_page);
+    lv_textarea_set_one_line(gitm_cfg_pw_ta, true);
+    lv_textarea_set_password_mode(gitm_cfg_pw_ta, true);
+    lv_textarea_set_placeholder_text(gitm_cfg_pw_ta, "WPA2 password (8-63)");
+    lv_textarea_set_text(gitm_cfg_pw_ta, wifi_connect_password);   // default = uplink password
+    lv_obj_set_width(gitm_cfg_pw_ta, lv_pct(92));
+    lv_obj_align(gitm_cfg_pw_ta, LV_ALIGN_TOP_MID, 0, 182);
+    lv_obj_add_event_cb(gitm_cfg_pw_ta, gitm_cfg_ta_event_cb, LV_EVENT_CLICKED, NULL);
+    if (!wifi_connect_password[0]) lv_obj_add_flag(gitm_cfg_pw_ta, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *start = lv_btn_create(function_page);
+    lv_obj_set_size(start, 160, 44);
+    lv_obj_align(start, LV_ALIGN_TOP_MID, 0, 228);
+    lv_obj_set_style_bg_color(start, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(start, 8, 0);
+    lv_obj_set_style_border_width(start, 0, 0);
+    lv_obj_t *start_lbl = lv_label_create(start);
+    lv_label_set_text(start_lbl, LV_SYMBOL_PLAY " Start Gateway");
+    lv_obj_set_style_text_color(start_lbl, lv_color_white(), 0);
+    lv_obj_center(start_lbl);
+    lv_obj_add_event_cb(start, gitm_cfg_start_cb, LV_EVENT_CLICKED, NULL);
+
+    // On-demand keyboard (hidden until a field is tapped).
+    gitm_cfg_kb = lv_keyboard_create(function_page);
+    lv_keyboard_set_mode(gitm_cfg_kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_keyboard_set_textarea(gitm_cfg_kb, gitm_cfg_ssid_ta);
+    lv_obj_set_size(gitm_cfg_kb, lv_pct(100), lv_pct(40));
+    lv_obj_align(gitm_cfg_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(gitm_cfg_kb, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(gitm_cfg_kb, gitm_cfg_kb_event_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(gitm_cfg_kb, gitm_cfg_kb_event_cb, LV_EVENT_CANCEL, NULL);
+}
+
 static void show_gitm_page(void)
 {
     create_function_page_base("Rogue GITM");
 
     // The STA uplink is already connected from the WiFi Connect screen. Add the
     // SoftAP without tearing down STA.
-    esp_wifi_set_mode(WIFI_MODE_APSTA);
+    // Bring up APSTA correctly (same sequence wifi_attacks uses). A fresh AP netif
+    // must be created with WiFi stopped, then mode set, then WiFi restarted — doing
+    // it while running (or setting APSTA before the netif exists) leaves the AP
+    // interface unusable and capture_gateway_start() fails. The stop/start drops
+    // the STA, so we reconnect it and the IP wait below re-acquires the lease.
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (!ap_netif) ap_netif = esp_netif_create_default_wifi_ap();
+    if (!ap_netif) {
+        esp_wifi_stop();
+        ap_netif = esp_netif_create_default_wifi_ap();
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        esp_wifi_start();
+        apply_wifi_power_settings();
+        vTaskDelay(pdMS_TO_TICKS(300));
+        esp_wifi_connect();               // STA config persists; rejoin the uplink
+    } else {
+        wifi_mode_t mode;
+        esp_wifi_get_mode(&mode);
+        if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
+            esp_wifi_set_mode(WIFI_MODE_APSTA);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
     esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
 
     // --- UI ---
@@ -14853,8 +15007,9 @@ static void show_gitm_page(void)
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = lv_label_create(content);
-    lv_label_set_text_fmt(title, LV_SYMBOL_LOOP " Mirror: %s  (ch %u)",
-                          wifi_connect_ssid[0] ? wifi_connect_ssid : "(hidden)", wifi_connect_channel);
+    lv_label_set_text_fmt(title, LV_SYMBOL_LOOP " AP: %s  (%s, ch %u)",
+                          gitm_ap_ssid[0] ? gitm_ap_ssid : "(hidden)",
+                          gitm_ap_open ? "open" : "WPA2", wifi_connect_channel);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(title, lv_color_make(0, 150, 136), 0);
 
@@ -14917,10 +15072,11 @@ static void show_gitm_page(void)
     esp_netif_ip_info_t sta_ip = {0};
     esp_netif_get_ip_info(sta_netif, &sta_ip);   // for the log line below
 
-    // Mirror the uplink SSID/password on our SoftAP and route via NAPT.
+    // Bring up our SoftAP with the configured name/security and route via NAPT.
+    // (Same name as the uplink = a mirror; a distinct name = a plain honeypot GW.)
     capture_gateway_config_t cfg = {
-        .ssid        = wifi_connect_ssid,
-        .password    = wifi_connect_password[0] ? wifi_connect_password : NULL,
+        .ssid        = gitm_ap_ssid,
+        .password    = (gitm_ap_open || gitm_ap_pass[0] == '\0') ? NULL : gitm_ap_pass,
         .channel     = wifi_connect_channel,
         .max_clients = 4,
     };
@@ -14959,8 +15115,9 @@ static void show_gitm_page(void)
     }
 
     gitm_timer = lv_timer_create(gitm_timer_cb, 1000, NULL);
-    ESP_LOGI(TAG, "Rogue GITM active: mirror='%s' ch=%u victims=%d uplink=" IPSTR,
-             wifi_connect_ssid, wifi_connect_channel, victims, IP2STR(&sta_ip.ip));
+    ESP_LOGI(TAG, "Rogue GITM active: AP='%s' (%s) ch=%u victims=%d uplink=" IPSTR,
+             gitm_ap_ssid, gitm_ap_open ? "open" : "wpa2", wifi_connect_channel,
+             victims, IP2STR(&sta_ip.ip));
 }
 
 static void rogue_ap_exit_cb(lv_event_t *e)
