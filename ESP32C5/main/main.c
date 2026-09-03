@@ -276,6 +276,9 @@ static lv_obj_t     *gitm_cfg_ssid_ta  = NULL;
 static lv_obj_t     *gitm_cfg_pw_ta    = NULL;
 static lv_obj_t     *gitm_cfg_sec_dd   = NULL;
 static lv_obj_t     *gitm_cfg_deauth_dd = NULL;
+static lv_obj_t     *gitm_cfg_pw_lbl   = NULL;   // "Password:" label (hidden with the field)
+static lv_obj_t     *gitm_cfg_pw_eye   = NULL;   // show/hide toggle button
+static lv_obj_t     *gitm_cfg_pw_eye_lbl = NULL;
 static lv_obj_t     *gitm_cfg_kb       = NULL;
 // Timezone table + time helpers are defined in the DS3231 block far below, but
 // the Time settings UI (above it) needs them — declare them here.
@@ -1802,6 +1805,9 @@ static void reset_function_page_children(void) {
     gitm_cfg_pw_ta = NULL;
     gitm_cfg_sec_dd = NULL;
     gitm_cfg_deauth_dd = NULL;
+    gitm_cfg_pw_lbl = NULL;
+    gitm_cfg_pw_eye = NULL;
+    gitm_cfg_pw_eye_lbl = NULL;
     gitm_cfg_kb = NULL;
     // BLE HoneyPair: stop advertising on any nav away (title back button included)
     if (hp_screen_active) {
@@ -14960,6 +14966,14 @@ static void gitm_stop_btn_cb(lv_event_t *e)
     gitm_stop();
     nav_to_menu_flag = true;
 }
+// Back: tear down the gateway but return to the Setup screen (STA uplink stays up)
+// so the user can change the AP name / security / deauth and retry.
+static void gitm_back_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    gitm_stop();
+    show_gitm_config_page();
+}
 
 // ---- Tab5-style session state chip ----
 enum { GITM_ST_IDLE = 0, GITM_ST_CONNECTING, GITM_ST_STARTING, GITM_ST_RUNNING,
@@ -15112,10 +15126,29 @@ static void gitm_cfg_sec_cb(lv_event_t *e)
 {
     // 0 = WPA2, 1 = Open. Hide the password field when Open.
     uint16_t sel = lv_dropdown_get_selected(lv_event_get_target(e));
+    bool hide = (sel == 1);
     if (gitm_cfg_pw_ta) {
-        if (sel == 1) lv_obj_add_flag(gitm_cfg_pw_ta, LV_OBJ_FLAG_HIDDEN);
-        else          lv_obj_clear_flag(gitm_cfg_pw_ta, LV_OBJ_FLAG_HIDDEN);
+        if (hide) lv_obj_add_flag(gitm_cfg_pw_ta, LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_clear_flag(gitm_cfg_pw_ta, LV_OBJ_FLAG_HIDDEN);
     }
+    if (gitm_cfg_pw_lbl) {
+        if (hide) lv_obj_add_flag(gitm_cfg_pw_lbl, LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_clear_flag(gitm_cfg_pw_lbl, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (gitm_cfg_pw_eye) {
+        if (hide) lv_obj_add_flag(gitm_cfg_pw_eye, LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_clear_flag(gitm_cfg_pw_eye, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+// Show/hide the password (same pattern as the Admin Portal field).
+static void gitm_cfg_pw_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!gitm_cfg_pw_ta) return;
+    bool hidden = lv_textarea_get_password_mode(gitm_cfg_pw_ta);
+    lv_textarea_set_password_mode(gitm_cfg_pw_ta, !hidden);
+    if (gitm_cfg_pw_eye_lbl)
+        lv_label_set_text(gitm_cfg_pw_eye_lbl, hidden ? LV_SYMBOL_EYE_OPEN : LV_SYMBOL_EYE_CLOSE);
 }
 static void gitm_cfg_start_cb(lv_event_t *e)
 {
@@ -15137,14 +15170,16 @@ static void gitm_cfg_start_cb(lv_event_t *e)
     strncpy(gitm_ap_ssid, ssid, sizeof(gitm_ap_ssid) - 1); gitm_ap_ssid[sizeof(gitm_ap_ssid) - 1] = '\0';
     strncpy(gitm_ap_pass, pw, sizeof(gitm_ap_pass) - 1);   gitm_ap_pass[sizeof(gitm_ap_pass) - 1] = '\0';
     gitm_ap_open = open;
-    gitm_cfg_ssid_ta = gitm_cfg_pw_ta = gitm_cfg_sec_dd = gitm_cfg_deauth_dd = gitm_cfg_kb = NULL;
+    gitm_cfg_ssid_ta = gitm_cfg_pw_ta = gitm_cfg_sec_dd = gitm_cfg_deauth_dd = gitm_cfg_pw_lbl = NULL;
+    gitm_cfg_pw_eye = gitm_cfg_pw_eye_lbl = gitm_cfg_kb = NULL;
     show_gitm_page();
 }
 
 static void show_gitm_config_page(void)
 {
     create_function_page_base("Rogue GITM Setup");
-    gitm_cfg_ssid_ta = gitm_cfg_pw_ta = gitm_cfg_sec_dd = gitm_cfg_deauth_dd = gitm_cfg_kb = NULL;
+    gitm_cfg_ssid_ta = gitm_cfg_pw_ta = gitm_cfg_sec_dd = gitm_cfg_deauth_dd = gitm_cfg_pw_lbl = NULL;
+    gitm_cfg_pw_eye = gitm_cfg_pw_eye_lbl = gitm_cfg_kb = NULL;
 
     lv_obj_t *info = lv_label_create(function_page);
     lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
@@ -15155,59 +15190,90 @@ static void show_gitm_config_page(void)
     lv_obj_set_style_text_color(info, lv_color_make(150, 150, 150), 0);
     lv_obj_align(info, LV_ALIGN_TOP_MID, 0, 34);
 
+    // Two-row grid: text field on the left, dropdown on the right, label above each.
+    // Left column x=12 (field w=264); right column x=290 (dropdown w=178).
+    const int LX = 12, LW = 264, RX = 290, RW = 178;
+    const int R1_LBL = 66, R1_FLD = 86, R2_LBL = 132, R2_FLD = 152;
+
+    // Row 1 left: AP name
     lv_obj_t *ssid_lbl = lv_label_create(function_page);
-    lv_label_set_text(ssid_lbl, "AP name (SSID):");
+    lv_label_set_text(ssid_lbl, "AP name (SSID)");
     lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(ssid_lbl, ui_text_color(), 0);
-    lv_obj_align(ssid_lbl, LV_ALIGN_TOP_LEFT, 16, 70);
+    lv_obj_align(ssid_lbl, LV_ALIGN_TOP_LEFT, LX, R1_LBL);
 
     gitm_cfg_ssid_ta = lv_textarea_create(function_page);
     lv_textarea_set_one_line(gitm_cfg_ssid_ta, true);
     lv_textarea_set_text(gitm_cfg_ssid_ta, wifi_connect_ssid);   // default = uplink SSID
-    lv_obj_set_width(gitm_cfg_ssid_ta, lv_pct(92));
-    lv_obj_align(gitm_cfg_ssid_ta, LV_ALIGN_TOP_MID, 0, 88);
+    lv_obj_set_width(gitm_cfg_ssid_ta, LW);
+    lv_obj_align(gitm_cfg_ssid_ta, LV_ALIGN_TOP_LEFT, LX, R1_FLD);
     lv_obj_add_event_cb(gitm_cfg_ssid_ta, gitm_cfg_ta_event_cb, LV_EVENT_CLICKED, NULL);
 
+    // Row 1 right: Security
     lv_obj_t *sec_lbl = lv_label_create(function_page);
-    lv_label_set_text(sec_lbl, "Security:");
+    lv_label_set_text(sec_lbl, "Security");
     lv_obj_set_style_text_font(sec_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(sec_lbl, ui_text_color(), 0);
-    lv_obj_align(sec_lbl, LV_ALIGN_TOP_LEFT, 16, 130);
+    lv_obj_align(sec_lbl, LV_ALIGN_TOP_LEFT, RX, R1_LBL);
 
     gitm_cfg_sec_dd = lv_dropdown_create(function_page);
     lv_dropdown_set_options(gitm_cfg_sec_dd, "WPA2\nOpen");
     lv_dropdown_set_selected(gitm_cfg_sec_dd, wifi_connect_password[0] ? 0 : 1);
-    lv_obj_set_width(gitm_cfg_sec_dd, 140);
-    lv_obj_align(gitm_cfg_sec_dd, LV_ALIGN_TOP_LEFT, 110, 126);
+    lv_obj_set_width(gitm_cfg_sec_dd, RW);
+    lv_obj_align(gitm_cfg_sec_dd, LV_ALIGN_TOP_LEFT, RX, R1_FLD);
     lv_obj_add_event_cb(gitm_cfg_sec_dd, gitm_cfg_sec_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Row 2 left: Password (label + field hidden together when Open)
+    gitm_cfg_pw_lbl = lv_label_create(function_page);
+    lv_label_set_text(gitm_cfg_pw_lbl, "Password");
+    lv_obj_set_style_text_font(gitm_cfg_pw_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gitm_cfg_pw_lbl, ui_text_color(), 0);
+    lv_obj_align(gitm_cfg_pw_lbl, LV_ALIGN_TOP_LEFT, LX, R2_LBL);
 
     gitm_cfg_pw_ta = lv_textarea_create(function_page);
     lv_textarea_set_one_line(gitm_cfg_pw_ta, true);
     lv_textarea_set_password_mode(gitm_cfg_pw_ta, true);
-    lv_textarea_set_placeholder_text(gitm_cfg_pw_ta, "WPA2 password (8-63)");
+    lv_textarea_set_placeholder_text(gitm_cfg_pw_ta, "8-63 chars");
     lv_textarea_set_text(gitm_cfg_pw_ta, wifi_connect_password);   // default = uplink password
-    lv_obj_set_width(gitm_cfg_pw_ta, lv_pct(92));
-    lv_obj_align(gitm_cfg_pw_ta, LV_ALIGN_TOP_MID, 0, 162);
+    lv_obj_set_width(gitm_cfg_pw_ta, LW - 52);                     // leave room for the eye button
+    lv_obj_align(gitm_cfg_pw_ta, LV_ALIGN_TOP_LEFT, LX, R2_FLD);
     lv_obj_add_event_cb(gitm_cfg_pw_ta, gitm_cfg_ta_event_cb, LV_EVENT_CLICKED, NULL);
-    if (!wifi_connect_password[0]) lv_obj_add_flag(gitm_cfg_pw_ta, LV_OBJ_FLAG_HIDDEN);
 
-    // Deauth mode: Off / Broadcast a separately-selected victim / Targeted unicast
-    // of the target AP(s)' clients (forces roam even same-network).
+    // Show/hide eye button, right of the password field (like the Admin Portal).
+    gitm_cfg_pw_eye = lv_btn_create(function_page);
+    lv_obj_set_size(gitm_cfg_pw_eye, 46, 38);
+    lv_obj_align_to(gitm_cfg_pw_eye, gitm_cfg_pw_ta, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
+    lv_obj_set_style_bg_color(gitm_cfg_pw_eye, ui_accent_color(), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(gitm_cfg_pw_eye, 8, 0);
+    gitm_cfg_pw_eye_lbl = lv_label_create(gitm_cfg_pw_eye);
+    lv_label_set_text(gitm_cfg_pw_eye_lbl, LV_SYMBOL_EYE_CLOSE);
+    lv_obj_set_style_text_font(gitm_cfg_pw_eye_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(gitm_cfg_pw_eye_lbl, lv_color_white(), 0);
+    lv_obj_center(gitm_cfg_pw_eye_lbl);
+    lv_obj_add_event_cb(gitm_cfg_pw_eye, gitm_cfg_pw_toggle_cb, LV_EVENT_CLICKED, NULL);
+
+    if (!wifi_connect_password[0]) {
+        lv_obj_add_flag(gitm_cfg_pw_ta, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(gitm_cfg_pw_lbl, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(gitm_cfg_pw_eye, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Row 2 right: Deauth mode (Off / Broadcast a separate victim / Targeted unicast)
     lv_obj_t *da_lbl = lv_label_create(function_page);
-    lv_label_set_text(da_lbl, "Deauth:");
+    lv_label_set_text(da_lbl, "Deauth");
     lv_obj_set_style_text_font(da_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(da_lbl, ui_text_color(), 0);
-    lv_obj_align(da_lbl, LV_ALIGN_TOP_LEFT, 16, 200);
+    lv_obj_align(da_lbl, LV_ALIGN_TOP_LEFT, RX, R2_LBL);
 
     gitm_cfg_deauth_dd = lv_dropdown_create(function_page);
-    lv_dropdown_set_options(gitm_cfg_deauth_dd, "Off\nBroadcast victim\nTargeted clients");
+    lv_dropdown_set_options(gitm_cfg_deauth_dd, "Off\nBroadcast\nTargeted");
     lv_dropdown_set_selected(gitm_cfg_deauth_dd, 0);
-    lv_obj_set_width(gitm_cfg_deauth_dd, 200);
-    lv_obj_align(gitm_cfg_deauth_dd, LV_ALIGN_TOP_LEFT, 110, 196);
+    lv_obj_set_width(gitm_cfg_deauth_dd, RW);
+    lv_obj_align(gitm_cfg_deauth_dd, LV_ALIGN_TOP_LEFT, RX, R2_FLD);
 
     lv_obj_t *start = lv_btn_create(function_page);
-    lv_obj_set_size(start, 160, 42);
-    lv_obj_align(start, LV_ALIGN_TOP_MID, 0, 240);
+    lv_obj_set_size(start, 180, 44);
+    lv_obj_align(start, LV_ALIGN_TOP_MID, 0, 210);
     lv_obj_set_style_bg_color(start, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_radius(start, 8, 0);
     lv_obj_set_style_border_width(start, 0, 0);
@@ -15217,12 +15283,20 @@ static void show_gitm_config_page(void)
     lv_obj_center(start_lbl);
     lv_obj_add_event_cb(start, gitm_cfg_start_cb, LV_EVENT_CLICKED, NULL);
 
-    // On-demand keyboard (hidden until a field is tapped).
+    // On-demand keyboard — same size/placement/theme as the rest of the UI
+    // (WiFi Connect / Add home network screens).
     gitm_cfg_kb = lv_keyboard_create(function_page);
     lv_keyboard_set_mode(gitm_cfg_kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_keyboard_set_textarea(gitm_cfg_kb, gitm_cfg_ssid_ta);
     lv_obj_set_size(gitm_cfg_kb, lv_pct(100), lv_pct(40));
     lv_obj_align(gitm_cfg_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(gitm_cfg_kb, ui_bg_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(gitm_cfg_kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(gitm_cfg_kb, lv_color_make(0, 100, 0), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(gitm_cfg_kb, lv_color_make(0, 150, 0), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(gitm_cfg_kb, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_color(gitm_cfg_kb, ui_border_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_width(gitm_cfg_kb, 1, LV_PART_ITEMS);
     lv_obj_add_flag(gitm_cfg_kb, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(gitm_cfg_kb, gitm_cfg_kb_event_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(gitm_cfg_kb, gitm_cfg_kb_event_cb, LV_EVENT_CANCEL, NULL);
@@ -15342,8 +15416,30 @@ static void show_gitm_page(void)
     lv_obj_set_style_text_font(gitm_rec_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(gitm_rec_label, COLOR_MATERIAL_GREEN, 0);
 
-    lv_obj_t *stop_btn = lv_btn_create(content);
-    lv_obj_set_size(stop_btn, lv_pct(100), 40);
+    // Button row: Back (to Setup, keeps the uplink) + Stop & Exit (to menu).
+    lv_obj_t *btn_row = lv_obj_create(content);
+    lv_obj_set_size(btn_row, lv_pct(100), 46);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_style_pad_column(btn_row, 8, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(back_btn, 150, 42);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, gitm_back_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *stop_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(stop_btn, 150, 42);
     lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_radius(stop_btn, 8, 0);
     lv_obj_set_style_border_width(stop_btn, 0, 0);
