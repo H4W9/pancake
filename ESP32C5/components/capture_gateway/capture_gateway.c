@@ -387,11 +387,13 @@ esp_err_t capture_gateway_start(esp_netif_t *ap_netif,
 
     err = capture_gateway_start_dhcp(ap_netif);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "start_dhcp failed: %s", esp_err_to_name(err));
         goto fail;
     }
 
     err = esp_netif_napt_enable(ap_netif);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "napt_enable failed: %s (is CONFIG_LWIP_IPV4_NAPT set?)", esp_err_to_name(err));
         capture_gateway_stop_dhcp(ap_netif);
         goto fail;
     }

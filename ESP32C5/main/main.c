@@ -616,6 +616,15 @@ static void inspect_task(void *arg)
     // Keep sweeping the list, re-sniffing any AP that hasn't yielded a beacon
     // yet, until every AP is resolved (or the screen is left). MFP shows "?"
     // until that AP's beacon lands, then updates live to req/opt/no + uptime.
+    // Enable monitor mode ONCE with a beacon (MGMT) filter, then hop channels per
+    // AP. esp_wifi_set_channel only takes effect while promiscuous is on, and
+    // without the MGMT filter the driver never delivers beacons to our callback —
+    // both were the reason MFP stayed "?".
+    wifi_promiscuous_filter_t ifilt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+    esp_wifi_set_promiscuous_filter(&ifilt);
+    esp_wifi_set_promiscuous_rx_cb(inspect_beacon_cb);
+    esp_wifi_set_promiscuous(true);
+
     int sweeps = 0;
     while (inspect_active) {
         int unresolved = 0;
@@ -625,15 +634,12 @@ static void inspect_task(void *arg)
             memset((void *)&g_inspect, 0, sizeof(g_inspect));
             memcpy((void *)g_inspect.bssid, inspect_bssid[i], 6);
             esp_wifi_set_channel(inspect_chan[i], WIFI_SECOND_CHAN_NONE);
-            esp_wifi_set_promiscuous_rx_cb(inspect_beacon_cb);
-            esp_wifi_set_promiscuous(true);
             g_inspect.active = true;
             for (int w = 0; w < 16 && inspect_active && g_inspect.beacons_seen == 0; w++) {
                 vTaskDelay(pdMS_TO_TICKS(50));   // up to ~0.8 s per AP per sweep
             }
             g_inspect.active = false;
             if (!inspect_active) break;          // cancelled: leave the radio to the next owner
-            esp_wifi_set_promiscuous(false);
 
             const uint8_t *b = inspect_bssid[i];
             uint8_t oui3[3] = { b[0], b[1], b[2] };
