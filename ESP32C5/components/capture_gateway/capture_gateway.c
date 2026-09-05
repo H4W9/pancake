@@ -391,9 +391,20 @@ esp_err_t capture_gateway_start(esp_netif_t *ap_netif,
         goto fail;
     }
 
-    err = esp_netif_napt_enable(ap_netif);
+    // Setting the AP IP just above bounces the AP netif down->up; esp_netif_napt_enable
+    // returns ESP_FAIL if it runs while the netif is momentarily down. Retry briefly so
+    // a transient race doesn't kill the whole gateway (a genuine NOT_SUPPORTED / config
+    // problem still fails out after the retries, logged).
+    err = ESP_FAIL;
+    for (int attempt = 0; attempt < 6; attempt++) {
+        err = esp_netif_napt_enable(ap_netif);
+        if (err == ESP_OK) break;
+        ESP_LOGW(TAG, "napt_enable attempt %d: %s; retrying", attempt + 1, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "napt_enable failed: %s (is CONFIG_LWIP_IPV4_NAPT set?)", esp_err_to_name(err));
+        ESP_LOGE(TAG, "napt_enable failed after retries: %s (is CONFIG_LWIP_IPV4_NAPT set?)",
+                 esp_err_to_name(err));
         capture_gateway_stop_dhcp(ap_netif);
         goto fail;
     }
