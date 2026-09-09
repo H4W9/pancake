@@ -600,6 +600,10 @@ static void inspect_task(void *arg)
     esp_wifi_set_promiscuous_filter(&ifilt);
     esp_wifi_set_promiscuous_rx_cb(inspect_beacon_cb);
     pr = esp_wifi_set_promiscuous(true);
+    // Warm-up: monitor mode + the first channel set take ~150-200 ms to actually
+    // start delivering frames. Without this the first APs in the list are inspected
+    // before the radio is ready and never catch a beacon (their MFP stayed "?").
+    vTaskDelay(pdMS_TO_TICKS(200));
     ESP_LOGI(TAG, "inspect_task start: count=%d wifi_mode=%d promisc_ret=%s",
              inspect_count, (int)imode, esp_err_to_name(pr));
 
@@ -612,9 +616,10 @@ static void inspect_task(void *arg)
             memset((void *)&g_inspect, 0, sizeof(g_inspect));
             memcpy((void *)g_inspect.bssid, inspect_bssid[i], 6);
             esp_wifi_set_channel(inspect_chan[i], WIFI_SECOND_CHAN_NONE);
+            vTaskDelay(pdMS_TO_TICKS(60));       // let the radio settle on the new channel
             g_inspect.active = true;
-            for (int w = 0; w < 16 && inspect_active && g_inspect.beacons_seen == 0; w++) {
-                vTaskDelay(pdMS_TO_TICKS(50));   // up to ~0.8 s per AP per sweep
+            for (int w = 0; w < 24 && inspect_active && g_inspect.beacons_seen == 0; w++) {
+                vTaskDelay(pdMS_TO_TICKS(50));   // up to ~1.2 s per AP per sweep
             }
             g_inspect.active = false;
             if (!inspect_active) break;          // cancelled: leave the radio to the next owner
@@ -7562,7 +7567,7 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     
     // Set new client callback for UI refresh
     wifi_sniffer_set_new_client_callback(sniffer_new_client_notify);
-    
+
     // Auto-start sniffer task
     if (!sniffer_task_active) {
         ESP_LOGI(TAG, "Starting WiFi Sniffer...");
@@ -12547,6 +12552,12 @@ static void main_tile_event_cb(lv_event_t *e)
     } else if (strcmp(tile_name, "Global WiFi Attacks") == 0) {
         show_global_attacks_screen();
     } else if (strcmp(tile_name, "WiFi Sniff&Karma") == 0) {
+        // From the main menu the Observer monitors ALL networks: clear any leftover
+        // Scan & Attack selection so the sniffer starts in scan-all mode rather than
+        // selected-networks-only mode. (Opening it from Scan & Attack keeps the
+        // selection so it focuses on the picked AP.)
+        wifi_scanner_clear_selections();
+        g_shared_selected_count = 0;
         sniffer_yes_btn_cb(NULL);  // Skip intermediate screen, go directly to Network Observer
     } else if (strcmp(tile_name, "Settings") == 0) {
         show_settings_screen();
