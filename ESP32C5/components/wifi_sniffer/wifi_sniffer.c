@@ -453,7 +453,11 @@ esp_err_t wifi_sniffer_start(void) {
     sniffer_packet_count = 0;
     sniffer_selected_channels_count = 0;
     memset(sniffer_selected_channels, 0, sizeof(sniffer_selected_channels));
-    
+    // Clear any leftover pause from a previous single-AP observation session
+    // (wifi_sniffer_set_fixed_channel pauses the hopper). Without this the hop
+    // task can start up already paused and sit on channel 1 forever.
+    sniffer_channel_hop_paused = false;
+
     // Check if networks were selected
     if (g_shared_selected_count > 0) {
         // Selected networks mode - skip scan, use selected networks only

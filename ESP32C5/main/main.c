@@ -319,6 +319,7 @@ static volatile uint16_t touch_y_flag = 0;
 static volatile bool show_touch_dot = true;
 static volatile bool ui_locked = false;
 static volatile bool nav_to_menu_flag = false;
+static volatile bool nav_to_attack_tiles_flag = false;  // deferred back to Select Attack (from Radar)
 static volatile int64_t last_input_ms = 0;
 static volatile bool screen_dimmed = false;
 static volatile bool ignore_touch_until_release = false;
@@ -600,10 +601,16 @@ static void inspect_task(void *arg)
     esp_wifi_set_promiscuous_filter(&ifilt);
     esp_wifi_set_promiscuous_rx_cb(inspect_beacon_cb);
     pr = esp_wifi_set_promiscuous(true);
-    // Warm-up: monitor mode + the first channel set take ~150-200 ms to actually
-    // start delivering frames. Without this the first APs in the list are inspected
-    // before the radio is ready and never catch a beacon (their MFP stayed "?").
-    vTaskDelay(pdMS_TO_TICKS(200));
+    // Warm-up: monitor mode + the first channel set take ~300-400 ms to actually
+    // start delivering frames (the diag shows beacon delivery ramping up over the
+    // first ~second of a run). Do the warm-up ON THE FIRST AP's channel so row 0 is
+    // inspected on an already-hot, already-settled radio instead of paying the
+    // cold-start cost — otherwise the first AP consistently missed its beacon and
+    // its MFP stayed "?".
+    if (inspect_count > 0) {
+        esp_wifi_set_channel(inspect_chan[0], WIFI_SECOND_CHAN_NONE);
+    }
+    vTaskDelay(pdMS_TO_TICKS(400));
     ESP_LOGI(TAG, "inspect_task start: count=%d wifi_mode=%d promisc_ret=%s",
              inspect_count, (int)imode, esp_err_to_name(pr));
 
@@ -4506,6 +4513,10 @@ static void display_refresh_task(void *pvParameters)
             if (nav_to_menu_flag) {
                 nav_to_menu_flag = false;
                 show_menu();
+            }
+            if (nav_to_attack_tiles_flag) {
+                nav_to_attack_tiles_flag = false;
+                show_attack_tiles_screen();
             }
 
             // Process Evil Twin UI events
@@ -12421,7 +12432,10 @@ static void radar_timer_cb(lv_timer_t *t) {
 
 static void radar_back_btn_cb(lv_event_t *e) {
     (void)e;
-    nav_to_menu_flag = true;   // reset_function_page_children() does the teardown
+    // Return to the attack-selection screen (Radar is launched from there), not
+    // the main menu. Deferred so the page rebuild happens outside this event;
+    // show_attack_tiles_screen() -> reset_function_page_children() tears radar down.
+    nav_to_attack_tiles_flag = true;
 }
 
 static void show_ap_radar_screen(int scan_idx) {

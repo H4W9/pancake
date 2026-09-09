@@ -414,7 +414,14 @@ static void send_beacon_frame(const uint8_t *buf, int size)
 static void beacon_spam_task(void *pv)
 {
     (void)pv;
-    const uint8_t first_channel = 1, last_channel = 13;
+    // Dual-band sweep: 2.4 GHz (1-13) + non-DFS 5 GHz (UNII-1 36-48, UNII-3
+    // 149-165). DFS channels (52-144) are skipped because active beacon TX there
+    // requires radar detection and the radio won't transmit on them.
+    static const uint8_t spam_channels[] = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+        36, 40, 44, 48, 149, 153, 157, 161, 165
+    };
+    const int spam_channel_count = (int)(sizeof(spam_channels) / sizeof(spam_channels[0]));
     uint8_t frame[256];
 
     // Give each SSID its own stable, random, locally-administered BSSID so the fake
@@ -432,11 +439,12 @@ static void beacon_spam_task(void *pv)
         ssid_bssids[i][5] = (uint8_t)(r2 >> 8);
     }
 
-    ESP_LOGI(TAG, "Beacon spam started (%d SSIDs, ch %u-%u, unique BSSIDs)",
-             beacon_ssid_count, first_channel, last_channel);
+    ESP_LOGI(TAG, "Beacon spam started (%d SSIDs, %d channels 2.4+5 GHz, unique BSSIDs)",
+             beacon_ssid_count, spam_channel_count);
 
     while (beacon_spam_active) {
-        for (uint8_t ch = first_channel; ch <= last_channel && beacon_spam_active; ch++) {
+        for (int ci = 0; ci < spam_channel_count && beacon_spam_active; ci++) {
+            uint8_t ch = spam_channels[ci];
             esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
             vTaskDelay(pdMS_TO_TICKS(3));   // let the channel settle
             for (int i = 0; i < beacon_ssid_count && beacon_spam_active; i++) {
