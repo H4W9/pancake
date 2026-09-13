@@ -489,8 +489,12 @@ esp_err_t wifi_sniffer_start(void) {
         esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE);
         
         // Start channel hopping task
-        xTaskCreate(sniffer_channel_hop_task, "sniffer_ch_hop", 4096, NULL, 5, &sniffer_channel_task_handle);
-        
+        BaseType_t ok = xTaskCreate(sniffer_channel_hop_task, "sniffer_ch_hop", 4096, NULL, 5, &sniffer_channel_task_handle);
+        if (ok != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create channel hop task (internal RAM low)");
+            sniffer_channel_task_handle = NULL;
+        }
+
         ESP_LOGI(TAG, "[Sniffer] Now monitoring selected networks (no scan performed)");
         
     } else {
@@ -510,13 +514,21 @@ esp_err_t wifi_sniffer_start(void) {
         
         esp_wifi_set_promiscuous(true);
         esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_packet_handler);
-        
+
         sniffer_active = true;
         sniffer_channel_index = 0;
-        
-        // Start channel hopping task
-        xTaskCreate(sniffer_channel_hop_task, "sniffer_ch_hop", 16384, NULL, 5, &sniffer_channel_task_handle);
-        
+        sniffer_current_channel = channel_list[0];
+        esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE);
+
+        // Start channel hopping task. 4096 B matches the selected-mode task and
+        // fits the scarce internal RAM (~42 KB free) — 16384 B silently failed to
+        // create here, leaving the radio parked on channel 1 (no hopping).
+        BaseType_t ok = xTaskCreate(sniffer_channel_hop_task, "sniffer_ch_hop", 4096, NULL, 5, &sniffer_channel_task_handle);
+        if (ok != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create channel hop task (internal RAM low)");
+            sniffer_channel_task_handle = NULL;
+        }
+
         ESP_LOGI(TAG, "[Sniffer] Started - monitoring packets...");
     }
     
@@ -769,12 +781,18 @@ esp_err_t wifi_sniffer_start_noscan(void) {
     sniffer_current_channel = channel_list[0];
     esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE);
     
-    // Start channel hopping task
+    // Start channel hopping task. 4096 B matches the other start paths and fits
+    // the scarce internal RAM; check the result so a failed create can't leave the
+    // radio silently parked on one channel.
     if (sniffer_channel_task_handle == NULL) {
-        xTaskCreate(sniffer_channel_hop_task, "sniffer_ch_hop", 8192, NULL, 5, &sniffer_channel_task_handle);
+        BaseType_t ok = xTaskCreate(sniffer_channel_hop_task, "sniffer_ch_hop", 4096, NULL, 5, &sniffer_channel_task_handle);
+        if (ok != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create channel hop task (internal RAM low)");
+            sniffer_channel_task_handle = NULL;
+        }
     }
-    
-    ESP_LOGI(TAG, "[Sniffer] Started in noscan mode - preserved %d APs, %d probes", 
+
+    ESP_LOGI(TAG, "[Sniffer] Started in noscan mode - preserved %d APs, %d probes",
              sniffer_ap_count, probe_request_count);
     
     return ESP_OK;
