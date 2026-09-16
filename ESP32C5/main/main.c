@@ -7486,7 +7486,17 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     sniffer_observe_ap_index = -1;
     scan_done_ui_flag = false;
     sniffer_log_ta = NULL;
-    
+
+    // Reset the display sort state for this fresh session. Otherwise a previous
+    // (e.g. main-menu normal-mode) session leaves sniffer_sorted_count high with
+    // sniffer_initial_sort_done=true; when this session has fewer APs (e.g. 2
+    // selected), no sort branch shrinks the count, so the list renders the stale
+    // zeroed AP slots as phantom "[Hidden]" rows with 0 clients.
+    sniffer_sorted_count = 0;
+    sniffer_initial_sort_done = false;
+    sniffer_last_sort_time = 0;
+    sniffer_start_time = (uint32_t)(esp_timer_get_time() / 1000);
+
     // Scrollable list for networks with clients
     sniffer_ap_list = lv_list_create(function_page);
     lv_obj_set_size(sniffer_ap_list, lv_pct(100), LCD_V_RES - 30 - 50);  // Leave space for title and buttons
