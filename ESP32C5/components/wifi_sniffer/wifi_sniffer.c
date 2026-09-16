@@ -478,10 +478,14 @@ esp_err_t wifi_sniffer_start(void) {
             return ESP_FAIL;
         }
         
-        // Set promiscuous mode
+        // Set promiscuous mode. Filter MGMT|DATA explicitly: clients are only
+        // learned from DATA frames, and a prior MFP/inspect or radar run may have
+        // left the global filter at MGMT-only (which shows APs but no clients).
         esp_wifi_set_promiscuous(true);
+        wifi_promiscuous_filter_t sn_filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA };
+        esp_wifi_set_promiscuous_filter(&sn_filt);
         esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_packet_handler);
-        
+
         // Initialize channel hopping with selected channels
         sniffer_channel_index = 0;
         sniffer_current_channel = sniffer_selected_channels[0];
@@ -513,6 +517,8 @@ esp_err_t wifi_sniffer_start(void) {
         // For now, we'll just start promiscuous mode immediately
         
         esp_wifi_set_promiscuous(true);
+        wifi_promiscuous_filter_t sn_filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA };
+        esp_wifi_set_promiscuous_filter(&sn_filt);
         esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_packet_handler);
 
         sniffer_active = true;
@@ -773,10 +779,13 @@ esp_err_t wifi_sniffer_start_noscan(void) {
     sniffer_scan_phase = false;
     sniffer_selected_mode = false;
     
-    // Set promiscuous mode
+    // Set promiscuous mode (MGMT|DATA so clients from data frames are seen even
+    // if a prior MFP/radar run left the global filter at MGMT-only).
     esp_wifi_set_promiscuous(true);
+    wifi_promiscuous_filter_t sn_filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA };
+    esp_wifi_set_promiscuous_filter(&sn_filt);
     esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_packet_handler);
-    
+
     sniffer_channel_index = 0;
     sniffer_current_channel = channel_list[0];
     esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE);
